@@ -1,0 +1,21 @@
+{
+  "name": "@identra/sdk-server",
+  "version": "0.0.0",
+  "description": "Identra server SDK for demo issuer, verifier, DID registry, and sessions.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@identra/sdk-core": "0.0.0"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "@identra/sdk-client",
+  "version": "0.0.0",
+  "description": "Identra web/client SDK for demo presentation flows.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@identra/sdk-core": "0.0.0"
+  }
+}

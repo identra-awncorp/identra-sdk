@@ -1,0 +1,21 @@
+{
+  "name": "@identra/sdk-app",
+  "version": "0.0.0",
+  "description": "Identra mobile wallet SDK for demo holder flows.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@identra/sdk-core": "0.0.0"
+  }
+}
