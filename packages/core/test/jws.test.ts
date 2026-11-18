@@ -9,7 +9,7 @@ import {
   ErrorCodes,
   signJws,
   utf8Encode,
-  verifyJwsSignature,
+  verifyJws,
   type DecodedJws,
   type EcPublicJwk,
   type Signer,
@@ -19,6 +19,7 @@ import { p256 } from '@noble/curves/nist.js';
 import { createWebCryptoSigner, generateWebCryptoKeyPair, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import { nobleSigner, nobleVerifier, P256_N } from './helpers/noble.js';
 
+const verifies = async (...a: Parameters<typeof verifyJws>) => (await verifyJws(...a)) === null;
 // RFC 7515 Appendix A.3, extracted from https://www.rfc-editor.org/rfc/rfc7515.txt.
 const RFC_A3_JWK = {
   kty: 'EC',
@@ -40,7 +41,7 @@ const VERIFIERS: [string, Verifier][] = [
 ];
 
 function decoded(compact: string): DecodedJws {
-  const r = decodeJws(compact);
+  const r = decodeJws(compact, 16_384);
   assert.ok(r.ok, `decodeJws failed: ${r.ok ? '' : r.detail}`);
   return r.jws;
 }
@@ -51,11 +52,11 @@ const flip = (b: Uint8Array, i: number) => {
 };
 
 async function signers(): Promise<[string, Signer][]> {
-  const rfcKey = await crypto.subtle.importKey('jwk', { ...RFC_A3_JWK }, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+  const rfcKey = await crypto.subtle.importKey('jwk', { ...RFC_A3_JWK }, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
   const fresh = await generateWebCryptoKeyPair();
   return [
-    ['webcrypto (RFC A.3 key)', await createWebCryptoSigner({ privateKey: rfcKey })],
-    ['webcrypto (fresh key)', await createWebCryptoSigner({ privateKey: fresh.privateKey })],
+    ['webcrypto (RFC A.3 key)', await createWebCryptoSigner({ privateKey: rfcKey, publicJwk: RFC_PUBLIC })],
+    ['webcrypto (fresh key)', await createWebCryptoSigner({ privateKey: fresh.privateKey, publicJwk: fresh.publicJwk })],
     ['noble (RFC A.3 key)', nobleSigner(base64UrlDecode(RFC_A3_JWK.d))],
   ];
 }
@@ -66,9 +67,9 @@ describe('RFC 7515 Appendix A.3 (ES256)', () => {
       const jws = decoded(RFC_A3_JWS);
       assert.deepEqual(jws.header, { alg: 'ES256' });
       assert.equal(checkJwsAlgorithm(jws.header), null);
-      assert.equal(await verifyJwsSignature(jws, RFC_PUBLIC, verifier), true);
-      assert.equal(await verifyJwsSignature({ ...jws, signingInput: flip(jws.signingInput, 30) }, RFC_PUBLIC, verifier), false);
-      assert.equal(await verifyJwsSignature({ ...jws, signature: flip(jws.signature, 10) }, RFC_PUBLIC, verifier), false);
+      assert.equal(await verifies(jws, RFC_PUBLIC, verifier), true);
+      assert.equal(await verifies({ ...jws, signingInput: flip(jws.signingInput, 30) }, RFC_PUBLIC, verifier), false);
+      assert.equal(await verifies({ ...jws, signature: flip(jws.signature, 10) }, RFC_PUBLIC, verifier), false);
     });
   }
 });
@@ -82,9 +83,9 @@ describe('sign -> verify -> tamper, across backends', () => {
       const tamperedSignature = `${h}.${p}.${base64UrlEncode(flip(base64UrlDecode(s), 40))}`;
       for (const [vName, verifier] of VERIFIERS) {
         const label = `${sName} -> ${vName}`;
-        assert.equal(await verifyJwsSignature(decoded(compact), signer.publicJwk, verifier), true, label);
-        assert.equal(await verifyJwsSignature(decoded(tamperedPayload), signer.publicJwk, verifier), false, label);
-        assert.equal(await verifyJwsSignature(decoded(tamperedSignature), signer.publicJwk, verifier), false, label);
+        assert.equal(await verifies(decoded(compact), signer.publicJwk, verifier), true, label);
+        assert.equal(await verifies(decoded(tamperedPayload), signer.publicJwk, verifier), false, label);
+        assert.equal(await verifies(decoded(tamperedSignature), signer.publicJwk, verifier), false, label);
       }
     }
   });
@@ -116,8 +117,28 @@ describe('algorithm allow-list', () => {
     }
   });
   test('an unsigned JWS (empty signature part) is MALFORMED', () => {
-    const r = decodeJws(`${base64UrlEncode(utf8Encode('{"alg":"none"}'))}.${base64UrlEncode(utf8Encode('{}'))}.`);
+    const r = decodeJws(`${base64UrlEncode(utf8Encode('{"alg":"none"}'))}.${base64UrlEncode(utf8Encode('{}'))}.`, 16_384);
     assert.equal(r.ok ? null : r.code, ErrorCodes.MALFORMED);
+  });
+});
+
+describe('verifyJws always applies the allow-list', () => {
+  test('a header alg other than ES256 is ALG_NOT_ALLOWED even with a valid ES256 signature', async () => {
+    const signer = nobleSigner(base64UrlDecode(RFC_A3_JWK.d));
+    for (const alg of ['none', 'HS256', 'ES384']) {
+      const input = `${base64UrlEncode(utf8Encode(JSON.stringify({ alg })))}.${base64UrlEncode(utf8Encode('{}'))}`;
+      const compact = `${input}.${base64UrlEncode(await signer.sign(utf8Encode(input)))}`;
+      assert.equal(await verifyJws(decoded(compact), signer.publicJwk, nobleVerifier), ErrorCodes.ALG_NOT_ALLOWED, alg);
+    }
+    assert.equal(await verifyJws(decoded(RFC_A3_JWS), RFC_PUBLIC, webCryptoVerifier), null);
+    assert.equal(await verifyJws({ ...decoded(RFC_A3_JWS), signature: new Uint8Array(64) }, RFC_PUBLIC, webCryptoVerifier), ErrorCodes.SIGNATURE_INVALID);
+  });
+  test('decodeJws enforces maxBytes before decoding', () => {
+    const r = decodeJws(RFC_A3_JWS, RFC_A3_JWS.length - 1);
+    assert.equal(r.ok ? null : r.code, ErrorCodes.TOO_LARGE);
+    assert.equal(decodeJws(RFC_A3_JWS, RFC_A3_JWS.length).ok, true);
+    assert.throws(() => decodeJws(RFC_A3_JWS, 0), TypeError);
+    assert.throws(() => decodeJws(RFC_A3_JWS, undefined as never), TypeError);
   });
 });
 
@@ -144,7 +165,7 @@ describe('decodeJws is strict', () => {
   ];
   for (const [name, input] of bad) {
     test(name, () => {
-      const r = decodeJws(input);
+      const r = decodeJws(input, 16_384);
       assert.equal(r.ok ? null : r.code, ErrorCodes.MALFORMED);
     });
   }
@@ -165,6 +186,6 @@ describe('signJws', () => {
   });
   test('verifyJwsSignature returns false for a signature that is not 64 bytes', async () => {
     const jws = decoded(RFC_A3_JWS);
-    assert.equal(await verifyJwsSignature({ ...jws, signature: jws.signature.subarray(0, 63) }, RFC_PUBLIC, webCryptoVerifier), false);
+    assert.equal(await verifies({ ...jws, signature: jws.signature.subarray(0, 63) }, RFC_PUBLIC, webCryptoVerifier), false);
   });
 });

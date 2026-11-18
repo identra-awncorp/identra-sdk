@@ -4,7 +4,7 @@
 // Never throws for bad input.
 import { utf8Decode } from './encoding.js';
 import type { CertificateChainValidator, CertificateProfile, Verifier } from './interfaces.js';
-import { checkJwsAlgorithm, decodeJws, verifyJwsSignature } from './jws.js';
+import { checkJwsAlgorithm, decodeJws, verifyJws } from './jws.js';
 import { CLOCK_SKEW_MS } from './x509/chain.js';
 import type { ParsedCertificate } from './x509/parse.js';
 
@@ -48,18 +48,15 @@ export async function verifySignedToken(
   token: unknown,
   o: { typ: string; profile: CertificateProfile; maxBytes: number; chainValidator: CertificateChainValidator; verifier: Verifier; now: Date },
 ): Promise<VerifiedSignedToken | TokenFailure> {
-  // A compact JWS is ASCII, so its length in characters is its length in bytes; anything else fails decoding.
-  if (typeof token !== 'string') return fail('malformed', 'token is not a string');
-  if (token.length > o.maxBytes) return fail('too_large', `token is larger than ${o.maxBytes} bytes`);
-  const decoded = decodeJws(token);
-  if (!decoded.ok) return fail('malformed', decoded.detail);
+  const decoded = decodeJws(token, o.maxBytes);
+  if (!decoded.ok) return fail(decoded.code === 'TOO_LARGE' ? 'too_large' : 'malformed', decoded.detail);
   const { jws } = decoded;
   if (jws.header['typ'] !== o.typ) return fail('typ', `typ is not ${o.typ}`);
   if (checkJwsAlgorithm(jws.header) !== null) return fail('alg', 'alg is not ES256');
   const chain = await o.chainValidator.validate({ x5c: jws.header['x5c'] as string[], profile: o.profile, now: o.now });
   if (!chain.ok) return fail('chain', `certificate chain: ${chain.code}`);
   const leaf = chain.leaf!;
-  if (!(await verifyJwsSignature(jws, leaf.publicJwk!, o.verifier))) return fail('signature', 'signature does not verify');
+  if ((await verifyJws(jws, leaf.publicJwk!, o.verifier)) !== null) return fail('signature', 'signature does not verify');
   let payload: unknown;
   try {
     payload = JSON.parse(utf8Decode(jws.payload));

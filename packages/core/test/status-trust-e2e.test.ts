@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
   createMappedFetch, createPresentation, createSignedTrustListRegistry, createStatusList, createStatusListChecker, createStatusListToken,
-  issueDiploma, VCT, verifyCredential, type HttpFetch, type Signer, type StatusList, type TrustListContent,
+  issueDiploma, VCT, verifyPresentation, type HttpFetch, type Signer, type StatusList, type TrustListContent,
 } from '@identra/sdk-core';
 import { webCryptoHasher, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import { demoContent, fakeClock, FP, otherOrgStatus, statusSigner, TRUST_URL, trustToken } from './helpers/lists.js';
@@ -53,7 +53,7 @@ async function world(o: { content?: TrustListContent; statusSignerOverride?: Sig
   const issue = (idx: number) => issueDiploma({ ...ctx, iss: ISS, cnfJwk: holder.publicJwk, status: { idx, uri: STATUS_URI }, claims: DIPLOMA });
   const verify = async (idx = 42) => {
     const presentation = await createPresentation({ compact: await issue(idx), disclose: ['ho_ten'], holderSigner: holder, audience: AUD, nonce: NONCE, now: clock.now(), hasher: webCryptoHasher });
-    return verifyCredential(presentation, {
+    return verifyPresentation(presentation, {
       verifier: webCryptoVerifier, hasher: webCryptoHasher, chainValidator: validator, trustRegistry, statusChecker,
       supportedVcts: [VCT.diploma], now: clock.now(), presentation: { nonce: NONCE, audience: AUD },
     });

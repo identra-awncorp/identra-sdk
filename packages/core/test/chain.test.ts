@@ -18,7 +18,7 @@ for (const [backend, verifier, hasher] of BACKENDS) {
   const pin = (...roots: string[]) => createCertificateChainValidator({ trustedRoots: roots.map(ca), verifier, hasher });
   const validator = pin('root');
   const code = async (chain: unknown, now = NOW, v = validator) =>
-    (await v.validate({ x5c: chain as string[], profile: 'vc', now })).code;
+    (await v.validate({ x5c: chain as string[], profile: 'vc', now, expectedIssuerUri: `${ISS}/truong-mau` })).code;
 
   describe(`chain validation (${backend})`, () => {
     test('a good vc chain passes every step and returns the leaf and its fingerprint', async () => {
@@ -34,12 +34,11 @@ for (const [backend, verifier, hasher] of BACKENDS) {
     });
 
     test('good chains for every purpose and a Vietnamese subject pass', async () => {
-      for (const name of ['vc-product', 'status', 'request', 'utf8']) {
-        const profile = name === 'status' || name === 'request' ? name : 'vc';
-        const r = await validator.validate({ x5c: x5c(name), profile, now: NOW });
+      for (const [name, iss] of [['vc-product', `${ISS}/nha-san-xuat`], ['status'], ['request'], ['utf8', `${ISS}/truong-mau`]] as const) {
+        const r = await validator.validate(iss ? { x5c: x5c(name), profile: 'vc', now: NOW, expectedIssuerUri: iss } : { x5c: x5c(name), profile: name as 'status', now: NOW });
         assert.equal(r.ok, true, name);
       }
-      const r = await validator.validate({ x5c: x5c('utf8'), profile: 'vc', now: NOW });
+      const r = await validator.validate({ x5c: x5c('utf8'), profile: 'vc', now: NOW, expectedIssuerUri: `${ISS}/truong-mau` });
       assert.equal(r.leaf?.subject.O, 'Trường Mẫu TEST');
     });
 
@@ -137,13 +136,13 @@ for (const [backend, verifier, hasher] of BACKENDS) {
         assert.equal(await code(x5c('expired'), at('2026-03-01T00:00:00Z', 59)), null);
       });
       test('an expired issuing CA', async () => {
-        const r = await validator.validate({ x5c: x5c('under-issuing-expired', 'issuing-expired'), profile: 'vc', now: NOW });
+        const r = await validator.validate({ x5c: x5c('under-issuing-expired', 'issuing-expired'), profile: 'vc', now: NOW, expectedIssuerUri: `${ISS}/truong-mau` });
         assert.equal(r.code, ErrorCodes.CERT_EXPIRED);
         assert.match(r.checks[2]!.detail!, /issuing CA/);
       });
       test('an expired pinned root', async () => {
         const v = pin('root-expired');
-        const r = await v.validate({ x5c: x5c('under-root-expired', 'issuing-under-root-expired'), profile: 'vc', now: NOW });
+        const r = await v.validate({ x5c: x5c('under-root-expired', 'issuing-under-root-expired'), profile: 'vc', now: NOW, expectedIssuerUri: `${ISS}/truong-mau` });
         assert.equal(r.code, ErrorCodes.CERT_EXPIRED);
         assert.match(r.checks[2]!.detail!, /root/);
         assert.equal(await code(x5c('under-root-expired', 'issuing-under-root-expired'), at('2026-03-01T00:00:00Z', 59), v), null);
@@ -155,7 +154,8 @@ for (const [backend, verifier, hasher] of BACKENDS) {
 test('programmer errors throw', async () => {
   const v = createCertificateChainValidator({ trustedRoots: [ca('root')], verifier: webCryptoVerifier, hasher: webCryptoHasher });
   await assert.rejects(v.validate({ x5c: x5c('vc'), profile: 'nope' as 'vc', now: NOW }), TypeError);
-  await assert.rejects(v.validate({ x5c: x5c('vc'), profile: 'vc', now: new Date('x') }), TypeError);
+  await assert.rejects(v.validate({ x5c: x5c('vc'), profile: 'vc', now: new Date('x'), expectedIssuerUri: `${ISS}/truong-mau` }), TypeError);
+  await assert.rejects(v.validate({ x5c: x5c('vc'), profile: 'vc', now: NOW } as never), TypeError, 'expectedIssuerUri is required for vc');
   await assert.rejects(v.validate({ x5c: x5c('status'), profile: 'status', now: NOW, expectedIssuerUri: `${ISS}/truong-mau` }), TypeError);
   assert.throws(() => createCertificateChainValidator({ trustedRoots: [], verifier: webCryptoVerifier, hasher: webCryptoHasher }), TypeError);
   const three = [ca('root'), ca('root2'), ca('evil-root')];

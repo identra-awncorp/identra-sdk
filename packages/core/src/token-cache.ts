@@ -30,9 +30,9 @@ export interface TokenCache<T> {
 }
 
 /** GET `url` (https only) with a 5 s timeout; the body when the answer is 200 and the body fits `maxBytes`, else null. */
-export async function fetchToken(fetch: HttpFetch, url: string, maxBytes: number, accept: string): Promise<string | null> {
+export async function fetchToken(httpFetch: HttpFetch, url: string, maxBytes: number, accept: string): Promise<string | null> {
   if (typeof url !== 'string' || !url.startsWith('https://')) return null;
-  const res = await fetch(url, { method: 'GET', headers: { accept }, timeoutMs: FETCH_TIMEOUT_MS });
+  const res = await httpFetch(url, { method: 'GET', headers: { accept }, timeoutMs: FETCH_TIMEOUT_MS });
   if (res.status !== 200) return null;
   const body = await res.text();
   return typeof body === 'string' && body.length <= maxBytes ? body : null;

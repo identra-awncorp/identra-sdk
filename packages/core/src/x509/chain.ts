@@ -3,7 +3,7 @@
 import { base64Decode, base64UrlEncode, bytesEqual } from '../encoding.js';
 import type { CertificateChainValidator, CertificateProfile, ChainValidationResult, Hasher, Verifier } from '../interfaces.js';
 import { ErrorCodes, type Check, type CheckId, type ErrorCode } from '../results.js';
-import { OID, parseCertificate, type ParsedCertificate } from './parse.js';
+import { KEY_USAGE_BITS, OID, parseCertificate, type KeyUsageBit, type ParsedCertificate } from './parse.js';
 
 export const MAX_CERTIFICATE_BYTES = 4096;
 export const CLOCK_SKEW_MS = 60_000;
@@ -11,6 +11,16 @@ export const CLOCK_SKEW_MS = 60_000;
 const PROFILES: readonly CertificateProfile[] = ['vc', 'status', 'request', 'trust-list'];
 // Critical extensions this validator understands; any other critical extension is rejected.
 const KNOWN_CRITICAL = new Set<string>([OID.basicConstraints, OID.keyUsage, OID.subjectAltName]);
+// keyUsage must match exactly (ADR-0015 section 15): no missing and no extra bit.
+const LEAF_KEY_USAGE: readonly KeyUsageBit[] = ['digitalSignature'];
+const CA_KEY_USAGE: readonly KeyUsageBit[] = ['keyCertSign', 'cRLSign'];
+// ETSI EN 319 412-1 legal-person identifier with a Vietnamese tax code (ADR-0015 section 9).
+const ORGANIZATION_IDENTIFIER = /^VATVN-[0-9]{10}(-[0-9]{3})?$/;
+
+function hasExactKeyUsage(cert: ParsedCertificate, required: readonly KeyUsageBit[]): boolean {
+  const ku = cert.keyUsage;
+  return ku !== undefined && KEY_USAGE_BITS.every((bit) => ku[bit] === required.includes(bit));
+}
 // Cheap bound on the string before decoding; the 4 KB rule itself applies to the decoded DER.
 const MAX_BASE64_LENGTH = 2 * MAX_CERTIFICATE_BYTES;
 
@@ -92,21 +102,23 @@ export function createCertificateChainValidator(options: {
     }
   }
 
-  // Step 4: basicConstraints, keyUsage, subject and critical extensions (ADR-0015 section 15).
-  function checkConstraints(chain: ParsedCertificate[], root: ParsedCertificate, profile: CertificateProfile): void {
+  // Step 4: basicConstraints, keyUsage, subject and critical extensions (ADR-0015 sections 9, 15).
+  function checkConstraints(chain: ParsedCertificate[], root: ParsedCertificate): void {
     const fail = (detail: string) => new StepFailure(ErrorCodes.CERT_CONSTRAINT_INVALID, detail);
     const leaf = chain[0]!;
     if (!leaf.basicConstraints || leaf.basicConstraints.cA) throw fail('leaf must have basicConstraints CA:FALSE');
-    if (!leaf.keyUsage?.digitalSignature) throw fail('leaf keyUsage must include digitalSignature');
-    if (profile !== 'trust-list') {
-      const s = leaf.subject;
-      if (!s.O || !s.C || !s.organizationIdentifier) throw fail('leaf subject must carry O, C and organizationIdentifier');
-      const ca = chain[1]!;
+    if (!hasExactKeyUsage(leaf, LEAF_KEY_USAGE)) throw fail('leaf keyUsage must be exactly digitalSignature');
+    const s = leaf.subject;
+    if (s.C !== 'VN' || !s.O || !ORGANIZATION_IDENTIFIER.test(s.organizationIdentifier ?? '')) {
+      throw fail('leaf subject must be C=VN, O, organizationIdentifier=VATVN-<tax code>');
+    }
+    const ca = chain[1];
+    if (ca) {
       if (!ca.basicConstraints?.cA || ca.basicConstraints.pathLenConstraint !== 0) throw fail('issuing CA must have CA:TRUE and pathLenConstraint 0');
-      if (!ca.keyUsage?.keyCertSign) throw fail('issuing CA keyUsage must include keyCertSign');
+      if (!hasExactKeyUsage(ca, CA_KEY_USAGE)) throw fail('issuing CA keyUsage must be exactly keyCertSign and cRLSign');
     }
     if (!root.basicConstraints?.cA) throw fail('root must have CA:TRUE');
-    if (!root.keyUsage?.keyCertSign) throw fail('root keyUsage must include keyCertSign');
+    if (!hasExactKeyUsage(root, CA_KEY_USAGE)) throw fail('root keyUsage must be exactly keyCertSign and cRLSign');
     for (const cert of [...chain, root]) {
       const unknown = cert.criticalExtensions.find((o) => !KNOWN_CRITICAL.has(o));
       if (unknown) throw fail(`unknown critical extension ${unknown}`);
@@ -118,8 +130,8 @@ export function createCertificateChainValidator(options: {
       const { x5c, profile, now, expectedIssuerUri } = input;
       if (!PROFILES.includes(profile)) throw new TypeError(`unknown profile ${String(profile)}`);
       if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new TypeError('now must be a valid Date');
-      if (expectedIssuerUri !== undefined && (profile !== 'vc' || typeof expectedIssuerUri !== 'string')) {
-        throw new TypeError('expectedIssuerUri is a string and only applies to profile vc');
+      if (profile === 'vc' ? typeof expectedIssuerUri !== 'string' : expectedIssuerUri !== undefined) {
+        throw new TypeError('expectedIssuerUri is required for profile vc and forbidden for the others');
       }
 
       // One check per step, in order; the first failure stops the run and later steps are SKIPPED.
@@ -135,7 +147,7 @@ export function createCertificateChainValidator(options: {
         const labelled = chain.map((cert, i) => ({ cert, label: i === 0 ? 'leaf' : 'issuing CA' }));
         checkValidity([...labelled, { cert: root, label: 'root' }], now);
         pass();
-        checkConstraints(chain, root, profile);
+        checkConstraints(chain, root);
         pass();
         const leaf = chain[0]!;
         if (!leaf.publicJwk) throw new StepFailure(ErrorCodes.CERT_KEY_NOT_ALLOWED, 'leaf key is not EC P-256');

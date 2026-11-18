@@ -16,7 +16,7 @@ const testDist = new URL('.', import.meta.url).pathname;
 const options: esbuild.BuildOptions = { bundle: true, platform: 'neutral', mainFields: ['module', 'main'], write: false, logLevel: 'silent' };
 
 const ENTRY = `
-  import { issueDiploma, createPresentation, verifyCredential, createCertificateChainValidator, base64Decode, hexDecode, VCT } from '@identra/sdk-core';
+  import { issueDiploma, createPresentation, verifyPresentation, createCertificateChainValidator, base64Decode, hexDecode, VCT } from '@identra/sdk-core';
   import { nobleVerifier, nobleHasher, nobleSigner } from './helpers/noble.js';
   export async function run(json) {
     const i = JSON.parse(json);
@@ -36,8 +36,8 @@ const ENTRY = `
       statusChecker: { async check() { return 'valid'; } },
       presentation: { nonce: i.nonce, audience: i.aud },
     };
-    const good = await verifyCredential(presentation, options);
-    const bad = await verifyCredential(presentation, { ...options, presentation: { nonce: 'other', audience: i.aud } });
+    const good = await verifyPresentation(presentation, options);
+    const bad = await verifyPresentation(presentation, { ...options, presentation: { nonce: 'other', audience: i.aud } });
     return JSON.stringify({ codes: good.checks.map((c) => c.code), claims: good.credential?.claims ?? null, badNonce: bad.checks.at(-1).code });
   }`;
 

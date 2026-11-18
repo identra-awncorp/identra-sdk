@@ -6,6 +6,9 @@ import { test } from 'node:test';
 import { parseCertificate } from '@identra/sdk-core';
 import { ca, leaf, REPO } from './helpers/pki.js';
 
+// RFC 5280 section 4.2.1.3, bits 0-8.
+const KEY_USAGE_BITS = ['digitalSignature', 'nonRepudiation', 'keyEncipherment', 'dataEncipherment', 'keyAgreement', 'keyCertSign', 'cRLSign', 'encipherOnly', 'decipherOnly'];
+const ku = (...set: string[]) => Object.fromEntries(KEY_USAGE_BITS.map((b) => [b, set.includes(b)]));
 const names = (dir: string) => readdirSync(new URL(`.pki/test/${dir}`, REPO));
 const all: [string, Uint8Array][] = [
   ...names('ca').map((n): [string, Uint8Array] => [`ca/${n}`, ca(n)]),
@@ -56,7 +59,7 @@ test('vc leaf fields', () => {
   assert.deepEqual(c.subject, { C: 'VN', O: 'Truong Mau TEST', organizationIdentifier: 'VATVN-0100000001', CN: 'Truong Mau TEST (vc)' });
   assert.deepEqual(c.sanUris, ['https://api-identra.awncorp.vn/issuers/truong-mau']);
   assert.deepEqual(c.basicConstraints, { cA: false });
-  assert.deepEqual(c.keyUsage, { digitalSignature: true, keyCertSign: false, cRLSign: false });
+  assert.deepEqual(c.keyUsage, ku('digitalSignature'));
   assert.deepEqual(c.criticalExtensions, ['2.5.29.19', '2.5.29.15']);
   assert.equal(c.signatureAlgorithm, '1.2.840.10045.4.3.2');
   assert.equal(c.publicKeyAlgorithm, '1.2.840.10045.2.1');
@@ -66,7 +69,7 @@ test('vc leaf fields', () => {
 
 test('CA profiles, foreign keys and a Vietnamese subject', () => {
   assert.deepEqual(parseCertificate(ca('root')).basicConstraints, { cA: true });
-  assert.deepEqual(parseCertificate(ca('root')).keyUsage, { digitalSignature: false, keyCertSign: true, cRLSign: true });
+  assert.deepEqual(parseCertificate(ca('root')).keyUsage, ku('keyCertSign', 'cRLSign'));
   assert.deepEqual(parseCertificate(ca('issuing')).basicConstraints, { cA: true, pathLenConstraint: 0 });
   assert.equal(parseCertificate(leaf('rsa')).publicKeyAlgorithm, '1.2.840.113549.1.1.1');
   assert.equal(parseCertificate(leaf('rsa')).publicJwk, undefined);

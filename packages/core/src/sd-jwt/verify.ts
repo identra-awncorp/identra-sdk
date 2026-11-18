@@ -2,11 +2,11 @@
 // Never throws for bad input; throws TypeError only for missing or wrong options.
 import type { CertificateChainValidator, EcPublicJwk, Hasher, StatusChecker, TrustEntry, TrustRegistry, Verifier } from '../interfaces.js';
 import { normalizeEcPublicJwk } from '../jwk.js';
-import { checkJwsAlgorithm, verifyJwsSignature } from '../jws.js';
+import { checkJwsAlgorithm, verifyJws } from '../jws.js';
 import { ErrorCodes, TrustListUnavailableError, type Check, type CheckId, type ErrorCode, type VerificationResult } from '../results.js';
 import type { ParsedCertificate } from '../x509/parse.js';
-import { parseSdJwt, type ParsedSdJwt } from './compact.js';
-import { METADATA_CLAIMS, SD_JWT_LIMITS, VCT } from './credential-types.js';
+import { disclosureSegments, parseSdJwt, sdShapeProblem, type ParsedSdJwt } from './compact.js';
+import { isStatusListUri, METADATA_CLAIMS, SD_JWT_LIMITS, VCT } from './credential-types.js';
 import { checkHolderBinding } from './holder-binding.js';
 
 export interface VerifyCredentialOptions {
@@ -18,8 +18,11 @@ export interface VerifyCredentialOptions {
   statusChecker: StatusChecker;
   supportedVcts: readonly string[];
   now: Date;
-  /** Given when verifying a presentation: a KB-JWT with this nonce and audience is required. */
-  presentation?: { nonce: string; audience: string };
+}
+
+export interface VerifyPresentationOptions extends VerifyCredentialOptions {
+  /** The KB-JWT must carry this nonce and audience. */
+  presentation: { nonce: string; audience: string };
 }
 
 export interface VerifiedCredential {
@@ -34,7 +37,7 @@ export interface VerifiedCredential {
   exp?: number;
   status?: { idx: number; uri: string };
   cnfJwk?: EcPublicJwk;
-  /** Subject claims (visible plus verified disclosures); only when holder_binding passed or is not listed. */
+  /** Subject claims (visible plus verified disclosures); only when the whole result is ok. */
   claims?: Record<string, unknown>;
 }
 
@@ -55,7 +58,7 @@ const GATED: CheckId[] = ['structure', 'algorithm', 'certificate_chain', 'signat
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
-function checkOptions(o: VerifyCredentialOptions): void {
+function checkOptions(o: VerifyCredentialOptions, presentation: { nonce: string; audience: string } | undefined): void {
   const fns: [unknown, string][] = [
     [o?.verifier?.verify, 'verifier'],
     [o?.hasher?.sha256, 'hasher'],
@@ -66,8 +69,8 @@ function checkOptions(o: VerifyCredentialOptions): void {
   for (const [fn, name] of fns) if (typeof fn !== 'function') throw new TypeError(`${name} is required`);
   if (!Array.isArray(o.supportedVcts)) throw new TypeError('supportedVcts must be an array');
   if (!(o.now instanceof Date) || Number.isNaN(o.now.getTime())) throw new TypeError('now must be a valid Date');
-  const p = o.presentation;
-  if (p !== undefined && (typeof p.nonce !== 'string' || p.nonce === '' || typeof p.audience !== 'string' || p.audience === '')) {
+  const p = presentation;
+  if (p !== undefined && (typeof p?.nonce !== 'string' || p.nonce === '' || typeof p.audience !== 'string' || p.audience === '')) {
     throw new TypeError('presentation needs a non-empty nonce and audience');
   }
 }
@@ -85,6 +88,8 @@ function checkStructure(compact: unknown, presentation: boolean): ParsedSdJwt {
     (p['nbf'] === undefined || isTime(p['nbf'])) && (p['exp'] === undefined || isTime(p['exp'])) &&
     (p['cnf'] === undefined || isObject(p['cnf'])) && (p['status'] === undefined || isObject(p['status']));
   if (!shapeOk) throw new Failure(ErrorCodes.MALFORMED, 'payload lacks string iss / vct, numeric iat, or has mistyped metadata');
+  const sdProblem = sdShapeProblem(p);
+  if (sdProblem) throw new Failure(ErrorCodes.MALFORMED, sdProblem);
   return parsed.sdJwt;
 }
 
@@ -125,7 +130,7 @@ async function checkStatus(o: VerifyCredentialOptions, p: Record<string, unknown
   const unavailable = (detail: string) => new Failure(ErrorCodes.STATUS_UNAVAILABLE, detail);
   const ref = statusRef(p);
   if (!ref) throw unavailable('status.status_list with idx and uri is missing or invalid');
-  if (!ref.uri.startsWith('https://') || !ref.uri.startsWith(`${p['iss'] as string}/status/`)) throw unavailable('status uri is not under <iss>/status/');
+  if (!isStatusListUri(ref.uri, p['iss'] as string)) throw unavailable('status uri is not <iss>/status/<n>');
   let answer: unknown;
   try {
     answer = await o.statusChecker.check(ref, { maToChuc: entry.maToChuc });
@@ -137,9 +142,32 @@ async function checkStatus(o: VerifyCredentialOptions, p: Record<string, unknown
   if (answer !== 'valid') throw unavailable('status could not be established');
 }
 
-/** Verifies a stored credential, or a presentation when `options.presentation` is given. */
-export async function verifyCredential(compact: unknown, options: VerifyCredentialOptions): Promise<CredentialVerificationResult> {
-  checkOptions(options);
+/**
+ * Verifies a credential PRESENTED BY ANOTHER PARTY: steps 1-9, including the KB-JWT that proves
+ * possession of `cnf.jwk` for `options.presentation` (nonce, audience). Use this for anything
+ * received from a holder.
+ */
+export async function verifyPresentation(compact: unknown, options: VerifyPresentationOptions): Promise<CredentialVerificationResult> {
+  if (options?.presentation === undefined) throw new TypeError('verifyPresentation needs options.presentation');
+  return verify(compact, options, options.presentation);
+}
+
+/**
+ * MUST NOT be used to accept a credential presented by someone else: it never proves possession.
+ * Verifies a credential the caller already holds (a wallet on receipt or display, a public
+ * product event): steps 1-8 and the disclosures; a compact carrying a KB-JWT is MALFORMED.
+ */
+export async function verifyStoredCredential(compact: unknown, options: VerifyCredentialOptions): Promise<CredentialVerificationResult> {
+  if ((options as { presentation?: unknown })?.presentation !== undefined) throw new TypeError('use verifyPresentation for a presentation');
+  return verify(compact, options, undefined);
+}
+
+async function verify(
+  compact: unknown,
+  options: VerifyCredentialOptions,
+  presentation: { nonce: string; audience: string } | undefined,
+): Promise<CredentialVerificationResult> {
+  checkOptions(options, presentation);
   const checks: Check[] = [];
   const pass = (id: CheckId) => void checks.push({ id, ok: true, code: null });
   const fail = (id: CheckId, f: Failure) => void checks.push({ id, ok: false, code: f.code, detail: f.detail });
@@ -152,7 +180,7 @@ export async function verifyCredential(compact: unknown, options: VerifyCredenti
   let leaf: ParsedCertificate;
   let fingerprint: string;
   try {
-    parsed = checkStructure(compact, options.presentation !== undefined);
+    parsed = checkStructure(compact, presentation !== undefined);
     pass('structure');
     if (checkJwsAlgorithm(parsed.jws.header) !== null) throw new Failure(ErrorCodes.ALG_NOT_ALLOWED, 'alg is not ES256');
     pass('algorithm');
@@ -167,15 +195,15 @@ export async function verifyCredential(compact: unknown, options: VerifyCredenti
     leaf = chain.leaf!;
     fingerprint = chain.fingerprint!;
     pass('certificate_chain');
-    if (!(await verifyJwsSignature(parsed.jws, leaf.publicJwk!, options.verifier))) {
-      throw new Failure(ErrorCodes.SIGNATURE_INVALID, 'issuer signature does not verify');
-    }
+    const signature = await verifyJws(parsed.jws, leaf.publicJwk!, options.verifier);
+    if (signature !== null) throw new Failure(signature, 'issuer signature does not verify');
     pass('signature');
   } catch (e) {
     if (!(e instanceof Failure)) throw e;
     const failed = checks.length;
     fail(GATED[failed]!, e);
-    const holderListed = options.presentation !== undefined || (parsed?.disclosures.length ?? 0) > 0;
+    // Decided from what is knowable without parsing, so every step 1-4 failure lists the same checks.
+    const holderListed = presentation !== undefined || disclosureSegments(compact) > 0;
     skip([...GATED.slice(failed + 1), 'validity_time', 'credential_type', 'issuer_trust', 'status', ...(holderListed ? ['holder_binding' as const] : [])]);
     return done(chainChecks ? { chainChecks } : {});
   }
@@ -205,8 +233,8 @@ export async function verifyCredential(compact: unknown, options: VerifyCredenti
   let claims: Record<string, unknown> | undefined = Object.fromEntries(
     Object.entries(p).filter(([k]) => !METADATA_CLAIMS.includes(k) && k !== '_sd' && k !== '_sd_alg'),
   );
-  if (options.presentation !== undefined || parsed.disclosures.length > 0) {
-    const r = await checkHolderBinding(parsed, options);
+  if (presentation !== undefined || disclosureSegments(compact) > 0) {
+    const r = await checkHolderBinding(parsed, { ...options, ...(presentation ? { presentation } : {}) });
     if (r.ok) {
       pass('holder_binding');
       claims = { ...claims, ...r.disclosed };
@@ -230,6 +258,7 @@ export async function verifyCredential(compact: unknown, options: VerifyCredenti
   if (ref) credential.status = ref;
   const cnfJwk = normalizeEcPublicJwk(isObject(p['cnf']) ? p['cnf']['jwk'] : undefined);
   if (cnfJwk) credential.cnfJwk = cnfJwk;
-  if (claims) credential.claims = claims;
+  // Claim values are handed out only for a credential that passed every check.
+  if (claims && checks.every((c) => c.ok)) credential.claims = claims;
   return done({ ...(chainChecks ? { chainChecks } : {}), credential });
 }

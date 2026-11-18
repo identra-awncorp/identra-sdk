@@ -5,7 +5,7 @@ import { chmodSync, copyFileSync, cpSync, mkdtempSync, symlinkSync, unlinkSync }
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { base64Encode, decodeJws, signJws, utf8Encode, verifyJwsSignature } from '@identra/sdk-core';
+import { base64Encode, decodeJws, signJws, utf8Encode, verifyJws } from '@identra/sdk-core';
 import { webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import { createFileKeyStore } from '@identra/sdk-server';
 import { freshDemoPki, pemCerts } from './helpers.js';
@@ -20,9 +20,9 @@ const copy = () => {
 };
 
 async function signsVerifiably(signer: Awaited<ReturnType<typeof store.signer>>) {
-  const decoded = decodeJws(await signJws({ typ: 'test' }, utf8Encode('{}'), signer));
+  const decoded = decodeJws(await signJws({ typ: 'test' }, utf8Encode('{}'), signer), 16_384);
   assert.ok(decoded.ok);
-  assert.equal(await verifyJwsSignature(decoded.jws, signer.publicJwk, webCryptoVerifier), true);
+  assert.equal(await verifyJws(decoded.jws, signer.publicJwk, webCryptoVerifier), null);
 }
 
 test('the demo layout: every organisation signer, the trust-list signer and the root', async () => {

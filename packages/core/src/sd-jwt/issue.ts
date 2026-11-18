@@ -13,6 +13,7 @@ import {
   RESERVED_CLAIM_NAMES,
   SD_JWT_LIMITS,
   VCT,
+  isStatusListUri,
   type DiplomaClaims,
   type ProductEventClaims,
 } from './credential-types.js';
@@ -48,6 +49,41 @@ function fail(message: string): never {
   throw new TypeError(message);
 }
 const has = (o: object, name: string): boolean => Object.keys(o).includes(name);
+// Names that would reach an object's prototype machinery when a verifier or consumer copies claims.
+const PROTOTYPE_NAMES = ['__proto__', 'constructor', 'prototype'];
+
+/**
+ * A claim value must survive JSON unchanged: null, boolean, string, finite number, arrays and
+ * plain objects only (no undefined, function, symbol, bigint, NaN, Infinity, Date, class
+ * instance, cycle), and no nested key from PROTOTYPE_NAMES or `_sd` / `_sd_alg` / `...`.
+ * Iterative; the message names the claim, never its value.
+ */
+function checkJsonValue(name: string, value: unknown): void {
+  const seen = new Set<object>();
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (v === null || typeof v === 'string' || typeof v === 'boolean') continue;
+    if (typeof v === 'number') {
+      if (!Number.isFinite(v)) fail(`claim ${name} holds a non-finite number`);
+      continue;
+    }
+    if (typeof v !== 'object') fail(`claim ${name} holds a value JSON cannot carry (${typeof v})`);
+    const o = v as object;
+    if (seen.has(o)) fail(`claim ${name} holds a cycle or a shared object`);
+    seen.add(o);
+    if (Array.isArray(o)) {
+      for (let i = 0; i < o.length; i++) stack.push(o[i]);
+      continue;
+    }
+    const proto = Object.getPrototypeOf(o);
+    if (proto !== Object.prototype && proto !== null) fail(`claim ${name} holds an object that is not a plain object`);
+    for (const key of Object.keys(o)) {
+      if (PROTOTYPE_NAMES.includes(key) || RESERVED_CLAIM_NAMES.includes(key)) fail(`claim ${name} holds the reserved key ${key}`);
+      stack.push((o as Record<string, unknown>)[key]);
+    }
+  }
+}
 const isNumericDate = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 
 function checkSigner(signer: Signer, iss: string): Signer & { x5c: string[] } {
@@ -70,14 +106,18 @@ export async function issueCredential(input: IssueCredentialInput): Promise<stri
   if (nbf !== undefined && !isNumericDate(nbf)) fail('nbf must be a NumericDate');
   if (exp !== undefined && !isNumericDate(exp)) fail('exp must be a NumericDate');
   if (!Number.isSafeInteger(status?.idx) || status.idx < 0) fail('status.idx must be a non-negative integer');
-  if (typeof status.uri !== 'string' || !status.uri.startsWith(`${iss}/status/`)) fail('status.uri must start with <iss>/status/');
+  if (!isStatusListUri(status.uri, iss)) fail('status.uri must be exactly <iss>/status/<n>, n in 1..999999999');
   if (typeof claims !== 'object' || claims === null || Array.isArray(claims)) fail('claims must be an object');
+  const claimProto = Object.getPrototypeOf(claims);
+  if (claimProto !== Object.prototype && claimProto !== null) fail('claims must be a plain object');
   if (!Array.isArray(disclosable) || new Set(disclosable).size !== disclosable.length) fail('disclosable must be a list of distinct names');
   for (const name of disclosable) if (METADATA_CLAIMS.includes(name)) fail(`metadata claim ${name} can never be disclosable`);
   for (const name of Object.keys(claims)) {
-    if (METADATA_CLAIMS.includes(name) || RESERVED_CLAIM_NAMES.includes(name)) fail(`${name} is not a subject claim name`);
+    if (METADATA_CLAIMS.includes(name) || RESERVED_CLAIM_NAMES.includes(name) || PROTOTYPE_NAMES.includes(name)) fail(`${name} is not a subject claim name`);
+    checkJsonValue(name, (claims as Record<string, unknown>)[name]);
   }
   for (const name of disclosable) if (!has(claims, name)) fail(`disclosable claim ${name} is not among the subject claims`);
+  if (disclosable.length > SD_JWT_LIMITS.maxDisclosures) fail(`more than ${SD_JWT_LIMITS.maxDisclosures} disclosable claims`);
   let decoys = 0;
   if (sdDigests !== undefined) {
     if (disclosable.length === 0 || !Number.isSafeInteger(sdDigests) || sdDigests < disclosable.length) {
@@ -90,13 +130,26 @@ export async function issueCredential(input: IssueCredentialInput): Promise<stri
   const now = clock.now();
   if (!(now instanceof Date) || Number.isNaN(now.getTime())) fail('clock.now() must return a valid Date');
 
-  const payload: Record<string, unknown> = { iss, vct, iat: Math.floor(now.getTime() / 1000) };
-  if (nbf !== undefined) payload['nbf'] = nbf;
-  if (exp !== undefined) payload['exp'] = exp;
-  if (jwk) payload['cnf'] = { jwk };
-  payload['status'] = { status_list: { idx: status.idx, uri: status.uri } };
-  Object.assign(payload, claims);
-  return libIssue({ signer, hasher, random, payload, disclosable, decoys });
+  // Built from entries (data properties only, no setters run).
+  const payload: Record<string, unknown> = Object.fromEntries([
+    ['iss', iss],
+    ['vct', vct],
+    ['iat', Math.floor(now.getTime() / 1000)],
+    ...(nbf !== undefined ? [['nbf', nbf]] : []),
+    ...(exp !== undefined ? [['exp', exp]] : []),
+    ...(jwk ? [['cnf', { jwk }]] : []),
+    ['status', { status_list: { idx: status.idx, uri: status.uri } }],
+    ...Object.entries(claims),
+  ]);
+  let compact: string;
+  try {
+    compact = await libIssue({ signer, hasher, random, payload, disclosable, decoys });
+  } catch {
+    fail('the SD-JWT library refused to issue the credential'); // its message may quote claim values
+  }
+  // Never hand out a credential that every verifier would reject (ADR-0007 limits).
+  if (compact!.length > SD_JWT_LIMITS.maxCompactBytes) fail(`the credential would exceed ${SD_JWT_LIMITS.maxCompactBytes} bytes`);
+  return compact!;
 }
 
 function exactKeys(claims: object, required: readonly string[], optional: readonly string[] = []): void {

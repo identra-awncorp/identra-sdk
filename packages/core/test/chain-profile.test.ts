@@ -11,22 +11,22 @@ const ISS = 'https://api-identra.awncorp.vn/issuers';
 const pin = (...roots: string[]) =>
   createCertificateChainValidator({ trustedRoots: roots.map(ca), verifier: webCryptoVerifier, hasher: webCryptoHasher });
 const validator = pin('root');
-const run = (chain: string[], profile: CertificateProfile = 'vc', v = validator, expectedIssuerUri?: string) =>
-  v.validate({ x5c: chain, profile, now: NOW, ...(expectedIssuerUri ? { expectedIssuerUri } : {}) });
+const run = (chain: string[], profile: CertificateProfile = 'vc', v = validator, expectedIssuerUri = `${ISS}/truong-mau`) =>
+  v.validate(profile === 'vc' ? { x5c: chain, profile, now: NOW, expectedIssuerUri } : { x5c: chain, profile, now: NOW });
 
 describe('CERT_CONSTRAINT_INVALID, one test per sub-rule', () => {
   const cases: [string, string[], RegExp, ReturnType<typeof pin>?][] = [
     ['leaf with CA:TRUE', x5c('ca-true'), /leaf must have basicConstraints CA:FALSE/],
     ['leaf without basicConstraints', x5c('no-basic-constraints'), /leaf must have basicConstraints CA:FALSE/],
     ['leaf without digitalSignature', x5c('no-digital-signature'), /digitalSignature/],
-    ['leaf without organizationIdentifier', x5c('no-org-id'), /O, C and organizationIdentifier/],
-    ['leaf without O', x5c('no-o'), /O, C and organizationIdentifier/],
-    ['leaf without C', x5c('no-c'), /O, C and organizationIdentifier/],
+    ['leaf without organizationIdentifier', x5c('no-org-id'), /leaf subject must be C=VN, O, organizationIdentifier=VATVN-/],
+    ['leaf without O', x5c('no-o'), /leaf subject must be C=VN, O, organizationIdentifier=VATVN-/],
+    ['leaf without C', x5c('no-c'), /leaf subject must be C=VN, O, organizationIdentifier=VATVN-/],
     ['issuing CA without pathlen:0', x5c('under-issuing-no-pathlen', 'issuing-no-pathlen'), /issuing CA must have CA:TRUE and pathLenConstraint 0/],
     ['issuing CA with CA:FALSE', x5c('under-issuing-ca-false', 'issuing-ca-false'), /issuing CA must have CA:TRUE/],
-    ['issuing CA without keyCertSign', x5c('under-issuing-no-key-cert-sign', 'issuing-no-key-cert-sign'), /issuing CA keyUsage must include keyCertSign/],
+    ['issuing CA without keyCertSign', x5c('under-issuing-no-key-cert-sign', 'issuing-no-key-cert-sign'), /issuing CA keyUsage must be exactly keyCertSign and cRLSign/],
     ['root with CA:FALSE', x5c('under-root-ca-false', 'issuing-under-root-ca-false'), /root must have CA:TRUE/, pin('root-ca-false')],
-    ['root without keyCertSign', x5c('under-root-no-key-cert-sign', 'issuing-under-root-no-key-cert-sign'), /root keyUsage must include keyCertSign/, pin('root-no-key-cert-sign')],
+    ['root without keyCertSign', x5c('under-root-no-key-cert-sign', 'issuing-under-root-no-key-cert-sign'), /root keyUsage must be exactly keyCertSign and cRLSign/, pin('root-no-key-cert-sign')],
     ['unknown critical extension', x5c('critical-ext'), /unknown critical extension 1\.3\.6\.1\.4\.1\.55555\.1/],
   ];
   for (const [name, chain, detail, v] of cases) {
@@ -51,17 +51,24 @@ describe('ISSUER_MISMATCH', () => {
     assert.equal((await run(x5c('status'), 'vc', validator, `${ISS}/truong-mau`)).code, ErrorCodes.ISSUER_MISMATCH);
     assert.equal((await run(x5c('vc'), 'vc', validator, `${ISS}/nha-san-xuat`)).code, ErrorCodes.ISSUER_MISMATCH);
   });
-  test('without expectedIssuerUri the SAN is not checked and the check is not listed', async () => {
-    const r = await run(x5c('wrong-san'));
-    assert.equal(r.ok, true);
-    assert.equal(r.checks.some((c) => c.id === 'issuer_uri'), false);
+  test('the match is exact string equality with a SAN URI', async () => {
+    for (const near of [`${ISS}/truong-mau/`, `${ISS}/Truong-mau`, `${ISS}/truong-mau#x`, 'https://API-identra.awncorp.vn/issuers/truong-mau', `${ISS}/truong-ma`]) {
+      assert.equal((await run(x5c('vc'), 'vc', validator, near)).code, ErrorCodes.ISSUER_MISMATCH, near);
+    }
+  });
+  test('expectedIssuerUri is required for vc and forbidden for the other profiles', async () => {
+    await assert.rejects(validator.validate({ x5c: x5c('vc'), profile: 'vc', now: NOW } as never), TypeError);
+    for (const profile of ['status', 'request', 'trust-list'] as const) {
+      await assert.rejects(validator.validate({ x5c: x5c('status'), profile, now: NOW, expectedIssuerUri: `${ISS}/truong-mau` } as never), TypeError);
+    }
   });
 });
 
 describe('profile trust-list', () => {
   test('accepts exactly one CA:FALSE certificate signed directly by the root', async () => {
     assert.equal((await run([b64(leaf('trust-list'))], 'trust-list')).ok, true);
-    assert.equal((await run([b64(leaf('trust-list-no-org-id'))], 'trust-list')).ok, true, 'organizationIdentifier not required');
+    const r = await run([b64(leaf('trust-list-no-org-id'))], 'trust-list');
+    assert.equal(r.code, ErrorCodes.CERT_CONSTRAINT_INVALID, 'the trust-list signer subject follows ADR-0015 section 9 too');
   });
   test('rejects a certificate issued by the issuing CA', async () => {
     assert.equal((await run([b64(leaf('vc'))], 'trust-list')).code, ErrorCodes.CERT_CHAIN_UNTRUSTED);
@@ -93,14 +100,16 @@ describe('two pinned roots', () => {
   });
 });
 
-describe('DEMO PKI (make-demo-pki.sh) at the current time', () => {
+describe('DEMO PKI (make-demo-pki.sh), one day after it was made', () => {
   const demo = createCertificateChainValidator({
     trustedRoots: pemCerts(pemFile('demo/root.cert.pem')),
     verifier: webCryptoVerifier,
     hasher: webCryptoHasher,
   });
   const chainOf = (path: string) => pemCerts(pemFile(path)).map(b64);
-  const now = new Date();
+  // A fixed instant derived from the set itself (its last certificate's notBefore + 1 day), so the
+  // test does not depend on the wall clock or on when .pki/demo was generated.
+  const now = new Date(parseCertificate(pemCerts(pemFile('demo/trust-list-signer/trust-list.cert.pem'))[0]!).notBefore.getTime() + 86_400_000);
   const orgs: [string, string, CertificateProfile, string?][] = [
     ['truong-mau', 'vc', 'vc', `${ISS}/truong-mau`],
     ['truong-mau', 'status', 'status'],

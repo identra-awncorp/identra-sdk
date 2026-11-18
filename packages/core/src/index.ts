@@ -13,10 +13,12 @@ export { issueCredential, issueDiploma, issueProductEvent, type IssuerContext, t
 export { createPresentation } from './sd-jwt/present.js';
 export { decodeCredentialUnverified, type UnverifiedCredential } from './sd-jwt/compact.js';
 export {
-  verifyCredential,
+  verifyPresentation,
+  verifyStoredCredential,
   type CredentialVerificationResult,
   type VerifiedCredential,
   type VerifyCredentialOptions,
+  type VerifyPresentationOptions,
 } from './sd-jwt/verify.js';
 // Status list and trust list (GĐ7a, docs/architecture.md section 7).
 export {
