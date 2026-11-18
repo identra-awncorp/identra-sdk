@@ -56,3 +56,16 @@ export {
 export { createTrustListToken, TRUST_LIST_TOKEN_MAX_BYTES, TRUST_LIST_TOKEN_TYP, verifyTrustListToken, type VerifiedTrustListToken } from './trust/token.js';
 export { createSignedTrustListRegistry, TRUST_LIST_MAX_FRESH_SECONDS, type SignedTrustListRegistry } from './trust/registry.js';
 export { createMappedFetch } from './mapped-fetch.js';
+// Product lifecycle chain (GĐ6b, docs/architecture.md section 10).
+export { formatDigitalLinkPath, formatProductCode, gs1CheckDigit, parseDigitalLinkPath, parseProductCode, type ProductCode } from './product/gs1.js';
+export { parseUtcInstant } from './sd-jwt/credential-types.js';
+export {
+  PRODUCT_CHAIN_LIMITS,
+  productEventHash,
+  verifyProductChain,
+  type ProductChainEvent,
+  type ProductChainResult,
+  type ProductChainState,
+  type ProductEventView,
+  type VerifyProductChainOptions,
+} from './product/chain.js';

@@ -19,7 +19,7 @@ import { x5c } from './helpers/pki.js';
 const PRODUCT: ProductEventClaims = {
   ma_san_pham: '(01)09520123456788(21)SN-0001',
   cong_doan: 'san_xuat',
-  thoi_diem: '2026-05-30T08:00:00+07:00',
+  thoi_diem: '2026-05-30T01:00:00Z',
   dia_diem: 'Hà Nội',
   mo_ta: 'Sản xuất lô 1',
 };

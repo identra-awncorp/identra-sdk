@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  createSignedTrustListRegistry, STATUS_LIST_BYTES, verifyStatusListToken, type HttpFetch, type RandomSource,
+  base64Decode, createSignedTrustListRegistry, parseCertificate, STATUS_LIST_BYTES, verifyStatusListToken, type HttpFetch, type RandomSource,
 } from '@identra/sdk-core';
 import { webCryptoRandom, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import {
@@ -45,6 +45,7 @@ test('collisions are retried; when the draws fail, allocation rolls over to the 
   assert.deepEqual(got.map((g) => g.idx).sort(), [7, 8, 9]);
   const next = await service.allocate('truong-mau');
   assert.equal(next.uri, URI(2));
+  assert.equal(next.n, 2);
   assert.ok([7, 8, 9].includes(next.idx));
 });
 
@@ -70,13 +71,13 @@ test('an index that is not 0 is never handed out, so no credential is born revok
   const bytes = new Uint8Array(STATUS_LIST_BYTES);
   bytes[1] = 0b01 << 2; // entry 5 (bits 2-3 of byte 1) revoked without an allocation, as old data might be
   assert.equal(await storage.save('truong-mau', 1, bytes, null), true);
-  assert.deepEqual(await service.allocate('truong-mau'), { uri: URI(1), idx: 6 });
+  assert.deepEqual(await service.allocate('truong-mau'), { uri: URI(1), n: 1, idx: 6 });
 });
 
 test('status changes only for allocated indexes; revoked is final', async () => {
   const { service, storage } = setup(indexes(5));
   await assert.rejects(service.setStatus('truong-mau', 1, 5, 'revoked'), StatusIndexNotAllocatedError);
-  assert.deepEqual(await service.allocate('truong-mau'), { uri: URI(1), idx: 5 });
+  assert.deepEqual(await service.allocate('truong-mau'), { uri: URI(1), n: 1, idx: 5 });
   const v0 = (await storage.load('truong-mau', 1))!.version;
   await service.setStatus('truong-mau', 1, 5, 'suspended');
   await service.setStatus('truong-mau', 1, 5, 'valid');
@@ -111,6 +112,7 @@ test('token: null for a list that does not exist; n is bounded', async () => {
 
 test('iat strictly increases: same-second re-sign, clock step back, restart with the persisted lastIat', async () => {
   const { service, storage, clock } = setup(indexes(10, 11));
+  clock.advance(600);
   await service.allocate('truong-mau');
   await service.allocate('truong-mau');
   const t1 = (await service.token('truong-mau', 1))!;
@@ -119,10 +121,13 @@ test('iat strictly increases: same-second re-sign, clock step back, restart with
   assert.equal(iatOf(t2), iatOf(t1) + 1, 'same second: iat + 1');
   clock.advance(-30);
   await service.setStatus('truong-mau', 1, 11, 'suspended');
+  assert.equal(await service.token('truong-mau', 1), t2, 'clock stepped back 30 s: the held token is served, not one 31 s ahead');
+  clock.advance(30);
   const t3 = (await service.token('truong-mau', 1))!;
-  assert.equal(iatOf(t3), iatOf(t2) + 1, 'clock stepped back');
+  assert.equal(iatOf(t3), iatOf(t2) + 1, 'once the clock caught up: iat + 1');
+  clock.advance(-30);
   const restarted = createStatusListService({ issuerUri, keyStore, storage, random: webCryptoRandom, clock });
-  assert.equal(iatOf((await restarted.token('truong-mau', 1))!), iatOf(t3) + 1, 'restart: from the stored lastIat');
+  assert.equal(iatOf((await restarted.token('truong-mau', 1))!), iatOf(t3) + 1, 'restart with nothing held: from the stored lastIat, up to 60 s ahead');
 });
 
 test('the token verifies with the core verifier; re-signed on change and after one hour', async () => {
@@ -154,4 +159,95 @@ test('the token verifies with the core verifier; re-signed on change and after o
   // Signed with the status certificate of Truong Mau: not valid for another organisation's credentials.
   const other = await verifyStatusListToken(t3, { uri: URI(), issuer: { maToChuc: 'VATVN-0100000002' }, chainValidator, trustRegistry, verifier: webCryptoVerifier, now: clock.now() });
   assert.equal(other.ok, false);
+});
+
+test('setStatus with opts.storage does the whole update on that storage (the caller\'s transaction)', async () => {
+  const shared = createMemoryStatusListStorage();
+  const counting = (log: string[]): StatusListStorage => ({
+    load: (...a) => (log.push('load'), shared.load(...a)),
+    save: (...a) => (log.push('save'), shared.save(...a)),
+    recordIat: (...a) => (log.push('recordIat'), shared.recordIat(...a)),
+    reserve: (...a) => (log.push('reserve'), shared.reserve(...a)),
+    isReserved: (...a) => (log.push('isReserved'), shared.isReserved(...a)),
+  });
+  const service: string[] = [];
+  const tx: string[] = [];
+  const s = createStatusListService({ issuerUri, keyStore, storage: counting(service), random: webCryptoRandom, clock: fakeClock() });
+  const { n, idx } = await s.allocate('truong-mau');
+  service.length = 0;
+  await s.setStatus('truong-mau', n, idx, 'revoked', { storage: counting(tx) });
+  assert.deepEqual(service, [], 'the service storage is not used');
+  assert.deepEqual(tx, ['isReserved', 'load', 'save']);
+  await s.setStatus('truong-mau', n, idx, 'revoked');
+  assert.deepEqual(service, ['isReserved', 'load'], 'already revoked: read through the default storage, nothing saved');
+});
+
+test('a burst of 200 changes never pushes iat more than 5 s ahead; the final state is served soon after; every token verifies', async () => {
+  const clock = fakeClock(new Date(Date.now() + 600_000));
+  const storage = createMemoryStatusListStorage();
+  const service = createStatusListService({ issuerUri, keyStore, storage, random: webCryptoRandom, clock });
+  const trust = createTrustListService({ source: () => TRUST_CONTENT, keyStore, clock });
+  const fetch: HttpFetch = async () => ({ status: 200, headers: { get: () => null }, text: () => trust.token() });
+  const chainValidator = validatorFor(DEMO);
+  const trustRegistry = createSignedTrustListRegistry({ url: 'https://api-identra.awncorp.vn/trust-list', fetch, verifier: webCryptoVerifier, chainValidator, clock, maxAgeSeconds: 0 });
+  const read = async (token: string | null) => {
+    const r = await verifyStatusListToken(token, { uri: URI(), issuer: { maToChuc: 'VATVN-0100000001' }, chainValidator, trustRegistry, verifier: webCryptoVerifier, now: clock.now() });
+    assert.ok(r.ok, r.ok ? '' : `${r.reason}: ${r.detail}`);
+    return r;
+  };
+  const got = [];
+  for (let i = 0; i < 200; i++) got.push(await service.allocate('truong-mau'));
+  for (const [i, g] of got.entries()) {
+    await service.setStatus('truong-mau', 1, g.idx, 'revoked');
+    const token = (await service.token('truong-mau', 1))!;
+    assert.ok(iatOf(token) <= Math.floor(clock.now().getTime() / 1000) + 5, `change ${i}`);
+    await read(token);
+    clock.advance(0.035); // 200 changes in 7 s
+  }
+  let seconds = 0;
+  for (;;) {
+    const r = await read(await service.token('truong-mau', 1));
+    if (got.every((g) => r.list.getStatus(g.idx) === 1)) break;
+    assert.ok(++seconds <= 6, 'the final state is served within 6 s after the burst');
+    clock.advance(1);
+  }
+  // A single change after a quiet second is visible at once.
+  clock.advance(10);
+  const one = await service.allocate('truong-mau');
+  await service.setStatus('truong-mau', 1, one.idx, 'suspended');
+  assert.equal((await read(await service.token('truong-mau', 1))).list.getStatus(one.idx), 2);
+});
+
+test('a stored lastIat more than 60 s ahead is ignored once, reported, and never poisons later tokens', async () => {
+  const clock = fakeClock(new Date(Date.now() + 600_000));
+  const storage = createMemoryStatusListStorage();
+  const reasons: string[] = [];
+  const service = createStatusListService({ issuerUri, keyStore, storage, random: webCryptoRandom, clock, onError: (r, issuer) => reasons.push(`${r}:${issuer}`) });
+  await service.allocate('truong-mau');
+  const nowS = Math.floor(clock.now().getTime() / 1000);
+  await storage.recordIat('truong-mau', 1, nowS + 142);
+  const t1 = (await service.token('truong-mau', 1))!;
+  assert.equal(iatOf(t1), nowS);
+  const g = await service.allocate('truong-mau');
+  await service.setStatus('truong-mau', 1, g.idx, 'revoked');
+  assert.equal(iatOf((await service.token('truong-mau', 1))!), nowS + 1, 'still strictly increasing');
+  assert.deepEqual(reasons, ['last_iat_in_future:truong-mau']);
+});
+
+test('an expired status certificate signs nothing: the held token is served until its exp, then the call fails', async () => {
+  const signer = await keyStore.signer('truong-mau', 'status');
+  const notAfter = Math.floor(parseCertificate(base64Decode(signer.x5c![0]!)).notAfter.getTime() / 1000);
+  const clock = fakeClock(new Date((notAfter - 3600) * 1000));
+  const reasons: string[] = [];
+  const service = createStatusListService({ issuerUri, keyStore, storage: createMemoryStatusListStorage(), random: webCryptoRandom, clock, onError: (r) => reasons.push(r) });
+  const g = await service.allocate('truong-mau');
+  const held = (await service.token('truong-mau', 1))!;
+  assert.deepEqual(service.current('truong-mau', 1), { iat: iatOf(held), exp: iatOf(held) + 86_400, signerNotAfter: notAfter });
+  clock.advance(7200);
+  await service.setStatus('truong-mau', 1, g.idx, 'revoked');
+  assert.equal(await service.token('truong-mau', 1), held, 'not replaced by a token that would not verify');
+  assert.deepEqual(reasons, ['signer_expired']);
+  clock.advance(86_400);
+  await assert.rejects(service.token('truong-mau', 1), /no token can be served/);
+  assert.equal(service.current('truong-mau', 2), null);
 });

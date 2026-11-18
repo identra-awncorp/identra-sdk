@@ -14,9 +14,9 @@ call the SDK (ADR-0005).
 |---|---|---|---|
 | `@identra/sdk-core` | Node, browser, React Native | Interfaces, JWS, X.509 chain validation, SD-JWT VC issue / present / verify, verification policy, status list, trust list, product chain, `did:jwk` | `@sd-jwt/core`, `@sd-jwt/sd-jwt-vc`, `@owf/token-status-list`, `micro-key-producer` |
 | `@identra/sdk-core/webcrypto` | Node, browser | `Signer` / `Verifier` / `Hasher` / `RandomSource` on `globalThis.crypto` | none |
-| `@identra/sdk-server` | Node | Key store, OpenID4VCI issuer, status list and trust list signing, OpenID4VP verifier | `@openid4vc/openid4vci`, `@openid4vc/openid4vp`, `@openid4vc/oauth2`, `dcql`, `jose` |
-| `@identra/sdk-app` | React Native, Node (simulated wallet) | `@noble` crypto adapters, JWE, `WalletKeyStore`, `CredentialStore`, OpenID4VCI client, OpenID4VP wallet | `@noble/curves`, `@noble/hashes`, `@noble/ciphers`, `@openid4vc/openid4vci`, `@openid4vc/openid4vp`, `@openid4vc/oauth2`, `dcql` |
-| `@identra/sdk-client` | browser | Verifier session client for web pages (create session, QR payload, poll result) | none |
+| `@identra/sdk-server` | Node | Key store, OpenID4VCI issuer (section 8), status list and trust list signing (section 7), OpenID4VP verifier (section 9), product-chain append check (section 10) | `@openid4vc/openid4vci`, `@openid4vc/openid4vp`, `@openid4vc/oauth2`, `dcql`, `jose` |
+| `@identra/sdk-app` | React Native, Node (simulated wallet) | `@noble` crypto adapters, JWE, `WalletKeyStore`, credential vault, backup catalogue, the wallet object: OpenID4VCI client (section 8), OpenID4VP wallet (section 9) | `@noble/curves`, `@noble/hashes`, `@noble/ciphers`, `@openid4vc/openid4vci`, `@openid4vc/openid4vp`, `@openid4vc/oauth2`, `dcql` |
+| `@identra/sdk-client` | browser | Verifier session client for web pages (create session, QR payload, poll result); the separate entry `@identra/sdk-client/product` verifies a product chain in the browser (section 10) | none (main entry); `@identra/sdk-core` (product entry) |
 
 Rules:
 
@@ -150,9 +150,9 @@ interface VerifiedCredential {          // only when steps 1–4 passed
 | 5 | `validity_time` | `iat` ≤ now + 60 s, `nbf` ≤ now + 60 s, `exp` > now − 60 s | `NOT_YET_VALID`, `EXPIRED` |
 | 6 | `credential_type` | `vct` is in `supportedVcts` | `VCT_UNSUPPORTED` |
 | 7 | `issuer_trust` | `trustRegistry.lookup(fingerprint, now)` returns an entry with `mucDich` `vc`, `maToChuc` equal to the leaf `organizationIdentifier`, `vct` containing the credential `vct`, and for product events `congDoan` containing the event's `cong_doan`. `TrustListUnavailableError` is `TRUST_LIST_UNAVAILABLE`; any other failure (null, mismatch, other exception) is `ISSUER_NOT_TRUSTED` | `ISSUER_NOT_TRUSTED`, `TRUST_LIST_UNAVAILABLE` |
-| 8 | `status` | Only when step 7 passed, otherwise `SKIPPED` and the `StatusChecker` is not called (no request on behalf of an untrusted issuer). Rules below, then the checker's answer: `valid` passes, `revoked` / `suspended` map to their codes, anything else or an exception is `STATUS_UNAVAILABLE` | `REVOKED`, `SUSPENDED`, `STATUS_UNAVAILABLE` |
+| 8 | `status` | Only when steps 6 and 7 passed, otherwise `SKIPPED` and the `StatusChecker` is not called (no request on behalf of an untrusted issuer, nor for a credential of a type the caller does not support). Rules below, then the checker's answer: `valid` passes, `revoked` / `suspended` map to their codes, anything else or an exception is `STATUS_UNAVAILABLE` | `REVOKED`, `SUSPENDED`, `STATUS_UNAVAILABLE` |
 | 9 | `holder_binding` | Always listed by `verifyPresentation`; listed by `verifyStoredCredential` when the compact carries disclosures. Disclosures (ADR-0008 §6), any failure `DISCLOSURE_INVALID`: a top-level `_sd` exists; each disclosure is `[salt, name, value]` with string salt and name (array-element disclosures are refused); name not `_sd`, `...`, `_sd_alg` nor a metadata claim (`iss`, `vct`, `iat`, `nbf`, `exp`, `cnf`, `status`); no duplicate disclosure; digest referenced by the top-level `_sd`; no two disclosures with one name; no clash with a visible payload claim; no `_sd`, `_sd_alg` or `...` key inside a disclosed value. In `verifyPresentation`, the KB-JWT, any failure `KB_INVALID`: present and at most 4 096 bytes; credential has a valid P-256 `cnf.jwk`; header `typ` `kb+jwt` and `alg` `ES256`; signature by `cnf.jwk`; `sd_hash` = base64url(SHA-256(`<jwt>~<disclosures>~`)) recomputed by the verifier; `iat` within [now − 300 s − 60 s, now + 60 s] (both ends inclusive); `exp`, when present, a number > now − 60 s; `nbf`, when present, a number ≤ now + 60 s. Then `nonce` (`NONCE_MISMATCH`), then `aud` (`AUD_MISMATCH`), so an unsigned KB-JWT never yields a mismatch | `DISCLOSURE_INVALID`, `KB_INVALID`, `NONCE_MISMATCH`, `AUD_MISMATCH` |
-| 10 | `product_chain` | Product events only: `prev` matches the previous credential, stage order (GĐ6b) | `CHAIN_BROKEN` |
+| 10 | `product_chain` | Only in `verifyProductChain` (section 10), listed last for every event (alone at index 3 and later); `SKIPPED` when steps 1–4 failed. The event is a product event of the product being viewed, at its stage position, linked by `prev` to the event before it as received, with a `thoi_diem` that is a valid ISO instant, not later than its own `iat` + 60 s and not earlier than the previous valid step; the five claims are strings of 1–500 characters (`MALFORMED` otherwise) | `CHAIN_BROKEN`, `MALFORMED` |
 
 Other codes: `CLIENT_ID_MISMATCH`, `VERIFIER_NOT_TRUSTED` (wallet checking a
 presentation request), `DID_RESOLUTION_FAILED`, `KEY_NOT_FOUND` (`did:jwk`
@@ -254,9 +254,13 @@ value as an OpenID4VP `x509_hash`.
   `https://identra.awncorp.vn/vct/su-kien-vong-doi/v1`; no disclosures, no
   `cnf`; claims `ma_san_pham` (GS1 element string `(01)<GTIN>(21)<serial>`),
   `cong_doan` (`san_xuat` | `kiem_dinh` | `phan_phoi`), `thoi_diem`,
-  `dia_diem`, `mo_ta`, and `prev` = base64url(SHA-256(previous compact)) on
-  every event but the first; all strings of at most 500 characters; has
-  `status`; no `exp`.
+  `dia_diem`, `mo_ta`, and `prev` = base64url(SHA-256(previous compact, its
+  trailing `~` included)) on every event but the first (the first has no `prev`
+  claim at all); all strings of at most 500 characters; `thoi_diem` an ISO 8601
+  UTC instant (`YYYY-MM-DDTHH:MM:SS[.sss]Z`, `parseUtcInstant`) not later than
+  the event's `iat` + 60 s; has `status`; no `exp`. The issuer refuses a
+  `ma_san_pham` that `parseProductCode` refuses and a `thoi_diem` that is not
+  such an instant or is later than the time of issuance + 60 s (section 10).
 - Header of both: `{ alg: 'ES256', typ: 'dc+sd-jwt', x5c: [leaf, issuingCa] }`,
   no `kid`. `iss` = `https://api-identra.awncorp.vn/issuers/<name>`.
 - Metadata claims (`iss`, `vct`, `iat`, `nbf`, `exp`, `cnf`, `status`) are never
@@ -369,13 +373,17 @@ empty.
   section, an empty issuer `vct`; a `signer_not_before` later than the signer
   certificate's notBefore (`claims`); a signer certificate whose notBefore is
   earlier than `minSignerNotBefore` (`not_trusted`).
-- `signer_not_before` (ADR-0019 §2): after a trust-list signer is replaced, the server
-  publishes lists carrying the new certificate's notBefore; the registry remembers
+- `signer_not_before` (ADR-0019 §2): the server publishes every list with its
+  signer certificate's notBefore, so after a trust-list signer is replaced the lists
+  carry the new certificate's notBefore; the registry remembers
   the largest value of any verified list (and persists it with `seen`) and refuses
   lists of older signer certificates from then on.
 - `createStatusListChecker({ fetch, verifier, chainValidator, trustRegistry, clock, maxAgeSeconds?, seen? })`
   (`StatusChecker`): refuses a non-https `uri` and an `idx` outside the list without a
-  request; `GET` with `timeoutMs: 5000`, HTTP 200 only; caches per `uri` by the rules
+  request; the injected fetch decides which hosts are reachable at all (the wallet
+  admits only `/status/<n>` URLs, the server answers only its own lists and refuses
+  every other status URL itself); `GET` with `timeoutMs: 5000` and `maxBytes`,
+  HTTP 200 only; caches per `uri` by the rules
   of section 5 (a list is verified for any trusted `status` signer whose organisation
   matches its trust list entry); every answer re-checks the signer against the trust
   list and against the caller's issuer organisation. Every failure is `'unavailable'`.
@@ -405,26 +413,51 @@ empty.
   `allocate(issuer)` draws random indexes of the issuer's current list (64 draws),
   claims one with `storage.reserve`, which must be atomic (Postgres: unique key
   `(issuer, n, idx)`, `INSERT … ON CONFLICT DO NOTHING`), so two concurrent
-  allocations never get one index, and only returns an index whose value is 0;
+  allocations never get one index, and only returns an index whose value is 0, as
+  `{ uri, n, idx }`;
   when the draws fail it moves to list `n + 1` (created), and throws
   `StatusListFullError` only when that fails too. The current list number is kept
-  in memory and starts at 1 after a restart. `setStatus` requires a reserved index
+  in memory and starts at 1 after a restart. `setStatus(issuer, n, idx, status,
+  { storage }?)` runs on `storage` instead of the service's when given (a storage
+  bound to the caller's database transaction), requires a reserved index
   (`StatusIndexNotAllocatedError`), uses `storage.save(…, expectedVersion)`
   (optimistic concurrency, 5 attempts), and keeps `revoked` final
   (`StatusRevokedError`). `token(issuer, n)` (`n` 1–999 999 999) is `null` for a
   list that does not exist (HTTP 404), is re-signed when the stored version changed
   or the token is an hour old, with `iat = max(now, lastIat + 1)` and `lastIat`
-  stored with the list; at most 1000 tokens are cached. Bursts of more than one
-  change per second make `iat` run ahead of the clock by that many seconds;
-  beyond 60 s clients would refuse the list as `not_yet_valid`.
-- `createTrustListService({ source, keyStore, clock, signerNotBefore?, lastToken?, onError? })`
+  stored with the list; at most 1000 tokens are cached. Signing rules (both list
+  services): a new `iat` is never more than 5 s ahead of the clock while a held
+  token can be served — under a burst the held token is served and the changes
+  appear at the next allowed signing, so after a quiet moment a single change is
+  visible at once and under sustained bursts a change waits at most about one
+  second (one signing per second); with nothing held (after a restart) up to 60 s
+  ahead is accepted, the skew verifiers allow. A stored `lastIat` more than 60 s
+  ahead is ignored (`onError('last_iat_in_future', issuer)`, once per list), and
+  this process keeps its own last `iat` so tokens still never repeat one. Before
+  signing, the status certificate must be inside its validity: otherwise
+  (`onError('signer_expired', issuer)`) the held token is served until its `exp`,
+  then `token` throws. `current(issuer, n)` gives `{ iat, exp, signerNotAfter }`
+  of the held token, or null (ADR-0014 §7).
+- `createTrustListService({ source, keyStore, clock, signerNotBefore?, lastToken?, onError?, lastIatStore? })`
   validates the source with the core validator and re-signs when it changed or
   after an hour, with `iat = max(now, lastIat + 1)`; `lastIat` is in memory and,
-  after a restart, taken from `lastToken` when the server kept it (otherwise a
-  restart within the same second as the last signature can repeat an `iat`, and
-  clients then keep their copy until the next one). An invalid or failing source:
-  the last good token is served unchanged until its `exp` and `onError` is called;
-  with none, the call throws.
+  after a restart, taken from `lastIatStore.get()` (read once before the first
+  signature; `set(iat)` after each one, and a failing store fails the call) and
+  from `lastToken` when the server kept it (with neither, a restart within the
+  same second as the last signature can repeat an `iat`, and clients then keep
+  their copy until the next one). An invalid or failing source: the last good
+  token is served unchanged until its `exp` and `onError('source_invalid' |
+  'source_threw')` is called; with none, the call throws `Error('trust list
+  source_invalid' | 'trust list source_threw')`. Neither carries validator detail
+  nor the source's own error, which could quote file content. The signing rules
+  of the status list service apply (5 s lead, `last_iat_in_future` for a
+  `lastToken` or stored `iat` more than 60 s ahead, `signer_expired` for a signer
+  certificate outside its validity; the error thrown with nothing held is
+  `Error('trust list <reason>')`). Every token carries `signer_not_before` = the
+  signer certificate's notBefore (ADR-0019 §2: after a signer replacement, every
+  client that fetched the new list refuses lists of older signer certificates);
+  `signerNotBefore` overrides it and may not be later. `current()` gives `{ iat,
+  exp, issuers, verifiers, signerNotAfter }` of the held token, or null (ADR-0014 §7).
 - `scripts/pki/make-trust-list-source.mjs <demo-pki-dir> [--out file]` writes the
   trust-list source of the demo organisations (`validFrom` = latest notBefore,
   `validUntil` = earliest notAfter of the organisation's certificates).
@@ -776,3 +809,154 @@ Known limitations:
   `credential_sets` options are refused by the wallet (`REQUEST_INVALID`); the
   Identra scenarios use none.
 - `purpose` is the verifier's own text, shown as sent.
+
+## 10. Product chain (GĐ6b, ADR-0012)
+
+GS1 identifiers (`sdk-core`, `product/gs1.ts`; GS1 General Specifications 7.9.1,
+3.5.2, figure 7.11-1; GS1 Digital Link URI syntax 4.2). Identra prints and accepts
+exactly `/01/<GTIN-14>/21/<serial>`: lot or other key qualifiers, GTIN-8/12/13,
+trailing slashes, raw sub-delimiters and lower-case percent-escapes are refused on
+purpose, so each product has exactly one accepted path.
+
+- GTIN: exactly 14 digits with a valid check digit (`gs1CheckDigit`: weights 3, 1,
+  3, … from the right). Serial, AI (21): 1–20 characters of set 82; refused also
+  when it contains `%` followed by two hex digits (it would look percent-encoded,
+  so element string and path stay one-to-one) and when it is `.` or `..` (a dot
+  segment to every URL parser).
+- `parseProductCode('(01)<GTIN>(21)<serial>')` / `formatProductCode(gtin, serial)`;
+  `parseDigitalLinkPath('/01/<GTIN>/21/<serial>')` / `formatDigitalLinkPath`.
+  The path parser accepts only what the formatter writes (at most 82 characters):
+  a serial character is raw only when it is `A–Z a–z 0–9 - . _`, every other
+  set-82 character is an upper-case percent-escape, and an escape of a raw
+  character (`%41`) is refused. Parsers return `{ gtin, serial }` or `null`;
+  formatters throw `TypeError`.
+
+`productEventHash(compact, hasher)` = base64url(SHA-256(the exact compact string
+including its trailing `~`)), the `prev` of the next event (a fixed test vector
+pins the wire format).
+
+`verifyProductChain({ gtin, serial, events }, options)` (`options` = the
+dependencies of `verifyStoredCredential` without `supportedVcts`, which is fixed to
+the product-event `vct`) never throws for bad `events` (`TypeError` for an invalid
+`gtin` / `serial` or options: parse the URL first) and returns:
+
+```ts
+interface ProductChainResult {
+  state: 'verified' | 'in_progress' | 'failed';   // the one verdict a page uses
+  ok: boolean;                                     // state === 'verified'
+  complete: boolean;                               // state === 'verified'
+  code: ErrorCode | null;                          // null unless failed (see 6)
+  missingStages: CongDoan[];                       // the stages to come when in_progress, else []
+  events: Array<{ index: number; ok: boolean; checks: Check[]; event?: ProductEventView }>;
+}
+interface ProductEventView { congDoan; thoiDiem; diaDiem; moTa; maSanPham: string; issuer: { maToChuc; ten } }
+```
+
+1. Before any work: `events` not an array, empty, or with a non-string entry →
+   `MALFORMED`; more than 20 entries or more than 20 × 16 384 characters in total
+   → `TOO_LARGE`. Then `state: 'failed'`, `events: []`, nothing is hashed or fetched.
+2. Events are verified one after another with `verifyStoredCredential`, so each
+   status list and the trust list are fetched at most once per chain (the caches
+   answer later events). Each event's checks are followed by `product_chain`. An
+   event at index 3 or later has only `product_chain` `CHAIN_BROKEN` (no stage
+   exists after `phan_phoi`): it is not parsed, hashed or verified.
+3. `product_chain` is `SKIPPED` when the event's steps 1–4 failed. Otherwise the
+   first rule broken gives its code:
+   - `vct` is the product-event `vct` (`CHAIN_BROKEN`);
+   - `ma_san_pham`, `cong_doan`, `thoi_diem`, `dia_diem`, `mo_ta` are strings of
+     1–500 characters (`MALFORMED`: an issuer bypassing `issueProductEvent`);
+   - `ma_san_pham` = `formatProductCode(gtin, serial)` of the page (`CHAIN_BROKEN`);
+   - `cong_doan` is the stage of its position: index 0 `san_xuat`, 1 `kiem_dinh`,
+     2 `phan_phoi`. This one rule covers wrong order, repeats, a missing first
+     stage, gaps and branching (`CHAIN_BROKEN`);
+   - index 0 has no `prev` claim; index n > 0 has `prev` = `productEventHash` of
+     entry n − 1 exactly as received, whatever that entry's own result
+     (`CHAIN_BROKEN`);
+   - `thoi_diem` is an ISO 8601 UTC instant naming a real date (years 0000–9999),
+     not later than the event's own `iat` + 60 s (and `iat` is at most now + 60 s,
+     step 5), and not earlier than the `thoi_diem` of entry n − 1 when that
+     entry's own `product_chain` passed (equal allowed; otherwise not compared, so
+     a broken or future-dated step never blocks the honest steps after it)
+     (`CHAIN_BROKEN`). There is no lower bound.
+4. Consequences: a tampered event N fails its own steps 1–4 (`SIGNATURE_INVALID`
+   or `MALFORMED`, `product_chain` `SKIPPED`), and N + 1 is `CHAIN_BROKEN` because
+   its `prev` no longer matches N's bytes. A revoked or suspended event N fails
+   only its `status` check; N + 1 still links, so the page shows red at N only. A
+   stage signed by an organisation whose trust list entry lacks that `cong_doan`
+   fails `issuer_trust` (`ISSUER_NOT_TRUSTED`, step 7) and its status list is not
+   fetched; so does a stage of a credential type other than the product event
+   (`credential_type`, step 6).
+5. `event` is returned only when every check but `status` passed: steps 1–7 and
+   `product_chain` ok, `status` ok or `REVOKED` / `SUSPENDED` /
+   `STATUS_UNAVAILABLE` (a revoked step is shown in red, with who signed it).
+   Text of an untrusted issuer, of an organisation removed from the trust list, or
+   of a broken link is never handed out. Values are verbatim: the SDK neither
+   interprets nor strips HTML; the page renders them as text (ADR-0012 security
+   requirement 2).
+6. `state`: `verified` = three events, every event ok; `in_progress` = one or two
+   events, every event ok (a correct prefix: a product mid-way, not an error;
+   `missingStages` lists the rest); `failed` = anything else, with `code` the
+   list-level code of 1 or else the first failing check's code of the first
+   failing event.
+
+`sdk-server` (`product-chain.ts`):
+
+- `appendProductEvent({ gtin, serial, existing, signer, hasher, random, clock, iss,
+  status, claims: { congDoan, thoiDiem, diaDiem, moTa }, verify })` → compact.
+  Runs `verifyProductChain` on `existing` first (with `verify`) and throws
+  `ProductChainRefusedError { index, code }` unless every stored event is fully
+  ok: a forged, broken, revoked, suspended or unverifiable predecessor is never
+  extended, and a complete chain is refused with index 3 and `CHAIN_BROKEN`
+  (index `null` for a list-level code). Then `TypeError` for a stage that is not
+  the next one or a `thoiDiem` earlier than the last stored one; `ma_san_pham`
+  comes from `gtin` / `serial`, `prev` from the last stored compact, and
+  `issueProductEvent` checks the rest.
+- `checkProductEventForStorage({ gtin, serial, existing, candidate }, options)` →
+  `{ ok: true } | { ok: false, code, index, checks }`: `verifyProductChain` of
+  `existing + candidate` must be `in_progress` or `verified`, i.e. the stored
+  events fully ok and the candidate extending them. Otherwise the first failing
+  event (stored or candidate) with its first failing code and its checks; `index`
+  `null` and no checks for a list-level code.
+
+`sdk-client/product` (separate entry; the main entry imports only types from
+`sdk-core`, and a bundle test keeps it that way):
+`createProductVerifier({ apiBaseUrl, canonicalApiOrigin = 'https://api-identra.awncorp.vn',
+rootCertificates, fetch?, now? })` → `{ load(gtin, serial) }`. One chain validator
+(pinned roots), signed trust list registry (`<canonical>/trust-list`) and status
+checker per verifier, on `createMappedFetch(canonical → apiBaseUrl)` over a
+browser `HttpFetch` that enforces `timeoutMs` over the whole exchange, a body cap
+of 20 × 16 384 + 4 096 bytes, `redirect: 'error'`, `credentials: 'omit'`,
+`referrerPolicy: 'no-referrer'`, `cache: 'no-store'`. The registry and the checker
+get a fetch that refuses, before any mapping, every URL other than
+`<canonical>/trust-list` and `<canonical>/issuers/…`: a trusted certificate whose
+SAN (and so `iss` and status URI) names another host causes no request there
+(`STATUS_UNAVAILABLE`). `load` GETs `<canonical>/v1/products/<gtin>/<serial
+percent-encoded as in the Digital Link>/events` (timeout 5 s), requires `{ gtin,
+serial, events: [], serverTime? }` echoing the request, runs `verifyProductChain`
+and returns `{ state: 'ok' | 'not_found' | 'network_error' | 'invalid_response',
+gtin, serial, result?, verifiedAt, serverTime?, clockSkewSeconds? }` (404 →
+`not_found`; other non-200, timeout, network or redirect → `network_error`;
+oversized, non-JSON, wrong shape or a `serverTime` that is not a `parseUtcInstant`
+instant → `invalid_response`). `serverTime` (the store's clock, from the envelope)
+and `clockSkewSeconds` (local now − serverTime) are a hint only, for the "giờ máy
+chưa đúng" message (ADR-0012 requirement 5) next to certificates that look not yet
+valid or a trust list that looks expired; no check uses them (the status list's
+`iat` is not exposed by the `StatusChecker` interface).
+
+Known limits:
+
+- Replay and truncation by the store are undetectable by design: the store
+  chooses which events it returns, so it can serve an older valid chain or drop
+  the latest events, and the page then shows an earlier state (`in_progress`).
+  It cannot hide a revocation this way: status lists are fetched and verified
+  separately.
+- A copied QR: the chain proves the record, not the box in hand (ADR-0012 "Giới
+  hạn đã biết").
+- No binding between a GTIN company prefix and an organisation: any organisation
+  allowed to sign `san_xuat` can start a chain for any GTIN. To be closed with a
+  `gtin_prefix` scope in the trust list.
+- ECDSA signatures are malleable ((r, s) and (r, n − s) both verify): anyone can
+  re-encode event N into different bytes that still verify, and N + 1's `prev`
+  then no longer matches, so the blame lands on N + 1 (`CHAIN_BROKEN`).
+- The product entry bundle is 684 KB minified (168 KB gzip), two thirds of it
+  `zod` pulled in by `@owf/token-status-list` (ADR-0017).

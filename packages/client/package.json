@@ -12,6 +12,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./product": {
+      "types": "./dist/product.d.ts",
+      "import": "./dist/product.js",
+      "default": "./dist/product.js"
     }
   },
   "files": [

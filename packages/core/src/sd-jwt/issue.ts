@@ -12,12 +12,14 @@ import {
   PRODUCT_EVENT_CLAIMS,
   RESERVED_CLAIM_NAMES,
   SD_JWT_LIMITS,
+  parseUtcInstant,
   VCT,
   isStatusListUri,
   type DiplomaClaims,
   type ProductEventClaims,
 } from './credential-types.js';
 import { libIssue } from './library.js';
+import { parseProductCode } from '../product/gs1.js';
 
 export interface IssuerContext {
   /** ES256 signer whose `x5c` is [leaf, issuing CA] and whose leaf has `iss` as a SAN URI. */
@@ -178,7 +180,6 @@ export async function issueDiploma(
   });
 }
 
-const GS1_ELEMENT_STRING = /^\(01\)\d{14}\(21\)[!-~]{1,20}$/;
 const SHA256_BASE64URL = /^[A-Za-z0-9_-]{43}$/;
 
 /** Product lifecycle event: every claim visible, no disclosures, no `cnf`, no `exp`. */
@@ -195,8 +196,15 @@ export async function issueProductEvent(
       fail(`${name} must be a non-empty string of at most ${SD_JWT_LIMITS.maxProductStringLength} characters`);
     }
   }
-  if (!GS1_ELEMENT_STRING.test(claims.ma_san_pham)) fail('ma_san_pham must be a GS1 element string (01)<GTIN>(21)<serial>');
+  if (!parseProductCode(claims.ma_san_pham)) fail('ma_san_pham must be a GS1 element string (01)<GTIN-14 with a valid check digit>(21)<serial of set 82>');
   if (!CONG_DOAN.includes(claims.cong_doan)) fail(`cong_doan must be one of ${CONG_DOAN.join(', ')}`);
+  // Verifiers refuse a thoi_diem later than iat + 60 s (docs/architecture.md section 10).
+  const time = parseUtcInstant(claims.thoi_diem);
+  if (time === null) fail('thoi_diem must be an ISO 8601 UTC instant YYYY-MM-DDTHH:MM:SS[.sss]Z');
+  const now = input.clock?.now?.();
+  if (now instanceof Date && time > Math.floor(now.getTime() / 1000) * 1000 + SD_JWT_LIMITS.clockSkewSeconds * 1000) {
+    fail('thoi_diem must not be later than the time of issuance');
+  }
   if (claims.prev !== undefined && !SHA256_BASE64URL.test(claims.prev)) fail('prev must be base64url of a SHA-256 digest');
   const { signer, hasher, random, clock, iss, status } = input;
   return issueCredential({ signer, hasher, random, clock, iss, status, vct: VCT.productEvent, claims: { ...claims }, disclosable: [] });

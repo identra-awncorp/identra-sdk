@@ -15,6 +15,12 @@ interface HeldList {
   signer: { fingerprint: string; maToChuc: string };
 }
 
+/**
+ * StatusChecker over HTTP. It requests whatever https status-list URI a credential names (the
+ * policy has already reduced it to `<iss>/status/<n>`); the injected fetch decides which hosts are
+ * reachable at all: the wallet's admits only `/status/<n>` URLs, a server's should answer only its
+ * own lists and refuse every other status URL.
+ */
 export function createStatusListChecker(options: {
   fetch: HttpFetch;
   verifier: Verifier;

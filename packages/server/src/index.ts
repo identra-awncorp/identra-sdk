@@ -9,10 +9,11 @@ export {
   StatusRevokedError,
   type StatusListValue,
   type StatusListService,
+  type StatusSigningProblem,
   type StatusListStorage,
   type StoredStatusList,
 } from './status-service.js';
-export { createTrustListService, type TrustListService } from './trust-list-service.js';
+export { createTrustListService, type LastIatStore, type TrustListProblem, type TrustListService } from './trust-list-service.js';
 export { createMemoryStateStore, type ProtocolStateStore } from './state-store.js';
 export type { HttpRequest, HttpResponse } from './issuance/http.js';
 export { generateIssuerKeys, type IssuerKeys } from './issuance/keys.js';
@@ -42,3 +43,4 @@ export {
   type SessionStatus,
 } from './presentation/verifier.js';
 export type { Scenario } from './presentation/library.js';
+export { appendProductEvent, checkProductEventForStorage, ProductChainRefusedError, type AppendProductEventInput, type StorageCheck } from './product-chain.js';
