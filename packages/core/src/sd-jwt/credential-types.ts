@@ -32,6 +32,8 @@ export const SD_JWT_LIMITS = Object.freeze({
   /** Compact (including disclosures and KB-JWT) in bytes (ADR-0007). */
   maxCompactBytes: 16_384,
   maxDisclosures: 50,
+  /** A KB-JWT alone, in bytes. */
+  maxKbJwtBytes: 4096,
   /** Each product event string claim, in characters. */
   maxProductStringLength: 500,
   /** KB-JWT `iat` may be at most this old (ADR-0008 section 4), plus clock skew. */
@@ -50,4 +52,15 @@ export interface ProductEventClaims {
   mo_ta: string;
   /** base64url(SHA-256(previous event compact)); absent on the first event. */
   prev?: string;
+}
+
+const STATUS_LIST_NUMBER = /^[1-9][0-9]{0,8}$/;
+/**
+ * The status list URI of an issuer has exactly the form `<iss>/status/<n>` with n a decimal
+ * 1..999999999 (ADR-0015 section 11). Compared as strings: no URL parsing, so "..", "%2e",
+ * "\\", whitespace, query, fragment, userinfo, port or case variants cannot pass.
+ */
+export function isStatusListUri(uri: unknown, iss: string): boolean {
+  const prefix = `${iss}/status/`;
+  return typeof uri === 'string' && uri.startsWith(prefix) && STATUS_LIST_NUMBER.test(uri.slice(prefix.length));
 }

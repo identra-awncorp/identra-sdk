@@ -5,17 +5,21 @@
 # All dates are fixed so the tests are deterministic: CAs start 2025-01-01, leaves 2026-01-01,
 # and the tests validate at 2026-06-01T00:00:00Z unless they say otherwise.
 # Good material goes through the identra-pki.sh subcommands; negative material, which those
-# subcommands refuse to produce, goes through its internal functions (sourced below).
+# subcommands refuse to produce, goes through the internal functions of pki-lib.sh.
 # Layout: <outdir>/ca/<name>/ca.{key,cert}.pem and <outdir>/leaf/<name>.{key,cert}.pem
 set -euo pipefail
+umask 077
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PKI="$HERE/identra-pki.sh"
-# shellcheck source=identra-pki.sh
-. "$PKI"
+# shellcheck source=pki-lib.sh
+. "$HERE/pki-lib.sh"
+init_run
 
 OUT=${1:?usage: make-test-pki.sh <outdir>}
+check_path "$OUT"
 if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT")" ]; then die "$OUT exists and is not empty"; fi
+make_dir "$OUT" # removed again by finish_run when this run fails
 CA="$OUT/ca"
 LEAF="$OUT/leaf"
 mkdir -p "$CA" "$LEAF"

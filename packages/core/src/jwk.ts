@@ -6,28 +6,57 @@ import type { EcPublicJwk, Hasher } from './interfaces.js';
 // Private members of every JWK key type (RFC 7518 section 6).
 const PRIVATE_MEMBERS = ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k'];
 
-function isCoordinate(v: unknown): v is string {
-  if (typeof v !== 'string') return false;
+// P-256 (SEC 2 / FIPS 186-4): y^2 = x^3 - 3x + b over GF(p).
+const P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn;
+const B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn;
+
+function toBigInt(bytes: Uint8Array): bigint {
+  let n = 0n;
+  for (const b of bytes) n = (n << 8n) | BigInt(b);
+  return n;
+}
+
+/** True when (x, y), 32-byte big-endian coordinates, is a point on P-256 (the point at infinity has no such encoding). */
+export function isP256Point(x: Uint8Array, y: Uint8Array): boolean {
+  if (x.length !== 32 || y.length !== 32) return false;
+  const X = toBigInt(x);
+  const Y = toBigInt(y);
+  if (X >= P || Y >= P || (X === 0n && Y === 0n)) return false;
+  const rhs = (((X * X) % P) * X - 3n * X + B) % P;
+  return (Y * Y) % P === (rhs + P) % P;
+}
+
+function coordinate(v: unknown): Uint8Array | null {
+  if (typeof v !== 'string') return null;
   try {
-    return base64UrlDecode(v).length === 32;
+    const bytes = base64UrlDecode(v);
+    return bytes.length === 32 ? bytes : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
 /**
  * Returns `{ kty, crv, x, y }` for a valid EC P-256 public JWK, dropping every other member,
- * or null when the input is not exactly that (other curve or key type, private members,
- * coordinates that are not strict base64url of 32 bytes). Whether the point lies on the curve
- * is left to the Verifier, which rejects such keys.
+ * or null when the input is not exactly that: other curve or key type, private members,
+ * coordinates that are not strict base64url of 32 bytes, or a point that is not on the curve.
+ * Never throws.
  */
 export function normalizeEcPublicJwk(jwk: unknown): EcPublicJwk | null {
-  if (typeof jwk !== 'object' || jwk === null || Array.isArray(jwk)) return null;
-  const j = jwk as Record<string, unknown>;
-  if (PRIVATE_MEMBERS.some((m) => m in j)) return null;
-  if (j['kty'] !== 'EC' || j['crv'] !== 'P-256') return null;
-  if (!isCoordinate(j['x']) || !isCoordinate(j['y'])) return null;
-  return { kty: 'EC', crv: 'P-256', x: j['x'], y: j['y'] };
+  try {
+    if (typeof jwk !== 'object' || jwk === null || Array.isArray(jwk)) return null;
+    const j = jwk as Record<string, unknown>;
+    if (PRIVATE_MEMBERS.some((m) => m in j)) return null;
+    if (j['kty'] !== 'EC' || j['crv'] !== 'P-256') return null;
+    const xs = j['x'];
+    const ys = j['y'];
+    const x = coordinate(xs);
+    const y = coordinate(ys);
+    if (!x || !y || !isP256Point(x, y)) return null;
+    return { kty: 'EC', crv: 'P-256', x: xs as string, y: ys as string };
+  } catch {
+    return null;
+  }
 }
 
 /** RFC 7638 JWK thumbprint (SHA-256, base64url) of an EC public key. */

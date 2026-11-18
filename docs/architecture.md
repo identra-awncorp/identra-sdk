@@ -57,6 +57,7 @@ type HttpFetch = (url: string, init?: { method?: string; headers?: Record<string
   => Promise<{ status: number; headers: { get(name: string): string | null }; text(): Promise<string> }>;
 
 interface CertificateChainValidator {
+  // expectedIssuerUri: required for profile 'vc', forbidden for the others (TypeError).
   validate(input: { x5c: string[]; profile: 'vc' | 'status' | 'request' | 'trust-list'; now: Date; expectedIssuerUri?: string }): Promise<ChainValidationResult>;
 }
 interface StatusChecker {
@@ -75,6 +76,22 @@ interface DidResolver { resolve(did: string, opts?: { versionTime?: string }): P
 
 Two implementations of the crypto interfaces exist and are tested with the same
 vectors: WebCrypto (`@identra/sdk-core/webcrypto`) and `@noble/*` (`@identra/sdk-app`).
+Both validate the JWK exactly as `normalizeEcPublicJwk` does: EC, P-256, 32-byte
+coordinates, no private members, and the point on the curve (y² = x³ − 3x + b mod p).
+
+JWS (one code path, ADR-0006): `signJws` builds every JWS; `decodeJws(compact,
+maxBytes)` has a required size bound (`TOO_LARGE`; credentials 16 384, KB-JWT
+4 096); `verifyJws(decoded, publicJwk, verifier)` is the only verification and
+always applies the `alg` allow-list first (`ALG_NOT_ALLOWED`, then
+`SIGNATURE_INVALID`), so a caller cannot skip it.
+
+`createWebCryptoSigner({ privateKey, publicJwk?, x5c? })`: `privateKey` is a
+CryptoKey (may be non-extractable) or PKCS#8 PEM/DER (imported non-extractable).
+The public key comes from `x5c[0]` when given (x5c = 1 or 2 certificates that all
+parse and, when 2, chain by name), else from `publicJwk`, else from the public key
+inside the PKCS#8 structure; the private key is never exported, and a throwaway
+signature proves that the public key belongs to it.
+`generateWebCryptoKeyPair()` returns `{ privateKey (non-extractable), publicJwk }`.
 
 ## 3. Results and error codes
 
@@ -93,27 +110,38 @@ compact credentials, disclosures or KB-JWTs (ADR-0014 §4).
 Checks of a credential, in order. Steps 1–4 stop the run: when one fails, every
 later check is listed with `ok: false, code: 'SKIPPED', skipped: true`. From
 step 5 on, all checks run. A check that does not apply to the credential kind
-is not listed.
+is not listed. Which checks are listed is decided only from what is knowable
+without parsing, so it is the same whichever of steps 1–4 fails:
+`holder_binding` is listed for every presentation, and for a stored credential
+whose compact shows at least one disclosure segment.
+
+Two entry points over one implementation, so the modes cannot be confused:
 
 ```ts
-verifyCredential(compact: string, options: {
+type VerifyCredentialOptions = {
   verifier: Verifier; hasher: Hasher; chainValidator: CertificateChainValidator;
   trustRegistry: TrustRegistry; statusChecker: StatusChecker;
   supportedVcts: string[]; now: Date;
-  presentation?: { nonce: string; audience: string };   // given = verifying a presentation
-}): Promise<{ ok: boolean; checks: Check[]; chainChecks?: Check[]; credential?: VerifiedCredential }>
+};
+// Anything received from another party: steps 1-9, the KB-JWT is required (step 9 always listed).
+verifyPresentation(compact, options & { presentation: { nonce: string; audience: string } })
+// MUST NOT be used to accept a credential presented by someone else: never proves possession.
+// A credential the caller already holds (wallet on receipt or display, a public product event).
+// A compact carrying a KB-JWT is MALFORMED.
+verifyStoredCredential(compact, options)
+// both: Promise<{ ok: boolean; checks: Check[]; chainChecks?: Check[]; credential?: VerifiedCredential }>
 
 interface VerifiedCredential {          // only when steps 1–4 passed
   vct: string; iss: string; fingerprint: string;
   issuer: { maToChuc: string; ten: string } | null;   // null unless step 7 passed
   iat: number; nbf?: number; exp?: number; status?: { idx: number; uri: string }; cnfJwk?: EcPublicJwk;
-  claims?: Record<string, unknown>;     // subject claims: visible + verified disclosures; only when step 9 passed or is not listed
+  claims?: Record<string, unknown>;     // subject claims (visible + verified disclosures); only when the WHOLE result is ok
 }
 ```
 
 | # | `id` | What | Codes |
 |---|---|---|---|
-| 1 | `structure` | ≤ 16 384 bytes and ≤ 50 disclosures, checked before any decoding (`TOO_LARGE`). ASCII compact `<jwt>~<disclosure>~…~[<kb-jwt>]`; strict JWS; every disclosure is base64url of a JSON array; payload is a JSON object with string `iss` and `vct`, numeric `iat`, numeric `nbf` / `exp` and object `cnf` / `status` when present (shape only, nothing is trusted yet). Header `typ` is exactly `dc+sd-jwt`. Without `options.presentation` a KB-JWT is `MALFORMED`: a stored credential never has one | `MALFORMED`, `TYP_INVALID`, `TOO_LARGE` |
+| 1 | `structure` | ≤ 16 384 bytes and ≤ 50 disclosures, checked before any decoding (`TOO_LARGE`). ASCII compact `<jwt>~<disclosure>~…~[<kb-jwt>]`; strict JWS; every disclosure is base64url of a JSON array; payload is a JSON object with string `iss` and `vct`, numeric `iat`, numeric `nbf` / `exp` and object `cnf` / `status` when present (shape only, nothing is trusted yet). SD shape of the payload (RFC 9901), with or without disclosures: top-level `_sd`, if present, is an array of unique 43-character base64url digests; `_sd_alg` is exactly `sha-256`, required with `_sd` (allowed alone only as `sha-256`); no key `_sd`, `_sd_alg` or `...` anywhere below the top level. Header `typ` is exactly `dc+sd-jwt`. In `verifyStoredCredential` a KB-JWT is `MALFORMED`: a stored credential never has one | `MALFORMED`, `TYP_INVALID`, `TOO_LARGE` |
 | 2 | `algorithm` | Header `alg` is `ES256` | `ALG_NOT_ALLOWED` |
 | 3 | `certificate_chain` | `CertificateChainValidator` (section 4) with profile `vc` and `expectedIssuerUri` = `iss`; the check carries the code of the failing chain step, and `chainChecks` lists the chain steps without details | `CERT_CHAIN_MALFORMED`, `CERT_CHAIN_UNTRUSTED`, `CERT_NOT_YET_VALID`, `CERT_EXPIRED`, `CERT_CONSTRAINT_INVALID`, `CERT_KEY_NOT_ALLOWED`, `ISSUER_MISMATCH` |
 | 4 | `signature` | Issuer signature with the leaf key | `SIGNATURE_INVALID` |
@@ -121,7 +149,7 @@ interface VerifiedCredential {          // only when steps 1–4 passed
 | 6 | `credential_type` | `vct` is in `supportedVcts` | `VCT_UNSUPPORTED` |
 | 7 | `issuer_trust` | `trustRegistry.lookup(fingerprint, now)` returns an entry with `mucDich` `vc`, `maToChuc` equal to the leaf `organizationIdentifier`, `vct` containing the credential `vct`, and for product events `congDoan` containing the event's `cong_doan`. `TrustListUnavailableError` is `TRUST_LIST_UNAVAILABLE`; any other failure (null, mismatch, other exception) is `ISSUER_NOT_TRUSTED` | `ISSUER_NOT_TRUSTED`, `TRUST_LIST_UNAVAILABLE` |
 | 8 | `status` | Only when step 7 passed, otherwise `SKIPPED` and the `StatusChecker` is not called (no request on behalf of an untrusted issuer). Rules below, then the checker's answer: `valid` passes, `revoked` / `suspended` map to their codes, anything else or an exception is `STATUS_UNAVAILABLE` | `REVOKED`, `SUSPENDED`, `STATUS_UNAVAILABLE` |
-| 9 | `holder_binding` | Listed when the compact carries disclosures or `options.presentation` is given. Disclosures (ADR-0008 §6), any failure `DISCLOSURE_INVALID`: `_sd_alg` is `sha-256`; each disclosure is `[salt, name, value]` with string salt and name (array-element disclosures are refused); name not `_sd`, `...`, `_sd_alg` nor a metadata claim (`iss`, `vct`, `iat`, `nbf`, `exp`, `cnf`, `status`); no duplicate disclosure; digest referenced by the top-level `_sd`; no two disclosures with one name; no clash with a visible payload claim; no nested `_sd` or array-element digest anywhere. With `options.presentation`, the KB-JWT, any failure `KB_INVALID`: present; credential has a valid P-256 `cnf.jwk`; header `typ` `kb+jwt` and `alg` `ES256`; signature by `cnf.jwk`; `sd_hash` = base64url(SHA-256(`<jwt>~<disclosures>~`)) recomputed by the verifier; `iat` within [now − 300 s − 60 s, now + 60 s]. Then `nonce` (`NONCE_MISMATCH`), then `aud` (`AUD_MISMATCH`), so an unsigned KB-JWT never yields a mismatch | `DISCLOSURE_INVALID`, `KB_INVALID`, `NONCE_MISMATCH`, `AUD_MISMATCH` |
+| 9 | `holder_binding` | Always listed by `verifyPresentation`; listed by `verifyStoredCredential` when the compact carries disclosures. Disclosures (ADR-0008 §6), any failure `DISCLOSURE_INVALID`: a top-level `_sd` exists; each disclosure is `[salt, name, value]` with string salt and name (array-element disclosures are refused); name not `_sd`, `...`, `_sd_alg` nor a metadata claim (`iss`, `vct`, `iat`, `nbf`, `exp`, `cnf`, `status`); no duplicate disclosure; digest referenced by the top-level `_sd`; no two disclosures with one name; no clash with a visible payload claim; no `_sd`, `_sd_alg` or `...` key inside a disclosed value. In `verifyPresentation`, the KB-JWT, any failure `KB_INVALID`: present and at most 4 096 bytes; credential has a valid P-256 `cnf.jwk`; header `typ` `kb+jwt` and `alg` `ES256`; signature by `cnf.jwk`; `sd_hash` = base64url(SHA-256(`<jwt>~<disclosures>~`)) recomputed by the verifier; `iat` within [now − 300 s − 60 s, now + 60 s] (both ends inclusive); `exp`, when present, a number > now − 60 s; `nbf`, when present, a number ≤ now + 60 s. Then `nonce` (`NONCE_MISMATCH`), then `aud` (`AUD_MISMATCH`), so an unsigned KB-JWT never yields a mismatch | `DISCLOSURE_INVALID`, `KB_INVALID`, `NONCE_MISMATCH`, `AUD_MISMATCH` |
 | 10 | `product_chain` | Product events only: `prev` matches the previous credential, stage order (GĐ6b) | `CHAIN_BROKEN` |
 
 Other codes: `CLIENT_ID_MISMATCH`, `VERIFIER_NOT_TRUSTED` (wallet checking a
@@ -135,25 +163,45 @@ to present only (ADR-0004, "Bổ sung 2026-11-19" point 3).
 
 Status rules enforced by the policy before the `StatusChecker` is called: the
 credential must carry `status.status_list.{uri, idx}` with `idx` a non-negative
-integer, and `uri` must be `https:` and start with `<iss>/status/` (ADR-0015 §11).
-Anything else is `STATUS_UNAVAILABLE` without a network call.
+integer, and `uri` must be exactly `<iss>/status/<n>` with `n` matching
+`^[1-9][0-9]{0,8}$` (ADR-0015 §11), compared as strings: no URL parsing and no
+platform `URL`, so `..`, `%2e`, `\`, whitespace, query, fragment, userinfo, port
+and case variants never reach the checker. Anything else is
+`STATUS_UNAVAILABLE` without a network call. The issuer enforces the same form.
 
-Issuance and presentation (programmer errors throw `TypeError`):
+Known limitation: no rule ties a credential's `iat` to its certificate's
+validity or to the 12-month signing window of ADR-0015 §14. A key stolen after
+its signing window can still sign backdated credentials until the certificate
+expires; the remedy is removing the certificate's fingerprint from the trust
+list (step 7).
+
+Issuance and presentation (programmer errors throw `TypeError`; errors of the
+library are wrapped in `TypeError` without echoing claim values):
 `issueCredential` (generic), `issueDiploma`, `issueProductEvent`,
 `createPresentation`, and `decodeCredentialUnverified` (display only, verifies
 nothing). The issuer refuses a signer without `x5c` [leaf, issuing CA], an
-`iss` that is not a SAN URI of the leaf, a status `uri` outside `<iss>/status/`
-and any disclosable metadata claim, `iat` included.
+`iss` that is not a SAN URI of the leaf, a status `uri` not of the form
+`<iss>/status/<n>`, any disclosable metadata claim (`iat` included), claim names
+`__proto__` / `constructor` / `prototype` / `_sd` / `_sd_alg` / `...` / metadata
+names, values JSON cannot carry unchanged (undefined, functions, symbols,
+bigints, non-finite numbers, non-plain objects, cycles; reserved keys at any
+depth), more than 50 disclosable claims, and a result larger than 16 384 bytes.
 
 ## 4. X.509 (ADR-0015 §7, §14, §15)
 
 `parseCertificate(der)` wraps `micro-key-producer` and is the only place that
-library is imported. It accepts strict DER only (re-encoding must reproduce the
-input) and returns the fields the validator needs: signed TBS bytes, signature
-as r||s, P-256 public JWK or the foreign key algorithm, validity (UTCTime and
-GeneralizedTime), raw issuer and subject names, `O` / `C` /
-`organizationIdentifier`, basicConstraints, keyUsage, SAN URIs, the list of
-critical extensions.
+library is imported (it also reads the public key of a PKCS#8 EC key for the
+WebCrypto signer). It accepts strict DER v3 certificates only (re-encoding must
+reproduce the input) and throws `TypeError`, never another error, otherwise. It
+returns the fields the validator needs: signed TBS bytes, signature as r||s (only
+for ecdsa-with-SHA256), P-256 public JWK (only for an uncompressed point on the
+curve; a compressed or off-curve key yields none) or the foreign key algorithm,
+validity, raw issuer and subject names, `O` / `C` / `organizationIdentifier` /
+`CN`, basicConstraints, all nine keyUsage bits, SAN URIs, the list of critical
+extensions. Duplicate extensions, duplicate subject attributes and mismatching
+inner/outer signature algorithms are refused. Times: UTCTime as RFC 5280;
+GeneralizedTime is accepted from 1950 on (RFC 5280 wants UTCTime through 2049:
+a documented leniency); years before 1950 are refused.
 
 `createCertificateChainValidator({ trustedRoots, verifier, hasher })` pins one
 or two root certificates (DER). `validate` returns
@@ -165,18 +213,25 @@ or two root certificates (DER). `validate` returns
    pinned root.
 2. `CERT_CHAIN_UNTRUSTED`: issuer and subject names do not chain byte for byte,
    a signature does not verify, or the last certificate is not signed by a
-   pinned root. A certificate signed with anything but ECDSA P-256 / SHA-256
-   cannot verify and lands here.
+   pinned root. A certificate signed with anything but ECDSA P-256 / SHA-256,
+   or by a key that is not a valid P-256 point, cannot verify and lands here.
 3. `CERT_NOT_YET_VALID` / `CERT_EXPIRED`: every certificate including the pinned
-   root, at `now` ± 60 s.
-4. `CERT_CONSTRAINT_INVALID`: leaf must have `CA:FALSE` and `digitalSignature`;
-   issuing CA must have `CA:TRUE`, `pathLenConstraint` 0 and `keyCertSign`;
-   root `CA:TRUE` and `keyCertSign`; the leaf must carry `O`, `C` and
-   `organizationIdentifier` (not required for `trust-list`); any unknown
-   critical extension.
-5. `CERT_KEY_NOT_ALLOWED`: the leaf key is not P-256.
-6. `ISSUER_MISMATCH`: `expectedIssuerUri` is given and is not one of the leaf's
-   SAN URIs (profile `vc` only).
+   root, valid when `notBefore − 60 s ≤ now ≤ notAfter + 60 s` (both ends inclusive).
+4. `CERT_CONSTRAINT_INVALID` (ADR-0015 §9, §15), for every profile:
+   - leaf: `basicConstraints` present with `CA:FALSE`; keyUsage exactly
+     `digitalSignature` (extension present, no other bit); subject `C` = `VN`,
+     non-empty `O`, `organizationIdentifier` matching `^VATVN-[0-9]{10}(-[0-9]{3})?$`
+     (the trust-list signer included);
+   - issuing CA: `CA:TRUE`, `pathLenConstraint` 0, keyUsage exactly
+     `keyCertSign` + `cRLSign`;
+   - root: `CA:TRUE`, keyUsage exactly `keyCertSign` + `cRLSign`;
+   - no unknown critical extension on any of them (known: basicConstraints,
+     keyUsage, subjectAltName; extendedKeyUsage is not interpreted, so a
+     critical one is refused).
+5. `CERT_KEY_NOT_ALLOWED`: the leaf has no P-256 key (other algorithm or curve,
+   compressed or off-curve point).
+6. `ISSUER_MISMATCH` (profile `vc`, where `expectedIssuerUri` is required): it is
+   not exactly equal to one of the leaf's SAN URIs.
 
 `fingerprint` is base64url (no padding) of SHA-256 over the leaf DER, the same
 value as an OpenID4VP `x509_hash`.
@@ -202,7 +257,11 @@ value as an OpenID4VP `x509_hash`.
   disclosable; a presentation that delivers one through a disclosure is
   `DISCLOSURE_INVALID`.
 - KB-JWT: `typ: kb+jwt`, `alg: ES256`, payload `iat`, `aud`, `nonce`, `sd_hash`;
-  accepted when `iat` is within 5 minutes (± 60 s).
+  accepted when `iat` is within 5 minutes (± 60 s); `exp` / `nbf`, when present,
+  are enforced with the same 60 s skew.
+- Profile rule: `typ` values are compared exactly and case-sensitively
+  (`dc+sd-jwt`, `kb+jwt`, `statuslist+jwt`, `identra-trust-list+jwt`), without an
+  `application/` prefix.
 - Status list token: JWS `typ: statuslist+jwt` with `x5c` (profile `status`),
   payload `sub` (= list URI), `iat`, `exp` (24 h), `ttl` (900), `status_list:
   { bits: 2, lst }`; 131 072 entries; values 0 valid, 1 revoked, 2 suspended.
@@ -224,6 +283,16 @@ with no valid copy the answer is `unavailable` / `TrustListUnavailableError`.
 - Test PKI is generated by `scripts/pki/` (OpenSSL) into a git-ignored
   directory; private keys are never committed.
 - Every error code above has at least one test that provokes exactly that code.
+- Differential test (`sd-jwt-differential.test.ts`): a deterministic corpus of
+  valid and mutated presentations is verified by `verifyPresentation` /
+  `verifyStoredCredential` and by the
+  library's strict `SdJwtVcInstance.verify`; we never accept what the library
+  rejects, accepted claims, digests and `sd_hash` agree, and the only cases where
+  we are stricter are an explicit list (KB-JWT in a stored credential, `iat` only
+  through a disclosure, size and disclosure-count limits, nested and
+  array-element disclosures, a non-canonical base64url KB-JWT signature, the SD
+  shape rules without disclosures), each with its asserted code. The RFC 9901 worked examples (disclosure digests, the
+  section 5.2 SD-JWT+KB) are reproduced from the RFC text.
 - `examples/gd2-e2e.mjs` (issue → store → present → verify, then a tampered
   disclosure) runs as part of `npm test`.
 - A bundle test runs issue → present → verify from an esbuild

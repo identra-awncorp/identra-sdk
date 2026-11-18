@@ -4,6 +4,8 @@
 import tseslint from 'typescript-eslint';
 
 const PLATFORM_GLOBALS = ['crypto', 'Buffer', 'process', 'fetch', 'window', 'document'];
+// Ways to reach the platform indirectly: `const g = globalThis; g.crypto`, `Reflect.construct(Date, [])`.
+const INDIRECT_GLOBALS = ['globalThis', 'self', 'global', 'performance', 'Reflect'];
 
 export default tseslint.config(
   { ignores: ['**/dist/**', '**/test-dist/**', '**/node_modules/**', '.pki/**'] },
@@ -16,7 +18,7 @@ export default tseslint.config(
         'error',
         { patterns: ['node:*', 'jose', 'jose/*', 'expo-*', 'react-native', 'react-native/*', '@noble/*'] },
       ],
-      'no-restricted-globals': ['error', ...PLATFORM_GLOBALS],
+      'no-restricted-globals': ['error', ...PLATFORM_GLOBALS, ...INDIRECT_GLOBALS],
       'no-restricted-properties': [
         'error',
         ...PLATFORM_GLOBALS.map((property) => ({ object: 'globalThis', property })),
@@ -27,6 +29,7 @@ export default tseslint.config(
         'error',
         { selector: "NewExpression[callee.name='Date'][arguments.length=0]", message: 'The clock is injected.' },
         { selector: "CallExpression[callee.name='Date']", message: 'The clock is injected.' },
+        { selector: 'ImportExpression', message: 'No dynamic import in sdk-core.' },
       ],
     },
   },

@@ -15,7 +15,9 @@ export interface DecodedJws {
   signingInput: Uint8Array;
 }
 
-export type DecodeJwsResult = { ok: true; jws: DecodedJws } | { ok: false; code: typeof ErrorCodes.MALFORMED; detail: string };
+export type DecodeJwsResult =
+  | { ok: true; jws: DecodedJws }
+  | { ok: false; code: typeof ErrorCodes.MALFORMED | typeof ErrorCodes.TOO_LARGE; detail: string };
 
 /**
  * Signs `payload` with `signer` and returns the compact JWS. `alg` comes from the signer and
@@ -37,13 +39,17 @@ export async function signJws(protectedHeader: Record<string, unknown>, payload:
 }
 
 /**
- * Strict compact JWS decoding: exactly three non-empty base64url parts and a header that is a
- * JSON object. Never throws for bad input. A `crit` header is rejected because no extension
- * is understood. Nothing about `alg` is decided here (see checkJwsAlgorithm).
+ * Strict compact JWS decoding: at most `maxBytes` long (checked first, `TOO_LARGE`), exactly
+ * three non-empty base64url parts and a header that is a JSON object. Never throws for bad
+ * input. A `crit` header is rejected because no extension is understood. Nothing about `alg` is
+ * decided here (see verifyJws).
  */
-export function decodeJws(compact: unknown): DecodeJwsResult {
+export function decodeJws(compact: unknown, maxBytes: number): DecodeJwsResult {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new TypeError('maxBytes must be a positive integer');
   const fail = (detail: string): DecodeJwsResult => ({ ok: false, code: ErrorCodes.MALFORMED, detail });
   if (typeof compact !== 'string') return fail('not a string');
+  // Every UTF-16 unit is at least one UTF-8 byte; anything non-ASCII fails base64url below.
+  if (compact.length > maxBytes) return { ok: false, code: ErrorCodes.TOO_LARGE, detail: `larger than ${maxBytes} bytes` };
   const parts = compact.split('.');
   if (parts.length !== 3) return fail('expected three parts');
   const [h, p, s] = parts as [string, string, string];
@@ -73,10 +79,16 @@ export function checkJwsAlgorithm(header: Record<string, unknown>): typeof Error
 }
 
 /**
- * ES256 signature check of a decoded JWS with a P-256 key. The header (including `alg`) is not
- * consulted; callers run checkJwsAlgorithm first. Returns false for any bad input.
+ * The one verification of a decoded JWS: the `alg` allow-list (ES256 only) and then the ES256
+ * signature with a P-256 key. The key type comes from the JWK, never from the header.
+ * Returns null when both pass. Never throws for bad input.
  */
-export async function verifyJwsSignature(jws: DecodedJws, publicJwk: EcPublicJwk, verifier: Verifier): Promise<boolean> {
-  if (jws.signature.length !== 64) return false;
-  return verifier.verify(publicJwk, jws.signingInput, jws.signature);
+export async function verifyJws(
+  jws: DecodedJws,
+  publicJwk: EcPublicJwk,
+  verifier: Verifier,
+): Promise<null | typeof ErrorCodes.ALG_NOT_ALLOWED | typeof ErrorCodes.SIGNATURE_INVALID> {
+  if (checkJwsAlgorithm(jws.header) !== null) return ErrorCodes.ALG_NOT_ALLOWED;
+  if (jws.signature.length !== 64) return ErrorCodes.SIGNATURE_INVALID;
+  return (await verifier.verify(publicJwk, jws.signingInput, jws.signature)) ? null : ErrorCodes.SIGNATURE_INVALID;
 }

@@ -33,7 +33,7 @@ test('identra-pki.sh refusals', () => {
   assert.ok(pki('init-issuing', '--dir', issuing, '--root-dir', root, '--o', 'Identra TEST', '--cn', 'Script Issuing').ok);
 
   refused(/unexpected argument/, 'init-root', '--dir', `${dir}/x`, '--o', 'O', '--cn', 'CN', '--days', '1');
-  refused(/must not contain/, 'init-root', '--dir', `${dir}/x`, '--o', 'A/CN=evil', '--cn', 'CN');
+  refused(/--o must be non-empty/, 'init-root', '--dir', `${dir}/x`, '--o', 'A/CN=evil', '--cn', 'CN');
   refused(/--mst must be/, 'new-key-and-csr', '--key', `${dir}/a.key.pem`, '--csr', `${dir}/a.csr.pem`, '--o', 'O', '--mst', '123', '--cn', 'CN');
 
   const csr = `${dir}/org.csr.pem`;
@@ -42,7 +42,7 @@ test('identra-pki.sh refusals', () => {
   const leafArgs = (purpose: string, out: string, ...extra: string[]) =>
     ['issue-leaf', '--ca-dir', issuing, '--csr', csr, '--purpose', purpose, '--out', `${dir}/${out}.cert.pem`, '--chain', `${dir}/${out}.chain.pem`, ...extra];
   refused(/--san-uri .* is required/, ...leafArgs('vc', 'a'));
-  refused(/--san-uri .* is required/, ...leafArgs('vc', 'a', '--san-uri', 'http://insecure.example/x'));
+  refused(/--san-uri must be https/, ...leafArgs('vc', 'a', '--san-uri', 'http://insecure.example/x'));
   refused(/only applies to vc/, ...leafArgs('status', 'a', '--san-uri', 'https://example.test/x'));
   refused(/--purpose must be/, ...leafArgs('trust-list', 'a'));
   assert.ok(pki(...leafArgs('vc', 'good', '--san-uri', 'https://example.test/issuers/org')).ok);

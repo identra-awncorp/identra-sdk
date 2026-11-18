@@ -1,14 +1,14 @@
-// verifyCredential, steps 1-8 and gating (docs/architecture.md section 3, ADR-0007).
+// steps 1-8 and gating (docs/architecture.md section 3, ADR-0007).
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { base64UrlEncode, ErrorCodes, issueDiploma, issueProductEvent, TrustListUnavailableError, utf8Encode, VCT, verifyCredential } from '@identra/sdk-core';
+import { base64UrlEncode, ErrorCodes, issueDiploma, issueProductEvent, TrustListUnavailableError, utf8Encode, VCT } from '@identra/sdk-core';
 import { x5c } from './helpers/pki.js';
 import {
   check, codes, craft, DIPLOMA, disclosure, fakeStatus, fakeTrust, holderKey, ISS, issuerContext, issuerSigner, NOW_S, STATUS,
-  TRUST_ENTRY, VC_FINGERPRINT, verifyOptions, visiblePayload,
+  TRUST_ENTRY, VC_FINGERPRINT, verifyOptions, visiblePayload, verifyAny,
 } from './helpers/sdjwt.js';
 
-const verify = async (compact: unknown, overrides = {}) => verifyCredential(compact, verifyOptions(overrides));
+const verify = async (compact: unknown, overrides = {}) => verifyAny(compact, verifyOptions(overrides));
 async function expectCode(compact: unknown, id: string, code: string, overrides = {}) {
   const r = await verify(compact, overrides);
   assert.equal(r.ok, false);
@@ -69,6 +69,29 @@ describe('step 1 structure', () => {
       ['status not an object', await withPayload({ status: 'ok' })],
     ];
     for (const [name, compact] of malformed) await expectCode(compact, 'structure', ErrorCodes.MALFORMED).catch((e) => assert.fail(`${name}: ${e.message}`));
+  });
+  test('the SD shape of the payload is checked in step 1, with or without disclosures', async () => {
+    const digest = 'A'.repeat(43);
+    const shapes: [string, Record<string, unknown>][] = [
+      ['the same digest twice', { _sd: [digest, digest], _sd_alg: 'sha-256' }],
+      ['_sd not an array', { _sd: digest, _sd_alg: 'sha-256' }],
+      ['_sd with a non-digest', { _sd: [digest, 'short'], _sd_alg: 'sha-256' }],
+      ['_sd with a non-string', { _sd: [7], _sd_alg: 'sha-256' }],
+      ['_sd without _sd_alg', { _sd: [digest] }],
+      ['_sd_alg other than sha-256', { _sd: [digest], _sd_alg: 'sha-512' }],
+      ['_sd_alg other than sha-256, no _sd', { _sd_alg: 'SHA-256' }],
+      ['nested _sd', { dia_chi: { _sd: [digest] } }],
+      ['nested _sd_alg', { dia_chi: { _sd_alg: 'sha-256' } }],
+      ['array-element digest', { quoc_tich: [{ '...': digest }] }],
+      ['deeply nested', { a: [[{ b: [{ c: { _sd: [] } }] }]] }],
+    ];
+    for (const [name, patch] of shapes) {
+      const compact = await withPayload(patch);
+      const r = await expectCode(compact, 'structure', ErrorCodes.MALFORMED).catch((e) => assert.fail(`${name}: ${e.message}`));
+      assert.equal(r.credential, undefined, name);
+    }
+    assert.equal(check(await verify(await withPayload({ _sd: [digest], _sd_alg: 'sha-256' })), 'structure').code, null, 'a valid shape with only decoys');
+    assert.equal(check(await verify(await withPayload({ _sd_alg: 'sha-256' })), 'structure').code, null, '_sd_alg alone is allowed');
   });
   test('a stored credential carrying a KB-JWT is MALFORMED', async () => {
     const compact = await craft({});
@@ -218,7 +241,7 @@ test('detail strings never carry claim values', async () => {
 });
 
 test('programmer errors throw', async () => {
-  await assert.rejects(verifyCredential('x', { ...verifyOptions(), now: new Date('x') }), TypeError);
-  await assert.rejects(verifyCredential('x', { ...verifyOptions(), statusChecker: undefined as never }), TypeError);
-  await assert.rejects(verifyCredential('x', verifyOptions({ presentation: { nonce: '', audience: 'a' } })), TypeError);
+  await assert.rejects(verifyAny('x', { ...verifyOptions(), now: new Date('x') }), TypeError);
+  await assert.rejects(verifyAny('x', { ...verifyOptions(), statusChecker: undefined as never }), TypeError);
+  await assert.rejects(verifyAny('x', verifyOptions({ presentation: { nonce: '', audience: 'a' } })), TypeError);
 });

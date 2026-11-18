@@ -2,7 +2,7 @@
 // Native). These adapters move to @identra/sdk-app in a later phase.
 import { p256 } from '@noble/curves/nist.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { base64UrlDecode, base64UrlEncode, type EcPublicJwk, type Hasher, type Signer, type Verifier } from '@identra/sdk-core';
+import { base64UrlDecode, base64UrlEncode, normalizeEcPublicJwk, type EcPublicJwk, type Hasher, type Signer, type Verifier } from '@identra/sdk-core';
 
 /** Order of the P-256 group, taken from noble rather than typed by hand. */
 export const P256_N: bigint = p256.Point.CURVE().n;
@@ -19,8 +19,10 @@ function jwkToPoint(jwk: EcPublicJwk): Uint8Array {
 export const nobleVerifier: Verifier = {
   async verify(publicJwk, data, signature) {
     try {
-      if (signature.length !== 64) return false;
-      return p256.verify(signature, data, jwkToPoint(publicJwk), { lowS: false, prehash: true, format: 'compact' });
+      // Same key validation as the WebCrypto adapter: EC P-256 public JWK, on the curve.
+      const jwk = normalizeEcPublicJwk(publicJwk);
+      if (!jwk || !(data instanceof Uint8Array) || !(signature instanceof Uint8Array) || signature.length !== 64) return false;
+      return p256.verify(signature, data, jwkToPoint(jwk), { lowS: false, prehash: true, format: 'compact' });
     } catch {
       return false;
     }

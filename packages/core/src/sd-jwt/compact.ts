@@ -48,7 +48,7 @@ export function parseSdJwt(compact: unknown): ParseSdJwtResult {
   const issuerJwt = parts[0]!;
   const last = parts[parts.length - 1]!;
   const encodedDisclosures = parts.slice(1, -1);
-  const decoded = decodeJws(issuerJwt);
+  const decoded = decodeJws(issuerJwt, SD_JWT_LIMITS.maxCompactBytes);
   if (!decoded.ok) return malformed(`issuer JWT: ${decoded.detail}`);
   let payload: unknown;
   try {
@@ -83,6 +83,50 @@ export function parseSdJwt(compact: unknown): ParseSdJwtResult {
   };
 }
 
+const RESERVED_KEYS = ['_sd', '_sd_alg', '...'];
+const DIGEST = /^[A-Za-z0-9_-]{43}$/;
+
+/** True when any object reachable from `roots` (the roots included) has a key `_sd`, `_sd_alg` or `...`. Iterative: depth is attacker-chosen. */
+export function containsReservedKey(roots: unknown[]): boolean {
+  const stack = [...roots];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (Array.isArray(v)) for (const e of v) stack.push(e);
+    else if (typeof v === 'object' && v !== null) {
+      for (const [k, e] of Object.entries(v)) {
+        if (RESERVED_KEYS.includes(k)) return true;
+        stack.push(e);
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * RFC 9901 shape rules for the issuer-signed payload, whatever the disclosures: `_sd` (if present)
+ * is an array of unique 43-character base64url digests; `_sd_alg` is `sha-256`, required with
+ * `_sd`; no `_sd`, `_sd_alg` or `...` key below the top level (Identra types have no nested or
+ * array-element disclosures). Returns the broken rule, or null.
+ */
+export function sdShapeProblem(payload: Record<string, unknown>): string | null {
+  const { _sd: sd, _sd_alg: sdAlg, ...rest } = payload;
+  if (sd !== undefined) {
+    if (!Array.isArray(sd) || !sd.every((d) => typeof d === 'string' && DIGEST.test(d))) return '_sd is not a list of SHA-256 digests';
+    if (new Set(sd).size !== sd.length) return '_sd repeats a digest';
+    if (sdAlg !== 'sha-256') return '_sd_alg is not sha-256';
+  } else if (sdAlg !== undefined && sdAlg !== 'sha-256') return '_sd_alg is not sha-256';
+  if (containsReservedKey(Object.values(rest))) return 'nested or array-element selective disclosure is not supported';
+  return null;
+}
+
+/** Number of disclosure segments a compact shows when split on "~" (a trailing KB-JWT adds none). */
+export function disclosureSegments(compact: unknown): number {
+  if (typeof compact !== 'string') return 0;
+  let separators = 0;
+  for (let i = 0; i < compact.length; i++) if (compact.charCodeAt(i) === 0x7e) separators++;
+  return Math.max(separators - 1, 0);
+}
+
 export interface UnverifiedCredential {
   header: Record<string, unknown>;
   /** The issuer-signed payload as is, including `_sd` and `_sd_alg`. */
@@ -95,7 +139,7 @@ export interface UnverifiedCredential {
 /**
  * NOT VERIFICATION. Decodes a credential the wallet already holds, for display only: no signature,
  * certificate, digest, time, trust or status check is made, so nothing returned here may be used
- * for a decision. Use verifyCredential for that. Throws TypeError on a malformed compact.
+ * for a decision. Use verifyStoredCredential or verifyPresentation for that. Throws TypeError on a malformed compact.
  */
 export function decodeCredentialUnverified(compact: string): UnverifiedCredential {
   const r = parseSdJwt(compact);

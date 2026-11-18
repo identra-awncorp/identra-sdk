@@ -13,7 +13,7 @@ import {
   issueDiploma,
   utf8Encode,
   VCT,
-  verifyCredential,
+  verifyPresentation,
 } from '@identra/sdk-core';
 import {
   createWebCryptoSigner,
@@ -44,7 +44,7 @@ const clock = { now: () => new Date() };
 
 // --- Wallet: a fresh holder key ------------------------------------------------------------------
 const holderKeys = await generateWebCryptoKeyPair();
-const holder = await createWebCryptoSigner({ privateKey: holderKeys.privateKey });
+const holder = await createWebCryptoSigner({ privateKey: holderKeys.privateKey, publicJwk: holderKeys.publicJwk });
 
 console.log('1. Issue a diploma');
 const stored = await issueDiploma({
@@ -102,7 +102,7 @@ const sent = decodeCredentialUnverified(presentation.slice(0, presentation.lastI
 expect(sent.length === 2 && sent.includes('ho_ten') && sent.includes('nganh'), `presentation carries only: ${sent.join(', ')}`);
 
 console.log('3. Verify the presentation');
-const result = await verifyCredential(presentation, options);
+const result = await verifyPresentation(presentation, options);
 printChecks(result);
 expect(result.ok, 'every check passes');
 expect(result.credential?.issuer?.ten === 'Trường Mẫu DEMO', `issuer from the trust list: ${result.credential?.issuer?.ten}`);
@@ -118,7 +118,7 @@ const sdHash = base64UrlEncode(await webCryptoHasher.sha256(utf8Encode(sdJwt)));
 const kbHeader = base64UrlEncode(utf8Encode(JSON.stringify({ typ: 'kb+jwt', alg: 'ES256' })));
 const kbPayload = base64UrlEncode(utf8Encode(JSON.stringify({ iat: Math.floor(Date.now() / 1000), aud: AUDIENCE, nonce, sd_hash: sdHash })));
 const kbSignature = base64UrlEncode(await holder.sign(utf8Encode(`${kbHeader}.${kbPayload}`)));
-const tampered = await verifyCredential(`${sdJwt}${kbHeader}.${kbPayload}.${kbSignature}`, options);
+const tampered = await verifyPresentation(`${sdJwt}${kbHeader}.${kbPayload}.${kbSignature}`, options);
 printChecks(tampered);
 expect(!tampered.ok, 'the tampered presentation is rejected');
 expect(tampered.checks.find((c) => c.id === 'holder_binding')?.code === 'DISCLOSURE_INVALID', 'holder_binding reports DISCLOSURE_INVALID');

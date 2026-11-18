@@ -14,6 +14,9 @@ import {
   type TrustEntry,
   type TrustRegistry,
   type VerifyCredentialOptions,
+  type VerifyPresentationOptions,
+  verifyPresentation,
+  verifyStoredCredential,
 } from '@identra/sdk-core';
 import { createWebCryptoSigner, generateWebCryptoKeyPair, webCryptoHasher, webCryptoRandom, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import { ca, leaf, NOW, pemFile, x5c } from './pki.js';
@@ -41,8 +44,8 @@ export const issuerSigner = (name = 'vc', caName = 'issuing') =>
   createWebCryptoSigner({ privateKey: pemFile(`test/leaf/${name}.key.pem`), x5c: x5c(name, caName) });
 
 export async function holderKey(): Promise<Signer> {
-  const { privateKey } = await generateWebCryptoKeyPair();
-  return createWebCryptoSigner({ privateKey });
+  const { privateKey, publicJwk } = await generateWebCryptoKeyPair();
+  return createWebCryptoSigner({ privateKey, publicJwk });
 }
 
 export const issuerContext = async () => ({ signer: await issuerSigner(), hasher: webCryptoHasher, random: webCryptoRandom, clock });
@@ -82,7 +85,12 @@ export function fakeStatus(answer: Awaited<ReturnType<StatusChecker['check']>> |
 
 export const validator = createCertificateChainValidator({ trustedRoots: [ca('root')], verifier: webCryptoVerifier, hasher: webCryptoHasher });
 
-export function verifyOptions(overrides: Partial<VerifyCredentialOptions> = {}): VerifyCredentialOptions {
+type AnyOptions = VerifyCredentialOptions & { presentation?: VerifyPresentationOptions['presentation'] };
+/** verifyPresentation when the options carry `presentation`, verifyStoredCredential otherwise. */
+export const verifyAny = (compact: unknown, options: AnyOptions) =>
+  options.presentation ? verifyPresentation(compact, options as VerifyPresentationOptions) : verifyStoredCredential(compact, options);
+
+export function verifyOptions(overrides: Partial<AnyOptions> = {}): AnyOptions {
   return {
     verifier: webCryptoVerifier,
     hasher: webCryptoHasher,
@@ -94,8 +102,8 @@ export function verifyOptions(overrides: Partial<VerifyCredentialOptions> = {}):
     ...overrides,
   };
 }
-export const presentationOptions = (overrides: Partial<VerifyCredentialOptions> = {}) =>
-  verifyOptions({ presentation: { nonce: NONCE, audience: AUD }, ...overrides });
+export const presentationOptions = (overrides: Partial<AnyOptions> = {}) =>
+  verifyOptions({ presentation: { nonce: NONCE, audience: AUD }, ...overrides }) as VerifyPresentationOptions;
 
 export function check(result: CredentialVerificationResult, id: CheckId) {
   const c = result.checks.find((x) => x.id === id);

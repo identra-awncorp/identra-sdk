@@ -9,12 +9,34 @@
 # Layout: <outdir>/ca/root/, <outdir>/ca/issuing/, <outdir>/orgs/<name>/<purpose>.{key,csr,cert,chain}.pem,
 #         <outdir>/trust-list-signer/trust-list.{key,csr,cert}.pem, <outdir>/root.cert.pem
 set -euo pipefail
+umask 077
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PKI="$HERE/identra-pki.sh"
+# shellcheck source=pki-lib.sh
+. "$HERE/pki-lib.sh"
 
-PKI="$(cd "$(dirname "$0")" && pwd)/identra-pki.sh"
 OUT=${1:?usage: make-demo-pki.sh <outdir> [<issuer-base-url>]}
 BASE=${2:-https://api-identra.awncorp.vn/issuers}
 BASE=${BASE%/}
-if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT")" ]; then echo "make-demo-pki: $OUT exists and is not empty" >&2; exit 1; fi
+[ $# -le 2 ] || die "usage: make-demo-pki.sh <outdir> [<issuer-base-url>]"
+
+# Everything is validated before the first key exists. Identifiers are canonical https URLs in
+# every environment; local and e2e runs redirect network access, they do not change identifiers.
+check_path "$OUT"
+for name in truong-mau nha-san-xuat kiem-dinh phan-phoi; do check_uri issuer-base-url "$BASE/$name"; done
+if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT")" ]; then die "$OUT exists and is not empty"; fi
+
+# A failed run removes everything it made: the whole <outdir>, or only its content when the
+# (empty) directory existed before.
+[ -e "$OUT" ] && PRE_EXISTING=1 || PRE_EXISTING=0
+undo() {
+  local status=$?
+  [ "$status" -eq 0 ] && return
+  if [ "$PRE_EXISTING" = 1 ]; then find "$OUT" -mindepth 1 -delete; else rm -rf -- "$OUT"; fi
+  echo "make-demo-pki: failed; removed $OUT" >&2
+}
+trap undo EXIT
+mkdir -p "$OUT"
 
 "$PKI" init-root --dir "$OUT/ca/root" --o "Identra DEMO" --cn "Identra DEMO Root CA"
 "$PKI" init-issuing --dir "$OUT/ca/issuing" --root-dir "$OUT/ca/root" --o "Identra DEMO" --cn "Identra DEMO Issuing CA 1"

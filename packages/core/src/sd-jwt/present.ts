@@ -37,11 +37,15 @@ export async function createPresentation(input: {
     throw new TypeError('audience and nonce must be non-empty strings');
   }
   if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new TypeError('now must be a valid Date');
-  return libPresent({
-    compact,
-    disclose,
-    holderSigner,
-    hasher,
-    kbPayload: { iat: Math.floor(now.getTime() / 1000), aud: audience, nonce },
-  });
+  try {
+    return await libPresent({
+      compact,
+      disclose,
+      holderSigner,
+      hasher,
+      kbPayload: { iat: Math.floor(now.getTime() / 1000), aud: audience, nonce },
+    });
+  } catch {
+    throw new TypeError('the SD-JWT library refused to present the credential'); // its message may quote claim values
+  }
 }
