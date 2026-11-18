@@ -40,7 +40,12 @@ async function world(o: { content?: TrustListContent; statusSignerOverride?: Sig
   const srv = server();
   const list: StatusList = createStatusList();
   const signer = o.statusSignerOverride ?? (await statusSigner());
-  const publishStatus = async () => srv.publish(STATUS_URI, await createStatusListToken({ list, uri: STATUS_URI, signer, now: clock.now() }));
+  // As the server does (ADR-0019 section 4): every new token has a greater iat than the last one.
+  let lastIat = 0;
+  const publishStatus = async () => {
+    lastIat = Math.max(Math.floor(clock.now().getTime() / 1000), lastIat + 1);
+    srv.publish(STATUS_URI, await createStatusListToken({ list, uri: STATUS_URI, signer, now: new Date(lastIat * 1000) }));
+  };
   srv.publish(TRUST_URL, await trustToken(o.content, clock.now()));
   await publishStatus();
   const common = { fetch: srv.fetch, verifier: webCryptoVerifier, chainValidator: validator, clock };

@@ -39,6 +39,12 @@ export interface TrustListPayload extends TrustListContent {
   iat: number;
   exp: number;
   ttl: number;
+  /**
+   * ADR-0019 section 2: lists signed by a trust-list certificate whose notBefore is earlier than
+   * this (seconds) are refused by every verifier that has seen it. Set after replacing a
+   * compromised trust-list signer.
+   */
+  signer_not_before?: number;
 }
 
 export const TRUST_LIST_MAX_ENTRIES = 1000;
@@ -110,14 +116,22 @@ function checkContent(c: Record<string, unknown>): void {
   const verifiers = list(c['verifiers'], 'verifiers', TRUST_LIST_MAX_ENTRIES);
   if (issuers.length + verifiers.length > TRUST_LIST_MAX_ENTRIES) throw new Invalid(`more than ${TRUST_LIST_MAX_ENTRIES} entries`);
   const seen = new Set<string>();
+  const orgs = { issuers: new Set<unknown>(), verifiers: new Set<unknown>() };
+  const once = (section: 'issuers' | 'verifiers', org: unknown, at: string) => {
+    if (orgs[section].has(org)) throw new Invalid(`${at}.ma_to_chuc is listed more than once in ${section}`);
+    orgs[section].add(org);
+  };
   issuers.forEach((e, i) => {
     const at = `issuers[${i}]`;
     if (!isObject(e)) throw new Invalid(`${at} must be an object`);
     only(e, ['ma_to_chuc', 'ten', 'chung_thu', 'vct', 'cong_doan', 'validFrom', 'validUntil'], at);
     if (!ORG_ID.test(text(e['ma_to_chuc'], `${at}.ma_to_chuc`))) throw new Invalid(`${at}.ma_to_chuc is not VATVN-<tax code>`);
+    once('issuers', e['ma_to_chuc'], at);
     text(e['ten'], `${at}.ten`);
     certificates(e['chung_thu'], `${at}.chung_thu`, ['vc', 'status'], seen);
-    list(e['vct'], `${at}.vct`).forEach((v, j) => text(v, `${at}.vct[${j}]`));
+    const vct = list(e['vct'], `${at}.vct`);
+    if (vct.length === 0) throw new Invalid(`${at}.vct must not be empty`);
+    vct.forEach((v, j) => text(v, `${at}.vct[${j}]`));
     if (e['cong_doan'] !== undefined) {
       list(e['cong_doan'], `${at}.cong_doan`).forEach((v, j) => {
         if (!(CONG_DOAN as readonly unknown[]).includes(v)) throw new Invalid(`${at}.cong_doan[${j}] is not a known stage`);
@@ -130,6 +144,7 @@ function checkContent(c: Record<string, unknown>): void {
     if (!isObject(e)) throw new Invalid(`${at} must be an object`);
     only(e, ['ma_to_chuc', 'ten', 'chung_thu', 'validFrom', 'validUntil'], at);
     if (!ORG_ID.test(text(e['ma_to_chuc'], `${at}.ma_to_chuc`))) throw new Invalid(`${at}.ma_to_chuc is not VATVN-<tax code>`);
+    once('verifiers', e['ma_to_chuc'], at);
     text(e['ten'], `${at}.ten`);
     certificates(e['chung_thu'], `${at}.chung_thu`, ['request'], seen);
     validity(e, at, false);
@@ -157,11 +172,12 @@ export function validateTrustListContent(v: unknown): Validation<TrustListConten
   });
 }
 
-/** The signed payload: `iat`, `exp`, `ttl` (positive integers) plus the content. */
+/** The signed payload: `iat`, `exp`, `ttl`, optional `signer_not_before` (positive integers) plus the content. */
 export function validateTrustListPayload(v: unknown): Validation<TrustListPayload> {
   return run(v, (o) => {
-    only(o, ['iat', 'exp', 'ttl', 'issuers', 'verifiers'], 'payload');
-    for (const k of ['iat', 'exp', 'ttl']) {
+    only(o, ['iat', 'exp', 'ttl', 'signer_not_before', 'issuers', 'verifiers'], 'payload');
+    for (const k of ['iat', 'exp', 'ttl', 'signer_not_before']) {
+      if (k === 'signer_not_before' && o[k] === undefined) continue;
       if (!Number.isSafeInteger(o[k]) || (o[k] as number) <= 0) throw new Invalid(`${k} must be a positive integer`);
     }
     checkContent(o);

@@ -2,7 +2,7 @@
 
 This document is the contract between the four packages and their consumers
 (`identra-server`, `identra-app`, `identra-website`). The decisions behind it are
-the ADRs 0001–0017 kept in the private parent repository; where this file and an
+the ADRs 0001–0019 kept in the private parent repository; where this file and an
 ADR disagree, the ADR wins and this file must be fixed.
 
 All protocol logic lives in this SDK. Consumers only do UI, HTTP, storage and
@@ -53,6 +53,8 @@ interface Verifier {
 interface Hasher { sha256(data: Uint8Array): Promise<Uint8Array> }
 interface RandomSource { bytes(n: number): Uint8Array }
 interface Clock { now(): Date }
+// Implementations MUST enforce timeoutMs (reject when it passes) and a response size limit:
+// sdk-core has no timer and reads text() whole.
 type HttpFetch = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number })
   => Promise<{ status: number; headers: { get(name: string): string | null }; text(): Promise<string> }>;
 
@@ -278,14 +280,29 @@ value as an OpenID4VP `x509_hash`.
   `status` under `issuers` and `request` under `verifiers`; instants are ISO 8601
   in UTC (`…Z`). At most 256 KB and 1000 entries.
 
-Caching rules shared by both lists (ADR-0013 §4, ADR-0015 §6): a held copy is
-used without a reload while younger than `min(ttl, maxAgeSeconds ?? ttl)`, the
-age counted from when this process fetched it (`maxAgeSeconds: 0` = always try
-to reload: the server-side verifier); otherwise reload; if the reload fails or
-yields an invalid token keep using the held copy until its `exp` (+ 60 s skew);
-never accept a copy whose `iat` is older than the held one; with no valid copy
-the answer is `unavailable` / `TrustListUnavailableError`. Concurrent reads of
-one URL share one request; the status checker holds at most 100 lists.
+Caching rules shared by both lists (ADR-0013 §4, ADR-0015 §6, ADR-0019): a held
+copy is used without a reload while younger than `min(ttl, cap, maxAgeSeconds ??
+∞)`, where the cap is a constant of `sdk-core` (900 s for a status list, 3600 s
+for the trust list) and a missing `ttl` means the cap; the age is counted from
+when this process fetched it, and a clock that stepped back before that instant
+makes the copy stale (`maxAgeSeconds: 0` = always try to reload: the
+server-side verifier). Otherwise reload; if the reload fails or yields an
+invalid token keep using the held copy until its `exp` (+ 60 s skew). Both
+tokens are refused when `exp − iat` exceeds 86 400 s + 60 s. Never accept a copy
+whose `iat` is older than the held one, nor another token with the same `iat`
+(the identical token is accepted and refreshes the held copy); the server never
+issues two tokens with one `iat` (`iat = max(now, last iat + 1)`). With no valid
+copy the answer is `unavailable` / `TrustListUnavailableError`. Concurrent reads
+of one URL share one request. The status checker holds at most 100 lists and
+never evicts one that is still inside its `exp`: when all are, a new list is
+verified and used but not cached.
+
+Optional persistence (`seen: { get(key), set(key, value) }`, ADR-0019 §3) keeps
+`iat:<url>` (last accepted `iat` per list URL) and, for the trust list,
+`signer-not-before:<url>` across restarts; it is read before verifying and
+written after each accepted token. Without a held copy only the stored `iat` is
+known, so a token with an equal `iat` is accepted. A failing store is treated as
+empty.
 
 ## 6. Testing
 
@@ -318,42 +335,54 @@ one URL share one request; the status checker holds at most 100 lists.
 
 `sdk-core` (pure; fetch and clock injected):
 
-- `createStatusList()`, `statusListFromBytes(bytes)`, `decodeStatusList({ bits, lst })`:
-  the list model on `@owf/token-status-list` (bit packing and ZLIB, ADR-0017).
-  Index and value are range-checked here (the library allows 3); decoding refuses
-  `bits ≠ 2`, anything but exactly 32 768 inflated bytes, and stops inflating once
-  the output passes 32 768 bytes (in the library's 64 KiB output chunks).
+- `createStatusList()`, `statusListFromBytes(bytes)`, `statusListEntry(bytes, idx)`,
+  `decodeStatusList({ bits, lst })`: the list model on `@owf/token-status-list` (bit
+  packing and ZLIB, ADR-0017). Index and value are range-checked here (the library
+  allows 3); decoding refuses `bits ≠ 2`, anything but exactly 32 768 inflated bytes,
+  and stops inflating once the output passes 32 768 bytes (in the library's 64 KiB
+  output chunks).
 - `createStatusListToken({ list, uri, signer, now, ttlSeconds = 900, lifetimeSeconds = 86 400 })`,
-  `createTrustListToken({ issuers, verifiers, signer, now, ttlSeconds = 3600, lifetimeSeconds = 86 400 })`.
-  The trust-list signer must have an `x5c` of exactly one certificate.
+  `createTrustListToken({ issuers, verifiers, signer, now, ttlSeconds = 3600, lifetimeSeconds = 86 400, signerNotBefore? })`.
+  `lifetimeSeconds` is at most 86 400. The trust-list signer must have an `x5c` of
+  exactly one certificate; `signerNotBefore` may not be later than its notBefore.
 - `verifyStatusListToken(token, { uri, issuer: { maToChuc }, chainValidator, trustRegistry, verifier, now })`
-  and `verifyTrustListToken(token, { chainValidator, verifier, now })` return
+  and `verifyTrustListToken(token, { chainValidator, verifier, now, minSignerNotBefore? })` return
   `{ ok: true, … }` or `{ ok: false, reason, detail }` and never throw for bad input.
   In order: size cap (`too_large`); strict JWS (`malformed`); `typ` exact (`typ`);
   `alg` ES256 (`alg`); `x5c` with profile `status` / `trust-list` (`chain`); signature
   with the leaf key (`signature`); numeric `iat` and `exp` present, `ttl` a positive
-  integer if present (`claims`); `iat` ≤ now + 60 s (`not_yet_valid`); `exp` > now − 60 s
-  (`expired`). Then for a status list: `sub` = `uri` (`claims`); the signer
-  fingerprint is in the trust list with purpose `status`, its `organizationIdentifier`
-  equals that entry's `maToChuc`, and that `maToChuc` is the issuer's (`not_trusted`;
-  `trust_list_unavailable` when the registry has no list); `status_list` decodes
-  (`claims`). For a trust list: the payload validator (`claims`), which also refuses
-  unknown fields and purposes, a purpose outside its section, malformed fingerprints
-  or instants, `validFrom ≥ validUntil`, and one fingerprint listed twice.
-- `createStatusListChecker({ fetch, verifier, chainValidator, trustRegistry, clock, maxAgeSeconds? })`
+  integer if present, `exp − iat` ≤ 86 460 s (`claims`); `iat` ≤ now + 60 s
+  (`not_yet_valid`); `exp` > now − 60 s (`expired`). Then for a status list: `sub` =
+  `uri` (`claims`); the signer fingerprint is in the trust list with purpose
+  `status`, its `organizationIdentifier` equals that entry's `maToChuc`, and that
+  `maToChuc` is the issuer's (`not_trusted`; `trust_list_unavailable` when the
+  registry has no list); `status_list` decodes (`claims`). For a trust list: the
+  payload validator (`claims`), which also refuses unknown fields and purposes, a
+  purpose outside its section, malformed fingerprints or instants, `validFrom ≥
+  validUntil`, one fingerprint listed twice, one `ma_to_chuc` twice within a
+  section, an empty issuer `vct`; a `signer_not_before` later than the signer
+  certificate's notBefore (`claims`); a signer certificate whose notBefore is
+  earlier than `minSignerNotBefore` (`not_trusted`).
+- `signer_not_before` (ADR-0019 §2): after a trust-list signer is replaced, the server
+  publishes lists carrying the new certificate's notBefore; the registry remembers
+  the largest value of any verified list (and persists it with `seen`) and refuses
+  lists of older signer certificates from then on.
+- `createStatusListChecker({ fetch, verifier, chainValidator, trustRegistry, clock, maxAgeSeconds?, seen? })`
   (`StatusChecker`): refuses a non-https `uri` and an `idx` outside the list without a
-  request; `GET` with `timeoutMs: 5000`, HTTP 200 only; caches per (issuer
-  `maToChuc`, `uri`) by the rules of section 5 and re-checks the signer against the
-  trust list on every answer. Every failure is `'unavailable'`.
-- `createSignedTrustListRegistry({ url, fetch, verifier, chainValidator, clock, maxAgeSeconds? })`
+  request; `GET` with `timeoutMs: 5000`, HTTP 200 only; caches per `uri` by the rules
+  of section 5 (a list is verified for any trusted `status` signer whose organisation
+  matches its trust list entry); every answer re-checks the signer against the trust
+  list and against the caller's issuer organisation. Every failure is `'unavailable'`.
+- `createSignedTrustListRegistry({ url, fetch, verifier, chainValidator, clock, maxAgeSeconds?, seen? })`
   (`TrustRegistry`): `lookup(fingerprint, at = clock.now())` gives the entry with the
   purpose of the matched certificate, `null` when absent or `at` is outside
-  `[validFrom, validUntil]`; `refresh()`; `current()` (iat, exp, ttl, entry counts)
-  for monitoring (ADR-0014 §7).
+  `[validFrom − 60 s, validUntil + 60 s]`; `refresh()`; `current()` (iat, exp, ttl,
+  entry counts) for monitoring (ADR-0014 §7).
 - `createMappedFetch(fetch, { 'https://api-identra.awncorp.vn': 'http://127.0.0.1:4000' })`:
   development and test deployments send network access for a canonical origin
   elsewhere; identifiers stay canonical. Only the exact origin followed by `/`, `?`,
-  `#` or nothing is mapped.
+  `#` or nothing is mapped. `init` (with `timeoutMs`) is passed unchanged: the
+  wrapped fetch enforces the timeout and the size limit.
 
 `sdk-server` (Node):
 
@@ -361,17 +390,46 @@ one URL share one request; the status checker holds at most 100 lists.
   `orgs/<name>/<purpose>.key.pem` + `.chain.pem` (purpose `vc` is the file `vc` or
   `vc-product`, exactly one of them), `trust-list-signer/trust-list.key.pem` +
   `.cert.pem`, `root.cert.pem` (+ `root2.cert.pem`). Names are lower-case words
-  joined by hyphens; key files must be regular files without group or other
-  permissions; keys are imported non-extractable and must match their certificate.
+  joined by hyphens; a key file is opened with `O_NOFOLLOW` and must be a regular
+  file without group or other permissions (checked on the open descriptor); at load
+  the chain must pass the core validator for the purpose's profile against the
+  store's own roots at the current time (for `vc`, against the leaf's only SAN URI),
+  and the key must match the leaf; keys are imported non-extractable.
 - `createStatusListService({ issuerUri, keyStore, storage, random, clock })`:
-  `allocate(issuer)` draws a random index and claims it with `storage.reserve`, which
-  must be atomic (Postgres: unique key `(issuer, n, idx)`, `INSERT … ON CONFLICT DO
-  NOTHING`), so two concurrent allocations never get one index; `setStatus` uses
-  `storage.save(…, expectedVersion)` (optimistic concurrency, retried); `revoked`
-  is final (`StatusRevokedError`); `token(issuer, n)` re-signs when the stored
-  version changed or the token is an hour old. All credentials use list 1 for now.
-- `createTrustListService({ source, keyStore, clock })` validates the source with the
-  core validator and re-signs when it changed or after an hour; an invalid source
-  throws.
+  `allocate(issuer)` draws random indexes of the issuer's current list (64 draws),
+  claims one with `storage.reserve`, which must be atomic (Postgres: unique key
+  `(issuer, n, idx)`, `INSERT … ON CONFLICT DO NOTHING`), so two concurrent
+  allocations never get one index, and only returns an index whose value is 0;
+  when the draws fail it moves to list `n + 1` (created), and throws
+  `StatusListFullError` only when that fails too. The current list number is kept
+  in memory and starts at 1 after a restart. `setStatus` requires a reserved index
+  (`StatusIndexNotAllocatedError`), uses `storage.save(…, expectedVersion)`
+  (optimistic concurrency, 5 attempts), and keeps `revoked` final
+  (`StatusRevokedError`). `token(issuer, n)` (`n` 1–999 999 999) is `null` for a
+  list that does not exist (HTTP 404), is re-signed when the stored version changed
+  or the token is an hour old, with `iat = max(now, lastIat + 1)` and `lastIat`
+  stored with the list; at most 1000 tokens are cached. Bursts of more than one
+  change per second make `iat` run ahead of the clock by that many seconds;
+  beyond 60 s clients would refuse the list as `not_yet_valid`.
+- `createTrustListService({ source, keyStore, clock, signerNotBefore?, lastToken?, onError? })`
+  validates the source with the core validator and re-signs when it changed or
+  after an hour, with `iat = max(now, lastIat + 1)`; `lastIat` is in memory and,
+  after a restart, taken from `lastToken` when the server kept it (otherwise a
+  restart within the same second as the last signature can repeat an `iat`, and
+  clients then keep their copy until the next one). An invalid or failing source:
+  the last good token is served unchanged until its `exp` and `onError` is called;
+  with none, the call throws.
 - `scripts/pki/make-trust-list-source.mjs <demo-pki-dir> [--out file]` writes the
-  trust-list source of the demo organisations.
+  trust-list source of the demo organisations (`validFrom` = latest notBefore,
+  `validUntil` = earliest notAfter of the organisation's certificates).
+
+Known limitations:
+
+- The trust-list signer is recognised only by being a CA:FALSE leaf signed directly
+  by a pinned root; there is no dedicated extended key usage or policy OID for it
+  yet (review F11). A future root-signed leaf for another purpose could therefore
+  sign a trust list.
+- A verifier that has never fetched a list (fresh install, empty `seen`) can be fed
+  an older list still inside its 24 h, or a list of a replaced trust-list signer
+  until that certificate expires, by an attacker who controls the connection
+  (ADR-0019, "Giới hạn còn lại").

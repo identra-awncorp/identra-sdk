@@ -32,11 +32,14 @@ test('the source script: content, fingerprints, organisation ids, validity', () 
     ma_to_chuc: 'VATVN-0100000005', ten: 'Nhà Tuyển Dụng Mẫu (DEMO)', chung_thu: [{ sha256: fp('orgs/nha-tuyen-dung-mau/request.cert.pem'), muc_dich: 'request' }],
     validFrom: content.verifiers[0]!.validFrom, validUntil: content.verifiers[0]!.validUntil,
   }]);
-  const from = Date.parse(content.issuers[0]!.validFrom);
-  assert.ok(from >= before - 1000 && from <= Date.now());
-  // truong-mau: vc lives 3 years, status 13 months: the earliest notAfter is the status certificate's.
-  const statusNotAfter = execFileSync('openssl', ['x509', '-in', join(DEMO, 'orgs/truong-mau/status.cert.pem'), '-noout', '-enddate'], { encoding: 'utf8' });
-  assert.equal(Date.parse(content.issuers[0]!.validUntil), Date.parse(statusNotAfter.split('=')[1]!));
+  // truong-mau: validFrom is the latest notBefore, validUntil the earliest notAfter of its certificates
+  // (vc lives 3 years, status 13 months: the earliest notAfter is the status certificate's).
+  const date = (file: string, which: 'startdate' | 'enddate') =>
+    Date.parse(execFileSync('openssl', ['x509', '-in', join(DEMO, file), '-noout', `-${which}`], { encoding: 'utf8' }).split('=')[1]!);
+  const starts = ['orgs/truong-mau/vc.cert.pem', 'orgs/truong-mau/status.cert.pem'].map((f) => date(f, 'startdate'));
+  assert.equal(Date.parse(content.issuers[0]!.validFrom), Math.max(...starts));
+  assert.equal(Date.parse(content.issuers[0]!.validUntil), date('orgs/truong-mau/status.cert.pem', 'enddate'));
+  assert.ok(Date.parse(content.issuers[0]!.validFrom) <= before);
 });
 
 test('the source script writes --out and refuses bad arguments', () => {
@@ -66,22 +69,53 @@ test('the service token verifies and every listed fingerprint resolves through t
   }
 });
 
-test('re-signed when the source changes or after one hour; an invalid source is an error', async () => {
+const iatOf = (token: string) => JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString()).iat as number;
+
+test('re-signed when the source changes or after one hour, always with a greater iat', async () => {
   const clock = fakeClock();
   let content = trustListSource(DEMO) as TrustListContent;
   const service = createTrustListService({ source: () => content, keyStore, clock });
   const t1 = await service.token();
-  clock.advance(10);
   assert.equal(await service.token(), t1);
   content = { ...content, verifiers: [] };
   const t2 = await service.token();
   assert.notEqual(t2, t1);
+  assert.equal(iatOf(t2), iatOf(t1) + 1, 'same second: iat + 1');
   clock.advance(3599);
   assert.equal(await service.token(), t2);
   clock.advance(1);
-  assert.notEqual(await service.token(), t2);
-  const bad = structuredClone(content);
+  const t3 = await service.token();
+  assert.notEqual(t3, t2);
+  // A restarted service given its last token continues above it, even with a clock stepped back.
+  clock.advance(-60);
+  const restarted = createTrustListService({ source: () => content, keyStore, clock, lastToken: t3 });
+  assert.equal(iatOf(await restarted.token()), iatOf(t3) + 1);
+});
+
+test('an invalid source: the last good token is served unchanged until its exp and onError is told', async () => {
+  const clock = fakeClock();
+  let content: unknown = trustListSource(DEMO);
+  const errors: string[] = [];
+  const service = createTrustListService({ source: () => content, keyStore, clock, onError: (e) => errors.push(e.message) });
+  const good = await service.token();
+  const bad = structuredClone(content) as TrustListContent;
   bad.issuers[0]!.chung_thu[0]!.sha256 = 'not-a-fingerprint';
   content = bad;
-  await assert.rejects(service.token(), /trust list source is invalid: issuers\[0\]\.chung_thu\[0\]\.sha256 is not a base64url SHA-256 fingerprint/);
+  clock.advance(7200);
+  assert.equal(await service.token(), good, 'not re-signed');
+  assert.deepEqual(errors, ['trust list source is invalid: issuers[0].chung_thu[0].sha256 is not a base64url SHA-256 fingerprint']);
+  const throwing = createTrustListService({ source: () => { throw new Error('file missing'); }, keyStore, clock });
+  await assert.rejects(throwing.token(), /file missing/, 'no good token: the call throws');
+  clock.advance(86_400 - 7200);
+  await assert.rejects(service.token(), /trust list source is invalid/, 'after exp the good token is no longer served');
+});
+
+test('signerNotBefore is carried in the payload', async () => {
+  const clock = fakeClock();
+  const notBefore = Math.floor(Date.parse(execFileSync('openssl', ['x509', '-in', join(DEMO, 'trust-list-signer/trust-list.cert.pem'), '-noout', '-startdate'], { encoding: 'utf8' }).split('=')[1]!) / 1000);
+  const service = createTrustListService({ source: () => trustListSource(DEMO), keyStore, clock, signerNotBefore: notBefore });
+  const r = await verifyTrustListToken(await service.token(), { chainValidator, verifier: webCryptoVerifier, now: clock.now(), minSignerNotBefore: notBefore });
+  assert.ok(r.ok);
+  assert.equal(r.payload.signer_not_before, notBefore);
+  await assert.rejects(createTrustListService({ source: () => trustListSource(DEMO), keyStore, clock, signerNotBefore: notBefore + 1 }).token(), /signerNotBefore must be/);
 });

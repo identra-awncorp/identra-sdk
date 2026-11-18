@@ -24,6 +24,7 @@ export {
 export {
   createStatusList,
   decodeStatusList,
+  statusListEntry,
   statusListFromBytes,
   STATUS_LIST_BYTES,
   STATUS_LIST_ENTRIES,
@@ -38,8 +39,9 @@ export {
   verifyStatusListToken,
   type VerifiedStatusListToken,
 } from './status/token.js';
-export { createStatusListChecker, STATUS_CACHE_MAX_URIS } from './status/checker.js';
-export type { TokenFailure, TokenFailureReason } from './signed-token.js';
+export { createStatusListChecker, STATUS_CACHE_MAX_URIS, STATUS_LIST_MAX_FRESH_SECONDS } from './status/checker.js';
+export { MAX_TOKEN_LIFETIME_SECONDS, type TokenFailure, type TokenFailureReason } from './signed-token.js';
+export type { SeenStore } from './token-cache.js';
 export {
   isFingerprint,
   TRUST_LIST_MAX_ENTRIES,
@@ -52,5 +54,5 @@ export {
   type TrustListVerifier,
 } from './trust/payload.js';
 export { createTrustListToken, TRUST_LIST_TOKEN_MAX_BYTES, TRUST_LIST_TOKEN_TYP, verifyTrustListToken, type VerifiedTrustListToken } from './trust/token.js';
-export { createSignedTrustListRegistry, type SignedTrustListRegistry } from './trust/registry.js';
+export { createSignedTrustListRegistry, TRUST_LIST_MAX_FRESH_SECONDS, type SignedTrustListRegistry } from './trust/registry.js';
 export { createMappedFetch } from './mapped-fetch.js';

@@ -41,6 +41,12 @@ export interface VerifiedSignedToken {
 }
 
 const SKEW_S = CLOCK_SKEW_MS / 1000;
+/**
+ * ADR-0019 section 1: a status list or trust list token may live at most 24 hours (exp - iat,
+ * plus the 60 s skew), whatever its signer wrote. With the freshness caps of token-cache.ts this
+ * bounds how long a removal or a revocation can stay unseen by a client that fetched one list.
+ */
+export const MAX_TOKEN_LIFETIME_SECONDS = 86_400;
 const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 export const fail = (reason: TokenFailureReason, detail: string): TokenFailure => ({ ok: false, reason, detail });
 
@@ -69,6 +75,7 @@ export async function verifySignedToken(
   if (!isTime(p['iat'])) return fail('claims', 'iat is missing or not a number');
   if (!isTime(p['exp'])) return fail('claims', 'exp is missing or not a number');
   if (p['ttl'] !== undefined && !(Number.isSafeInteger(p['ttl']) && (p['ttl'] as number) > 0)) return fail('claims', 'ttl is not a positive integer');
+  if (p['exp'] - p['iat'] > MAX_TOKEN_LIFETIME_SECONDS + SKEW_S) return fail('claims', 'exp - iat is more than 24 hours');
   if (p['iat'] > t + SKEW_S) return fail('not_yet_valid', 'iat is in the future');
   if (p['exp'] <= t - SKEW_S) return fail('expired', 'exp has passed');
   const result: VerifiedSignedToken = { ok: true, payload: p, iat: p['iat'], exp: p['exp'], leaf, fingerprint: chain.fingerprint! };
@@ -80,7 +87,9 @@ export async function verifySignedToken(
 export function tokenTimes(now: Date, ttlSeconds: number, lifetimeSeconds: number): { iat: number; exp: number; ttl: number } {
   if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new TypeError('now must be a valid Date');
   if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0) throw new TypeError('ttlSeconds must be a positive integer');
-  if (!Number.isSafeInteger(lifetimeSeconds) || lifetimeSeconds < ttlSeconds) throw new TypeError('lifetimeSeconds must be an integer of at least ttlSeconds');
+  if (!Number.isSafeInteger(lifetimeSeconds) || lifetimeSeconds < ttlSeconds || lifetimeSeconds > MAX_TOKEN_LIFETIME_SECONDS) {
+    throw new TypeError('lifetimeSeconds must be an integer from ttlSeconds to 86 400');
+  }
   const iat = Math.floor(now.getTime() / 1000);
   return { iat, exp: iat + lifetimeSeconds, ttl: ttlSeconds };
 }

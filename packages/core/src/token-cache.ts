@@ -1,20 +1,36 @@
 // Fetching and caching shared by the status list checker and the trust list registry
-// (docs/architecture.md section 5, ADR-0013 section 4, ADR-0015 section 6):
-// - a held copy is used without a refetch while younger than min(ttl, maxAgeSeconds ?? ttl), the age
-//   measured from when this cache fetched it (maxAgeSeconds 0: always try to refetch);
+// (docs/architecture.md section 5, ADR-0013 section 4, ADR-0015 section 6, ADR-0019):
+// - a held copy is used without a refetch while younger than min(ttl, maxFreshSeconds,
+//   maxAgeSeconds ?? Infinity); maxFreshSeconds is the hard cap of core (900 s status list,
+//   3600 s trust list), a missing ttl means the cap; the age is measured from when this cache
+//   fetched it, and a clock that stepped back before that instant makes the copy stale;
 // - otherwise refetch; when that fails or yields an invalid token, keep the held copy until its exp;
-// - a new copy whose iat is older than the held one never replaces it;
-// - concurrent reads of one key share one in-flight load; at most maxEntries keys, oldest evicted.
+// - a new copy whose iat is older than the held one never replaces it; one with the SAME iat only
+//   when it is the identical token; with `seen`, the last accepted iat survives a restart;
+// - concurrent reads of one key share one in-flight load; at most maxEntries keys are held, and an
+//   unexpired entry is never evicted to make room (the new token is then used but not cached).
 import type { Clock, HttpFetch } from './interfaces.js';
 import { CLOCK_SKEW_MS } from './x509/chain.js';
 
 export const FETCH_TIMEOUT_MS = 5000;
 
+/**
+ * Optional persistence of what a verifier has already accepted (ADR-0019 section 3), e.g. the
+ * wallet's durable storage. Keys: `iat:<url>` (the last accepted iat of the token served at that
+ * URL) and `signer-not-before:<trust list url>` (the largest signer_not_before seen). Values are
+ * integer seconds. A failing store is treated as empty: the verifier then starts blind, as without one.
+ */
+export interface SeenStore {
+  get(key: string): Promise<number | null>;
+  set(key: string, value: number): Promise<void>;
+}
+
 export interface CachedToken<T> {
   value: T;
+  /** The compact token, to tell an identical re-serve from another token with the same iat. */
+  token: string;
   iat: number;
   exp: number;
-  /** Seconds; a token without ttl is refetched on every read (the held copy still serves as fallback). */
   ttl?: number;
 }
 
@@ -29,7 +45,10 @@ export interface TokenCache<T> {
   peek(key: string): CachedToken<T> | undefined;
 }
 
-/** GET `url` (https only) with a 5 s timeout; the body when the answer is 200 and the body fits `maxBytes`, else null. */
+/**
+ * GET `url` (https only) with `timeoutMs: 5000`; the body when the answer is 200 and fits `maxBytes`,
+ * else null. The injected fetch must enforce the timeout and its own response size limit.
+ */
 export async function fetchToken(httpFetch: HttpFetch, url: string, maxBytes: number, accept: string): Promise<string | null> {
   if (typeof url !== 'string' || !url.startsWith('https://')) return null;
   const res = await httpFetch(url, { method: 'GET', headers: { accept }, timeoutMs: FETCH_TIMEOUT_MS });
@@ -38,23 +57,65 @@ export async function fetchToken(httpFetch: HttpFetch, url: string, maxBytes: nu
   return typeof body === 'string' && body.length <= maxBytes ? body : null;
 }
 
+export async function readSeen(seen: SeenStore | undefined, key: string): Promise<number | null> {
+  if (!seen) return null;
+  try {
+    const v = await seen.get(key);
+    return Number.isSafeInteger(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function writeSeen(seen: SeenStore | undefined, key: string, value: number): Promise<void> {
+  try {
+    await seen?.set(key, value);
+  } catch {
+    // Treated like a missing store: the in-memory state still applies.
+  }
+}
+
 export function createTokenCache<T>(o: {
   /** Fetches and fully verifies a token for `key`; null (or a rejection) when there is no valid one. */
   load: (key: string, now: Date) => Promise<CachedToken<T> | null>;
   clock: Clock;
+  maxFreshSeconds: number;
   maxAgeSeconds?: number;
   maxEntries: number;
+  seen?: SeenStore;
 }): TokenCache<T> {
   if (o.maxAgeSeconds !== undefined && !(Number.isSafeInteger(o.maxAgeSeconds) && o.maxAgeSeconds >= 0)) {
     throw new TypeError('maxAgeSeconds must be a non-negative integer');
   }
   const held = new Map<string, Held<T>>();
-  const inflight = new Map<string, Promise<void>>();
+  const inflight = new Map<string, Promise<Held<T> | null>>();
   const nowMs = () => o.clock.now().getTime();
   const usable = (h: Held<T>) => h.exp * 1000 > nowMs() - CLOCK_SKEW_MS;
-  const fresh = (h: Held<T>) => nowMs() - h.fetchedAtMs < Math.min(h.ttl ?? 0, o.maxAgeSeconds ?? Infinity) * 1000;
+  const fresh = (h: Held<T>) => {
+    const age = nowMs() - h.fetchedAtMs;
+    return age >= 0 && age < Math.min(h.ttl ?? o.maxFreshSeconds, o.maxFreshSeconds, o.maxAgeSeconds ?? Infinity) * 1000;
+  };
 
-  async function reload(key: string): Promise<void> {
+  function accepts(current: Held<T> | undefined, loaded: CachedToken<T>, floor: number | null): boolean {
+    if (current) return loaded.iat > current.iat || (loaded.iat === current.iat && loaded.token === current.token);
+    // Without a held copy only the persisted iat is known, not the token: an equal iat is accepted.
+    return floor === null || loaded.iat >= floor;
+  }
+
+  function store(key: string, entry: Held<T>): void {
+    if (!held.has(key)) {
+      for (const [k, h] of held) {
+        if (held.size < o.maxEntries) break;
+        if (!usable(h)) held.delete(k);
+      }
+      if (held.size >= o.maxEntries) return;
+    }
+    held.delete(key);
+    held.set(key, entry);
+  }
+
+  async function reload(key: string): Promise<Held<T> | null> {
+    const floor = await readSeen(o.seen, `iat:${key}`);
     let loaded: CachedToken<T> | null;
     try {
       loaded = await o.load(key, o.clock.now());
@@ -62,10 +123,11 @@ export function createTokenCache<T>(o: {
       loaded = null;
     }
     const current = held.get(key);
-    if (!loaded || (current && loaded.iat < current.iat)) return;
-    held.delete(key);
-    held.set(key, { ...loaded, fetchedAtMs: nowMs() });
-    while (held.size > o.maxEntries) held.delete(held.keys().next().value!);
+    if (!loaded || !accepts(current, loaded, floor)) return current ?? null;
+    const entry: Held<T> = { ...loaded, fetchedAtMs: nowMs() };
+    store(key, entry);
+    if (floor === null || loaded.iat > floor) await writeSeen(o.seen, `iat:${key}`, loaded.iat);
+    return entry;
   }
 
   return {
@@ -77,15 +139,14 @@ export function createTokenCache<T>(o: {
         pending = reload(key).finally(() => inflight.delete(key));
         inflight.set(key, pending);
       }
-      await pending;
-      const after = held.get(key);
-      return after && usable(after) ? after.value : null;
+      const r = await pending;
+      return r && usable(r) ? r.value : null;
     },
     peek(key) {
       const h = held.get(key);
       if (!h) return undefined;
-      const { value, iat, exp, ttl } = h;
-      return ttl === undefined ? { value, iat, exp } : { value, iat, exp, ttl };
+      const { value, token, iat, exp, ttl } = h;
+      return ttl === undefined ? { value, token, iat, exp } : { value, token, iat, exp, ttl };
     },
   };
 }

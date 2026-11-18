@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import { base64Encode, decodeJws, signJws, utf8Encode, verifyJws } from '@identra/sdk-core';
 import { webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import { createFileKeyStore } from '@identra/sdk-server';
-import { freshDemoPki, pemCerts } from './helpers.js';
+import { freshDemoPki, pemCerts, REPO } from './helpers.js';
 
 const DEMO = freshDemoPki();
 const store = createFileKeyStore(DEMO);
@@ -104,4 +104,23 @@ test('ambiguous or symlinked key files, extra roots', async () => {
   await assert.rejects(createFileKeyStore(dir).signer('nha-san-xuat', 'status'), /is not a regular file/);
   copyFileSync(join(dir, 'ca/issuing/ca.cert.pem'), join(dir, 'root2.cert.pem'));
   assert.equal(createFileKeyStore(dir).trustedRoots().length, 2);
+});
+
+test('at load the chain must validate for the purpose against the store\'s own roots', async () => {
+  const dir = copy();
+  const org = join(dir, 'orgs/truong-mau');
+  // A chain of another PKI (the core test PKI) with its own matching key.
+  copyFileSync(join(REPO, '.pki/test/leaf/status.chain.pem'), join(org, 'status.chain.pem'));
+  copyFileSync(join(REPO, '.pki/test/leaf/status.key.pem'), join(org, 'status.key.pem'));
+  chmodSync(join(org, 'status.key.pem'), 0o600);
+  await assert.rejects(createFileKeyStore(dir).signer('truong-mau', 'status'), /does not validate for profile status: CERT_CHAIN_UNTRUSTED/);
+  // Another profile's certificate: a status chain where a vc chain belongs.
+  copyFileSync(join(DEMO, 'orgs/truong-mau/status.chain.pem'), join(org, 'vc.chain.pem'));
+  copyFileSync(join(DEMO, 'orgs/truong-mau/status.key.pem'), join(org, 'vc.key.pem'));
+  await assert.rejects(createFileKeyStore(dir).signer('truong-mau', 'vc'), /must carry exactly one SAN URI/);
+  // A leaf of the Issuing CA in the trust-list signer's place.
+  const tl = join(dir, 'trust-list-signer');
+  copyFileSync(join(DEMO, 'orgs/kiem-dinh/status.cert.pem'), join(tl, 'trust-list.cert.pem'));
+  copyFileSync(join(DEMO, 'orgs/kiem-dinh/status.key.pem'), join(tl, 'trust-list.key.pem'));
+  await assert.rejects(createFileKeyStore(dir).trustListSigner(), /does not validate for profile trust-list: CERT_CHAIN_UNTRUSTED/);
 });

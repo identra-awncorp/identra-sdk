@@ -36,6 +36,25 @@ export async function otherOrgStatus(): Promise<{ signer: Signer; fingerprint: s
   return other;
 }
 
+let later: Signer | undefined;
+/**
+ * A second trust-list signer, issued directly by the test root with notBefore 2026-03-01 (the
+ * first one starts 2026-01-01): the replacement after a key compromise (ADR-0019 section 2).
+ * Made with identra-pki.sh on a copy of the root directory.
+ */
+export async function laterTrustListSigner(): Promise<Signer> {
+  if (later) return later;
+  const dir = mkdtempSync(join(tmpdir(), 'identra-later-tl-'));
+  cpSync(fileURLToPath(new URL('.pki/test/ca/root', REPO)), join(dir, 'root'), { recursive: true });
+  const pki = (...args: string[]) => execFileSync('bash', [fileURLToPath(new URL('scripts/pki/identra-pki.sh', REPO)), ...args], { stdio: 'pipe' });
+  const [key, csr, cert] = ['tl.key.pem', 'tl.csr.pem', 'tl.cert.pem'].map((f) => join(dir, f)) as [string, string, string];
+  pki('new-key-and-csr', '--key', key, '--csr', csr, '--o', 'Identra TEST', '--mst', '0100000000', '--cn', 'Identra TEST Trust List Signer 2');
+  pki('issue-trust-list-signer', '--root-dir', join(dir, 'root'), '--csr', csr, '--out', cert, '--start', '20260301000000Z');
+  later = await createWebCryptoSigner({ privateKey: readFileSync(key, 'utf8'), x5c: pemCerts(readFileSync(cert, 'utf8')).map(b64) });
+  return later;
+}
+export const LATER_SIGNER_NOT_BEFORE = Date.UTC(2026, 2, 1) / 1000;
+
 export const FP = {
   vc: fingerprintOf(leaf('vc')),
   status: fingerprintOf(leaf('status')),
@@ -88,7 +107,11 @@ export function scriptedFetch(routes: Record<string, Route | (() => Route | Prom
 export const ok = (body: string) => ({ status: 200, body });
 
 /** A signed trust list token of `content` (default demoContent) by the test trust-list signer. */
-export async function trustToken(content?: TrustListContent, now = NOW, options: { ttlSeconds?: number; lifetimeSeconds?: number } = {}) {
+export async function trustToken(
+  content?: TrustListContent,
+  now = NOW,
+  options: { ttlSeconds?: number; lifetimeSeconds?: number; signer?: Signer; signerNotBefore?: number } = {},
+) {
   return createTrustListToken({ ...(content ?? (await demoContent())), signer: await trustListSigner(), now, ...options });
 }
 

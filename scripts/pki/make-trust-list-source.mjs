@@ -2,7 +2,8 @@
 // Derives the trust-list source JSON ({ issuers, verifiers }, ADR-0015 section 6) for the DEMO
 // organisations from a directory written by make-demo-pki.sh. Fingerprints are computed from the
 // .cert.pem files, ma_to_chuc is read from each certificate's organizationIdentifier, validFrom is
-// now and validUntil the earliest notAfter of the organisation's certificates.
+// the latest notBefore and validUntil the earliest notAfter of the organisation's certificates
+// (not "now": a client whose clock runs slightly behind would otherwise see the issuer as unknown).
 // Needs the built SDK (npm run build). Usage: make-trust-list-source.mjs <demo-pki-dir> [--out file]
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -35,20 +36,20 @@ function certificate(path) {
   return { cert: parseCertificate(der), sha256: createHash('sha256').update(der).digest('base64url') };
 }
 
-const now = new Date();
 const issuers = [];
 const verifiers = [];
 for (const org of ORGANISATIONS) {
   const loaded = Object.entries(org.certs).map(([file, purpose]) => ({ ...certificate(join(dir, 'orgs', org.name, `${file}.cert.pem`)), purpose }));
   const ids = new Set(loaded.map((c) => c.cert.subject.organizationIdentifier));
   if (ids.size !== 1 || !loaded[0].cert.subject.organizationIdentifier) throw new Error(`${org.name}: certificates disagree on or lack organizationIdentifier`);
+  const notBefore = new Date(Math.max(...loaded.map((c) => c.cert.notBefore.getTime())));
   const notAfter = new Date(Math.min(...loaded.map((c) => c.cert.notAfter.getTime())));
   const entry = {
     ma_to_chuc: loaded[0].cert.subject.organizationIdentifier,
     ten: org.ten,
     chung_thu: loaded.map((c) => ({ sha256: c.sha256, muc_dich: c.purpose })),
   };
-  const validity = { validFrom: now.toISOString(), validUntil: notAfter.toISOString() };
+  const validity = { validFrom: notBefore.toISOString(), validUntil: notAfter.toISOString() };
   if (org.verifier) verifiers.push({ ...entry, ...validity });
   else issuers.push({ ...entry, vct: org.vct, ...(org.cong_doan ? { cong_doan: org.cong_doan } : {}), ...validity });
 }

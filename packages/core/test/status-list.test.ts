@@ -203,6 +203,11 @@ describe('verifyStatusListToken: one negative test per rule', async () => {
     for (const ttl of [0, -1, 1.5, '900']) await expectReason(await rawJws(header(), payload({ ttl }), signer), 'claims', /ttl/);
     assert.equal((await verifyStatusListToken(await rawJws(header(), payload({ ttl: undefined }), signer), opts())).ok, true, 'ttl is optional');
   });
+  test('exp - iat above 24 h (+60 s) is refused whatever the signer wrote', async () => {
+    assert.equal((await verifyStatusListToken(await rawJws(header(), payload({ exp: NOW_S + 86_460 }), signer), opts())).ok, true);
+    await expectReason(await rawJws(header(), payload({ exp: NOW_S + 86_461 }), signer), 'claims', /more than 24 hours/);
+    await expectReason(await rawJws(header(), payload({ exp: NOW_S + 10 * 365 * 86_400, ttl: 2 ** 52 }), signer), 'claims', /more than 24 hours/);
+  });
   test('tampered lst', async () => {
     const [h, , s] = (await token()).split('.');
     const other = createStatusList();
@@ -217,5 +222,6 @@ describe('verifyStatusListToken: one negative test per rule', async () => {
     await assert.rejects(createStatusListToken({ list, uri: 'http://x/status/1', signer, now: NOW }), TypeError);
     await assert.rejects(createStatusListToken({ list, uri: URI, signer: { ...signer, x5c: [signer.x5c![0]!] }, now: NOW }), TypeError);
     await assert.rejects(createStatusListToken({ list, uri: URI, signer, now: NOW, ttlSeconds: 0 }), TypeError);
+    await assert.rejects(createStatusListToken({ list, uri: URI, signer, now: NOW, lifetimeSeconds: 86_401 }), TypeError);
   });
 });

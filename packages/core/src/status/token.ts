@@ -14,6 +14,7 @@ export const STATUS_LIST_TOKEN_MAX_BYTES = 128 * 1024;
 export interface VerifiedStatusListToken {
   ok: true;
   list: StatusList;
+  token: string;
   iat: number;
   exp: number;
   ttl?: number;
@@ -40,13 +41,13 @@ export async function createStatusListToken(options: {
 
 /**
  * ADR-0015 section 6: the signer certificate must be in the trust list with purpose `status`, its
- * organizationIdentifier must equal that entry's maToChuc, and that maToChuc must be the one of the
- * organisation that issued the credential. Null when all hold.
+ * organizationIdentifier must equal that entry's maToChuc, and (unless `issuerMaToChuc` is null)
+ * that maToChuc must be the one of the organisation that issued the credential. Null when all hold.
  */
 export async function checkStatusListSigner(
   trustRegistry: TrustRegistry,
   signer: { fingerprint: string; maToChuc: string },
-  issuerMaToChuc: string,
+  issuerMaToChuc: string | null,
   now: Date,
 ): Promise<TokenFailure | null> {
   let entry;
@@ -59,8 +60,34 @@ export async function checkStatusListSigner(
   if (!entry) return fail('not_trusted', 'signer certificate is not in the trust list');
   if (entry.mucDich !== 'status') return fail('not_trusted', 'signer certificate purpose is not status');
   if (entry.maToChuc !== signer.maToChuc) return fail('not_trusted', 'signer organizationIdentifier differs from the trust list entry');
-  if (entry.maToChuc !== issuerMaToChuc) return fail('not_trusted', 'status list is signed by another organisation');
+  if (issuerMaToChuc !== null && entry.maToChuc !== issuerMaToChuc) return fail('not_trusted', 'status list is signed by another organisation');
   return null;
+}
+
+/**
+ * Every rule of docs/architecture.md section 7 except the comparison with the credential issuer's
+ * organisation (`issuerMaToChuc` null): what the checker caches per URI before each caller compares.
+ */
+export async function verifyStatusListTokenSigned(
+  token: unknown,
+  o: { uri: string; issuerMaToChuc: string | null; chainValidator: CertificateChainValidator; trustRegistry: TrustRegistry; verifier: Verifier; now: Date },
+): Promise<VerifiedStatusListToken | TokenFailure> {
+  const { chainValidator, verifier, now } = o;
+  const r = await verifySignedToken(token, { typ: STATUS_LIST_TOKEN_TYP, profile: 'status', maxBytes: STATUS_LIST_TOKEN_MAX_BYTES, chainValidator, verifier, now });
+  if (!r.ok) return r;
+  if (r.payload['sub'] !== o.uri) return fail('claims', 'sub is not the status list uri');
+  const signer = { fingerprint: r.fingerprint, maToChuc: r.leaf.subject.organizationIdentifier ?? '' };
+  const untrusted = await checkStatusListSigner(o.trustRegistry, signer, o.issuerMaToChuc, now);
+  if (untrusted) return untrusted;
+  let list: StatusList;
+  try {
+    list = decodeStatusList(r.payload['status_list']);
+  } catch (e) {
+    return fail('claims', (e as Error).message);
+  }
+  const result: VerifiedStatusListToken = { ok: true, list, token: token as string, iat: r.iat, exp: r.exp, signer };
+  if (r.ttl !== undefined) result.ttl = r.ttl;
+  return result;
 }
 
 /** Every rule of docs/architecture.md section 7; never throws for bad input. */
@@ -79,20 +106,6 @@ export async function verifyStatusListToken(
     throw new TypeError('uri and issuer.maToChuc are required');
   }
   if (typeof o.trustRegistry?.lookup !== 'function') throw new TypeError('trustRegistry is required');
-  const { chainValidator, verifier, now } = o;
-  const r = await verifySignedToken(token, { typ: STATUS_LIST_TOKEN_TYP, profile: 'status', maxBytes: STATUS_LIST_TOKEN_MAX_BYTES, chainValidator, verifier, now });
-  if (!r.ok) return r;
-  if (r.payload['sub'] !== o.uri) return fail('claims', 'sub is not the status list uri');
-  const signer = { fingerprint: r.fingerprint, maToChuc: r.leaf.subject.organizationIdentifier ?? '' };
-  const untrusted = await checkStatusListSigner(o.trustRegistry, signer, o.issuer.maToChuc, o.now);
-  if (untrusted) return untrusted;
-  let list: StatusList;
-  try {
-    list = decodeStatusList(r.payload['status_list']);
-  } catch (e) {
-    return fail('claims', (e as Error).message);
-  }
-  const result: VerifiedStatusListToken = { ok: true, list, iat: r.iat, exp: r.exp, signer };
-  if (r.ttl !== undefined) result.ttl = r.ttl;
-  return result;
+  const { uri, chainValidator, trustRegistry, verifier, now } = o;
+  return verifyStatusListTokenSigned(token, { uri, issuerMaToChuc: o.issuer.maToChuc, chainValidator, trustRegistry, verifier, now });
 }

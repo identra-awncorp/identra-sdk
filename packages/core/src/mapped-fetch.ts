@@ -6,7 +6,8 @@ import type { HttpFetch } from './interfaces.js';
 const ORIGIN = /^https?:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?$/;
 
 /**
- * `map` is `{ 'https://api-identra.awncorp.vn': 'http://127.0.0.1:4000' }`. A URL is rewritten only
+ * The wrapped fetch receives `init` unchanged, so it must itself enforce `timeoutMs` and a response
+ * size limit (HttpFetch contract). `map` is `{ 'https://api-identra.awncorp.vn': 'http://127.0.0.1:4000' }`. A URL is rewritten only
  * when it is a mapped origin exactly or continues with `/`, `?` or `#` right after it; every other
  * URL goes to `inner` unchanged. Nothing else is added: no redirect handling, no retries.
  */

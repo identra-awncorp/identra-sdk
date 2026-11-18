@@ -40,6 +40,10 @@ export interface Clock {
   now(): Date;
 }
 
+/**
+ * Implementations MUST enforce `timeoutMs` (rejecting when it passes) and a response size limit of
+ * their own: sdk-core has no timer and reads `text()` whole (ADR-0019, review F6).
+ */
 export type HttpFetch = (
   url: string,
   init?: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number },

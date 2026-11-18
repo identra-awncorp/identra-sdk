@@ -1,10 +1,15 @@
-// TrustRegistry over the signed trust list served at `url` (ADR-0015 section 6), with the shared
-// caching rules of docs/architecture.md section 5 (ttl 3600 s, held copy until exp, no older iat).
+// TrustRegistry over the signed trust list served at `url` (ADR-0015 section 6, ADR-0019), with the
+// shared caching rules of docs/architecture.md section 5 (fresh at most 3600 s, held copy until exp,
+// no older iat) and the signer_not_before rule.
 import type { CertificateChainValidator, Clock, HttpFetch, TrustEntry, TrustRegistry, Verifier } from '../interfaces.js';
 import { TrustListUnavailableError } from '../results.js';
-import { createTokenCache, fetchToken } from '../token-cache.js';
+import { createTokenCache, fetchToken, readSeen, writeSeen, type SeenStore } from '../token-cache.js';
+import { CLOCK_SKEW_MS } from '../x509/chain.js';
 import type { TrustListPayload } from './payload.js';
 import { TRUST_LIST_TOKEN_MAX_BYTES, verifyTrustListToken } from './token.js';
+
+/** ADR-0019 section 1: a held trust list is used without a refetch for at most one hour. */
+export const TRUST_LIST_MAX_FRESH_SECONDS = 3600;
 
 interface Indexed {
   entry: TrustEntry;
@@ -65,22 +70,35 @@ export function createSignedTrustListRegistry(options: {
   chainValidator: CertificateChainValidator;
   clock: Clock;
   maxAgeSeconds?: number;
+  /** Keeps `iat:<url>` and `signer-not-before:<url>` across restarts (ADR-0019 section 3). */
+  seen?: SeenStore;
 }): SignedTrustListRegistry {
-  const { url, fetch, verifier, chainValidator, clock } = options;
+  const { url, fetch: httpFetch, verifier, chainValidator, clock, seen } = options;
   if (typeof url !== 'string' || !url.startsWith('https://')) throw new TypeError('url must be an https URL');
-  for (const [fn, name] of [[fetch, 'fetch'], [verifier?.verify, 'verifier'], [chainValidator?.validate, 'chainValidator'], [clock?.now, 'clock']] as const) {
+  for (const [fn, name] of [[httpFetch, 'fetch'], [verifier?.verify, 'verifier'], [chainValidator?.validate, 'chainValidator'], [clock?.now, 'clock']] as const) {
     if (typeof fn !== 'function') throw new TypeError(`${name} is required`);
   }
+  // The largest signer_not_before of a verified list: in memory, and in `seen` when given.
+  const notBeforeKey = `signer-not-before:${url}`;
+  let minSignerNotBefore = 0;
   const cache = createTokenCache<HeldTrustList>({
     clock,
+    maxFreshSeconds: TRUST_LIST_MAX_FRESH_SECONDS,
     maxEntries: 1,
     ...(options.maxAgeSeconds !== undefined ? { maxAgeSeconds: options.maxAgeSeconds } : {}),
+    ...(seen ? { seen } : {}),
     async load(key, now) {
-      const token = await fetchToken(fetch, key, TRUST_LIST_TOKEN_MAX_BYTES, 'application/jwt');
+      const token = await fetchToken(httpFetch, key, TRUST_LIST_TOKEN_MAX_BYTES, 'application/jwt');
       if (token === null) return null;
-      const r = await verifyTrustListToken(token, { chainValidator, verifier, now });
+      minSignerNotBefore = Math.max(minSignerNotBefore, (await readSeen(seen, notBeforeKey)) ?? 0);
+      const r = await verifyTrustListToken(token, { chainValidator, verifier, now, ...(minSignerNotBefore > 0 ? { minSignerNotBefore } : {}) });
       if (!r.ok) return null;
-      return { value: index(r.payload), iat: r.payload.iat, exp: r.payload.exp, ttl: r.payload.ttl };
+      const raised = r.payload.signer_not_before;
+      if (raised !== undefined && raised > minSignerNotBefore) {
+        minSignerNotBefore = raised;
+        await writeSeen(seen, notBeforeKey, raised);
+      }
+      return { value: index(r.payload), token, iat: r.payload.iat, exp: r.payload.exp, ttl: r.payload.ttl };
     },
   });
 
@@ -92,7 +110,8 @@ export function createSignedTrustListRegistry(options: {
       if (!held) throw new TrustListUnavailableError();
       const found = typeof fingerprint === 'string' ? held.index.get(fingerprint) : undefined;
       if (!found) return null;
-      if (found.from !== undefined && (t < found.from || t > found.until!)) return null;
+      // The usual 60 s clock skew applies to the validity window.
+      if (found.from !== undefined && (t < found.from - CLOCK_SKEW_MS || t > found.until! + CLOCK_SKEW_MS)) return null;
       return copy(found.entry);
     },
     async refresh() {

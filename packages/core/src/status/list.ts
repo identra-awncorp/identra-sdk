@@ -45,13 +45,22 @@ export function createStatusList(): StatusList {
   return wrap(new LibraryStatusList(new Array<number>(STATUS_LIST_ENTRIES).fill(0), 2));
 }
 
+/**
+ * Entry `idx` of a raw bit array (toBytes) without building a list. Token Status List section 4.1:
+ * entry i is bits 2*(i mod 4) and up of byte floor(i / 4). May return 3 for corrupt bytes.
+ */
+export function statusListEntry(bytes: Uint8Array, idx: number): number {
+  if (!(bytes instanceof Uint8Array) || bytes.length !== STATUS_LIST_BYTES) throw new TypeError(`a status list is exactly ${STATUS_LIST_BYTES} bytes`);
+  if (!isIndex(idx)) throw new RangeError(`status list index must be an integer in [0, ${STATUS_LIST_ENTRIES})`);
+  return (bytes[idx >> 2]! >> ((idx & 3) * 2)) & 3;
+}
+
 /** A list from its raw bit array (toBytes). Throws TypeError unless it is exactly 32 768 bytes of values 0-2. */
 export function statusListFromBytes(bytes: Uint8Array): StatusList {
   if (!(bytes instanceof Uint8Array) || bytes.length !== STATUS_LIST_BYTES) throw new TypeError(`a status list is exactly ${STATUS_LIST_BYTES} bytes`);
   const values = new Array<number>(STATUS_LIST_ENTRIES);
   for (let i = 0; i < STATUS_LIST_ENTRIES; i++) {
-    // Token Status List section 4.1: entry i is bits 2*(i mod 4) and up of byte floor(i / 4).
-    const v = (bytes[i >> 2]! >> ((i & 3) * 2)) & 3;
+    const v = statusListEntry(bytes, i);
     if (!isValue(v)) throw new TypeError(`status list entry ${i} has the value 3, which is not defined`);
     values[i] = v;
   }

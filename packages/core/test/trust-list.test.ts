@@ -4,11 +4,13 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
   createSignedTrustListRegistry, createTrustListToken, TrustListUnavailableError, validateTrustListContent, validateTrustListPayload,
-  VCT, verifyTrustListToken, type TrustListContent,
+  VCT, verifyTrustListToken, type SeenStore, type TrustListContent,
 } from '@identra/sdk-core';
 import { webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import { b64, ca, leaf, NOW } from './helpers/pki.js';
-import { demoContent, fakeClock, FP, ok, ORG, otherOrgStatus, scriptedFetch, servedRegistry, TRUST_URL, trustListSigner, trustToken } from './helpers/lists.js';
+import {
+  demoContent, fakeClock, FP, LATER_SIGNER_NOT_BEFORE, laterTrustListSigner, ok, ORG, otherOrgStatus, scriptedFetch, servedRegistry, TRUST_URL, trustListSigner, trustToken,
+} from './helpers/lists.js';
 import { issuerSigner, NOW_S, rawJws, validator } from './helpers/sdjwt.js';
 
 const base = await demoContent();
@@ -60,6 +62,12 @@ describe('payload validation', () => {
     invalid((c) => (c.issuers[1]!.cong_doan = ['dong_goi']), /not a known stage/);
     invalid((c) => (c.issuers = Array(1001).fill(c.issuers[0])), /more than 1000/);
     invalid((c) => ((c.issuers = Array(500).fill(c.issuers[0])), (c.verifiers = Array(501).fill(c.verifiers[0]))), /more than 1000 entries/);
+    invalid((c) => (c.issuers[1]!.ma_to_chuc = c.issuers[0]!.ma_to_chuc), /issuers\[1\]\.ma_to_chuc is listed more than once in issuers/);
+    invalid((c) => (c.verifiers = [c.verifiers[0]!, { ...c.verifiers[0]!, chung_thu: [{ sha256: 'B'.repeat(42) + 'A', muc_dich: 'request' }] }]), /ma_to_chuc is listed more than once in verifiers/);
+    invalid((c) => (c.issuers[0]!.vct = []), /vct must not be empty/);
+    const both = clone();
+    both.verifiers[0]!.ma_to_chuc = both.issuers[0]!.ma_to_chuc;
+    assert.equal(validateTrustListContent(both).ok, true, 'one organisation may be issuer and verifier');
     assert.equal(validateTrustListContent(null).ok, false);
   });
   test('ISO 8601 instants', () => {
@@ -77,7 +85,8 @@ describe('payload validation', () => {
   test('payload numbers', () => {
     const p = { iat: NOW_S, exp: NOW_S + 86_400, ttl: 3600, ...clone() };
     assert.equal(validateTrustListPayload(p).ok, true);
-    for (const patch of [{ iat: 1.5 }, { exp: '1' }, { ttl: 0 }, { ttl: undefined }, { other: 1 }]) {
+    assert.equal(validateTrustListPayload({ ...p, signer_not_before: NOW_S - 86_400 }).ok, true);
+    for (const patch of [{ iat: 1.5 }, { exp: '1' }, { ttl: 0 }, { ttl: undefined }, { other: 1 }, { signer_not_before: 0 }, { signer_not_before: '1' }]) {
       assert.equal(validateTrustListPayload({ ...p, ...patch }).ok, false, JSON.stringify(patch));
     }
   });
@@ -140,18 +149,18 @@ describe('registry lookup', async () => {
     assert.equal(await registry.lookup('A'.repeat(43)), null);
     assert.equal(await registry.lookup(any(undefined)), null);
   });
-  test('validity window [validFrom, validUntil], inclusive', async () => {
+  test('validity window [validFrom - 60 s, validUntil + 60 s], inclusive', async () => {
     const c = clone();
     c.verifiers[0]!.validFrom = '2026-03-01T00:00:00Z';
     c.verifiers[0]!.validUntil = '2026-09-01T00:00:00Z';
     const { registry } = await servedRegistry(await trustToken(c));
     const at = (s: string) => new Date(s);
-    assert.equal(await registry.lookup(FP.vc, at('2025-12-31T23:59:59.999Z')), null);
-    assert.ok(await registry.lookup(FP.vc, at('2026-01-01T00:00:00Z')));
-    assert.ok(await registry.lookup(FP.vc, at('2029-01-01T00:00:00Z')));
-    assert.equal(await registry.lookup(FP.vc, at('2029-01-01T00:00:00.001Z')), null);
+    assert.equal(await registry.lookup(FP.vc, at('2025-12-31T23:58:59.999Z')), null);
+    assert.ok(await registry.lookup(FP.vc, at('2025-12-31T23:59:00Z')), 'validFrom - 60 s skew');
+    assert.ok(await registry.lookup(FP.vc, at('2029-01-01T00:01:00Z')), 'validUntil + 60 s skew');
+    assert.equal(await registry.lookup(FP.vc, at('2029-01-01T00:01:00.001Z')), null);
     assert.ok(await registry.lookup(FP.vc), 'default: clock.now()');
-    assert.equal(await registry.lookup(FP.request, at('2026-02-28T00:00:00Z')), null);
+    assert.equal(await registry.lookup(FP.request, at('2026-02-28T23:58:59Z')), null);
     assert.ok(await registry.lookup(FP.request, at('2026-06-01T00:00:00Z')));
     const { registry: open } = await servedRegistry();
     assert.ok(await open.lookup(FP.request, at('2099-01-01T00:00:00Z')), 'a verifier without a window');
@@ -236,3 +245,68 @@ describe('registry cache', async () => {
     assert.throws(() => createSignedTrustListRegistry({ url: 'http://x/trust-list', fetch: async () => any(0), verifier: webCryptoVerifier, chainValidator: validator, clock: fakeClock() }), TypeError);
   });
 });
+
+describe('ADR-0019: lifetime caps, signer_not_before, persistence', async () => {
+  const old = await trustListSigner();
+  const later = await laterTrustListSigner();
+  const h = (signer: typeof old) => ({ alg: 'ES256', typ: 'identra-trust-list+jwt', x5c: signer.x5c });
+  const memory = () => {
+    const store = new Map<string, number>();
+    const seen: SeenStore = { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v) };
+    return { store, seen };
+  };
+  const registryFor = (s: ReturnType<typeof scriptedFetch>, clock = fakeClock(), seen?: SeenStore) =>
+    createSignedTrustListRegistry({ url: TRUST_URL, fetch: s.fetch, verifier: webCryptoVerifier, chainValidator: validator, clock, ...(seen ? { seen } : {}) });
+
+  test('E1: a forged list with ttl 2^52 and exp +10 y is refused', async () => {
+    const forged = await rawJws(h(old), { iat: NOW_S + 59, exp: NOW_S + 10 * 365 * 86_400, ttl: 2 ** 52, ...clone() }, old);
+    const r = await verifyTrustListToken(forged, { chainValidator: validator, verifier: webCryptoVerifier, now: NOW });
+    assert.equal(r.ok ? 'ok' : `${r.reason}: ${r.detail}`, 'claims: exp - iat is more than 24 hours');
+    await assert.rejects(createTrustListToken({ ...clone(), signer: old, now: NOW, lifetimeSeconds: 86_401 }), TypeError);
+  });
+  test('E2: with ttl 2^52 inside 24 h the list is refetched after 3600 s and a removal arrives', async () => {
+    const big = await rawJws(h(old), { iat: NOW_S, exp: NOW_S + 86_400, ttl: 2 ** 52, ...clone() }, old);
+    const s = scriptedFetch({ [TRUST_URL]: ok(big) });
+    const clock = fakeClock();
+    const registry = registryFor(s, clock);
+    assert.ok(await registry.lookup(FP.vc));
+    clock.advance(3600);
+    s.routes[TRUST_URL] = ok(await trustToken({ ...clone(), issuers: clone().issuers.slice(1) }, clock.now()));
+    assert.equal(await registry.lookup(FP.vc), null);
+    assert.equal(s.calls.length, 2);
+  });
+  test('signer_not_before: after it was seen, a list of the replaced signer is refused even with a newer iat', async () => {
+    const withoutVerifier = { ...clone(), verifiers: [] };
+    const s = scriptedFetch({ [TRUST_URL]: ok(await trustToken(withoutVerifier, NOW, { signer: later, signerNotBefore: LATER_SIGNER_NOT_BEFORE })) });
+    const clock = fakeClock();
+    const { store, seen } = memory();
+    const registry = registryFor(s, clock, seen);
+    assert.equal(await registry.lookup(FP.request), null);
+    assert.deepEqual(Object.fromEntries(store), { [`iat:${TRUST_URL}`]: NOW_S, [`signer-not-before:${TRUST_URL}`]: LATER_SIGNER_NOT_BEFORE });
+    clock.advance(10);
+    s.routes[TRUST_URL] = ok(await trustToken(clone(), clock.now(), { signer: old }));
+    assert.equal(await registry.refresh(), true);
+    assert.equal(await registry.lookup(FP.request), null, 'still the list of the new signer');
+    // The same refusal directly, and after a restart with the persisted state.
+    const r = await verifyTrustListToken(await trustToken(clone(), clock.now(), { signer: old }), { chainValidator: validator, verifier: webCryptoVerifier, now: clock.now(), minSignerNotBefore: LATER_SIGNER_NOT_BEFORE });
+    assert.equal(r.ok ? 'ok' : r.reason, 'not_trusted');
+    const restarted = registryFor(scriptedFetch({ [TRUST_URL]: ok(await trustToken(clone(), clock.now(), { signer: old })) }), clock, seen);
+    await assert.rejects(restarted.lookup(FP.vc), TrustListUnavailableError);
+    // The new signer keeps working.
+    const fresh = registryFor(scriptedFetch({ [TRUST_URL]: ok(await trustToken(clone(), clock.now(), { signer: later })) }), clock, seen);
+    assert.ok(await fresh.lookup(FP.request));
+  });
+  test('a list whose signer_not_before is later than its own signer notBefore is invalid', async () => {
+    const t = await rawJws(h(old), { iat: NOW_S, exp: NOW_S + 86_400, ttl: 3600, signer_not_before: LATER_SIGNER_NOT_BEFORE, ...clone() }, old);
+    const r = await verifyTrustListToken(t, { chainValidator: validator, verifier: webCryptoVerifier, now: NOW });
+    assert.match(r.ok ? 'ok' : `${r.reason}: ${r.detail}`, /^claims: signer_not_before is later/);
+    await assert.rejects(trustToken(clone(), NOW, { signer: old, signerNotBefore: LATER_SIGNER_NOT_BEFORE }), /signerNotBefore must be/);
+  });
+  test('seen: an older iat is refused after a restart', async () => {
+    const { seen } = memory();
+    await registryFor(scriptedFetch({ [TRUST_URL]: ok(await trustToken(clone(), new Date(NOW.getTime() + 30_000))) }), fakeClock(), seen).lookup(FP.vc);
+    const restarted = registryFor(scriptedFetch({ [TRUST_URL]: ok(await trustToken(clone(), NOW)) }), fakeClock(), seen);
+    await assert.rejects(restarted.lookup(FP.vc), TrustListUnavailableError);
+  });
+});
+
