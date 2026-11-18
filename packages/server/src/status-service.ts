@@ -1,10 +1,11 @@
 // Status lists of the issuers this server operates (ADR-0013 sections 1-5, ADR-0019 section 4):
 // random index allocation with rollover to the next list, status changes of allocated indexes only
 // (revoked is final), and the signed Status List Token of an existing list, re-signed when the list
-// changed or the token is an hour old, with an iat strictly greater than the previous one.
+// changed or the token is an hour old, with an iat strictly greater than the previous one and never
+// more than 5 s ahead of the clock, by a status certificate valid at that moment.
 import {
-  createStatusList, createStatusListToken, STATUS_LIST_BYTES, STATUS_LIST_ENTRIES, STATUS_VALUE, statusListEntry, statusListFromBytes,
-  type Clock, type RandomSource,
+  base64Decode, createStatusList, createStatusListToken, parseCertificate, STATUS_LIST_BYTES, STATUS_LIST_ENTRIES, STATUS_VALUE, statusListEntry,
+  statusListFromBytes, type Clock, type RandomSource,
 } from '@identra/sdk-core';
 import type { IssuerKeyStore } from './key-store.js';
 
@@ -74,16 +75,30 @@ export interface StatusListService {
    * caller's database transaction, so the status change commits or rolls back with it.
    */
   setStatus(issuer: string, n: number, idx: number, status: CredentialStatus, opts?: { storage?: StatusListStorage }): Promise<void>;
-  /** The signed Status List Token served at uri(issuer, n); null when list n does not exist (HTTP 404). */
+  /**
+   * The signed Status List Token served at uri(issuer, n); null when list n does not exist (HTTP 404).
+   * Throws when there is no token to serve: the signer certificate is not valid now and no held
+   * token is inside its exp, or (after a restart) the next iat would be more than 60 s ahead.
+   */
   token(issuer: string, n: number): Promise<string | null>;
   uri(issuer: string, n: number): string;
+  /** The token held for list n, for monitoring (ADR-0014 section 7): seconds; null when none is held. */
+  current(issuer: string, n: number): { iat: number; exp: number; signerNotAfter: number } | null;
 }
+
+/** Why a status list was not (re-)signed; the held token, if any, is served meanwhile. */
+export type StatusSigningProblem = 'signer_expired' | 'last_iat_in_future';
 
 const RESIGN_AFTER_MS = 3600_000;
 const ALLOCATION_ATTEMPTS = 64;
 const SAVE_ATTEMPTS = 5;
 const MAX_LIST_NUMBER = 999_999_999;
 const TOKEN_CACHE_MAX = 1000;
+const LIFETIME_SECONDS = 86_400;
+/** A re-signed token's iat is at most this far ahead of the clock (a burst of changes waits instead). */
+const MAX_IAT_LEAD_SECONDS = 5;
+/** Verifiers accept an iat up to 60 s ahead; a stored lastIat beyond that is ignored (and reported). */
+const MAX_STORED_LEAD_SECONDS = 60;
 const NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 export function createStatusListService(options: {
@@ -92,9 +107,14 @@ export function createStatusListService(options: {
   storage: StatusListStorage;
   random: RandomSource;
   clock: Clock;
+  /** Told when a list is not signed as it should be; `issuer` is the organisation name. */
+  onError?: (reason: StatusSigningProblem, issuer: string) => void;
 }): StatusListService {
-  const { issuerUri, keyStore, storage, random, clock } = options;
-  const tokens = new Map<string, { token: string; version: number; signedAt: number }>();
+  const { issuerUri, keyStore, storage, random, clock, onError } = options;
+  const tokens = new Map<string, { token: string; version: number; signedAt: number; iat: number; signerNotAfter: number }>();
+  // The last iat this process signed per list: monotonic even when a stored lastIat is ignored.
+  const signedIat = new Map<string, number>();
+  const reportedFuture = new Set<string>();
   const signing = new Map<string, Promise<string>>();
   // The list new credentials go to, per issuer; starts at 1 after a restart and moves up as lists fill.
   const current = new Map<string, number>();
@@ -132,23 +152,52 @@ export function createStatusListService(options: {
     return null;
   }
 
+  /**
+   * Signs list n unless that is not allowed now, in which case the held token (if still inside its
+   * exp) is served: the signer certificate outside its validity, or an iat that would run more than
+   * 5 s ahead of the clock (more than 60 s when nothing is held, i.e. after a restart).
+   */
   async function sign(issuer: string, n: number, stored: StoredStatusList): Promise<string> {
     const now = clock.now();
-    // ADR-0019 section 4: never two tokens with one iat, never an older one (same-second re-sign, clock step back).
-    const iat = Math.max(Math.floor(now.getTime() / 1000), (stored.lastIat ?? 0) + 1);
-    const token = await createStatusListToken({
-      list: statusListFromBytes(stored.bytes), uri: uri(issuer, n), signer: await keyStore.signer(issuer, 'status'), now: new Date(iat * 1000),
-    });
-    await storage.recordIat(issuer, n, iat);
+    const nowS = Math.floor(now.getTime() / 1000);
     const key = `${issuer}/${n}`;
+    const prior = tokens.get(key);
+    const held = prior && (prior.iat + LIFETIME_SECONDS) * 1000 > now.getTime() ? prior : undefined;
+    const fallback = (why: string) => {
+      if (held) return held.token;
+      throw new Error(`status list ${key}: no token can be served (${why})`);
+    };
+    const signer = await keyStore.signer(issuer, 'status');
+    const cert = parseCertificate(base64Decode(signer.x5c![0]!));
+    if (now < cert.notBefore || now > cert.notAfter) {
+      onError?.('signer_expired', issuer);
+      return fallback('signer certificate not valid now');
+    }
+    let storedIat = stored.lastIat ?? 0;
+    if (storedIat > nowS + MAX_STORED_LEAD_SECONDS) {
+      if (!reportedFuture.has(key)) onError?.('last_iat_in_future', issuer);
+      reportedFuture.add(key);
+      storedIat = 0;
+    }
+    // ADR-0019 section 4: never two tokens with one iat, never an older one (same-second re-sign, clock step back).
+    const iat = Math.max(nowS, storedIat + 1, (signedIat.get(key) ?? 0) + 1);
+    if (iat > nowS + (held ? MAX_IAT_LEAD_SECONDS : MAX_STORED_LEAD_SECONDS)) return fallback('iat would run ahead of the clock');
+    const token = await createStatusListToken({ list: statusListFromBytes(stored.bytes), uri: uri(issuer, n), signer, now: new Date(iat * 1000) });
+    signedIat.set(key, iat);
+    await storage.recordIat(issuer, n, iat);
     tokens.delete(key);
-    tokens.set(key, { token, version: stored.version, signedAt: now.getTime() });
+    tokens.set(key, { token, version: stored.version, signedAt: now.getTime(), iat, signerNotAfter: Math.floor(cert.notAfter.getTime() / 1000) });
     if (tokens.size > TOKEN_CACHE_MAX) tokens.delete(tokens.keys().next().value!);
     return token;
   }
 
   return {
     uri,
+    current(issuer, n) {
+      check(issuer, n);
+      const held = tokens.get(`${issuer}/${n}`);
+      return held ? { iat: held.iat, exp: held.iat + LIFETIME_SECONDS, signerNotAfter: held.signerNotAfter } : null;
+    },
     async allocate(issuer) {
       const n = current.get(issuer) ?? 1;
       check(issuer, n);

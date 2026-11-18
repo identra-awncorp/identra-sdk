@@ -373,8 +373,9 @@ empty.
   section, an empty issuer `vct`; a `signer_not_before` later than the signer
   certificate's notBefore (`claims`); a signer certificate whose notBefore is
   earlier than `minSignerNotBefore` (`not_trusted`).
-- `signer_not_before` (ADR-0019 §2): after a trust-list signer is replaced, the server
-  publishes lists carrying the new certificate's notBefore; the registry remembers
+- `signer_not_before` (ADR-0019 §2): the server publishes every list with its
+  signer certificate's notBefore, so after a trust-list signer is replaced the lists
+  carry the new certificate's notBefore; the registry remembers
   the largest value of any verified list (and persists it with `seen`) and refuses
   lists of older signer certificates from then on.
 - `createStatusListChecker({ fetch, verifier, chainValidator, trustRegistry, clock, maxAgeSeconds?, seen? })`
@@ -421,9 +422,19 @@ empty.
   (`StatusRevokedError`). `token(issuer, n)` (`n` 1–999 999 999) is `null` for a
   list that does not exist (HTTP 404), is re-signed when the stored version changed
   or the token is an hour old, with `iat = max(now, lastIat + 1)` and `lastIat`
-  stored with the list; at most 1000 tokens are cached. Bursts of more than one
-  change per second make `iat` run ahead of the clock by that many seconds;
-  beyond 60 s clients would refuse the list as `not_yet_valid`.
+  stored with the list; at most 1000 tokens are cached. Signing rules (both list
+  services): a new `iat` is never more than 5 s ahead of the clock while a held
+  token can be served — under a burst the held token is served and the changes
+  appear at the next allowed signing, so after a quiet moment a single change is
+  visible at once and under sustained bursts a change waits at most about one
+  second (one signing per second); with nothing held (after a restart) up to 60 s
+  ahead is accepted, the skew verifiers allow. A stored `lastIat` more than 60 s
+  ahead is ignored (`onError('last_iat_in_future', issuer)`, once per list), and
+  this process keeps its own last `iat` so tokens still never repeat one. Before
+  signing, the status certificate must be inside its validity: otherwise
+  (`onError('signer_expired', issuer)`) the held token is served until its `exp`,
+  then `token` throws. `current(issuer, n)` gives `{ iat, exp, signerNotAfter }`
+  of the held token, or null (ADR-0014 §7).
 - `createTrustListService({ source, keyStore, clock, signerNotBefore?, lastToken?, onError?, lastIatStore? })`
   validates the source with the core validator and re-signs when it changed or
   after an hour, with `iat = max(now, lastIat + 1)`; `lastIat` is in memory and,
@@ -435,8 +446,15 @@ empty.
   token is served unchanged until its `exp` and `onError('source_invalid' |
   'source_threw')` is called; with none, the call throws `Error('trust list
   source_invalid' | 'trust list source_threw')`. Neither carries validator detail
-  nor the source's own error, which could quote file content. `current()` gives
-  `{ iat, exp, issuers, verifiers }` of the held token, or null (ADR-0014 §7).
+  nor the source's own error, which could quote file content. The signing rules
+  of the status list service apply (5 s lead, `last_iat_in_future` for a
+  `lastToken` or stored `iat` more than 60 s ahead, `signer_expired` for a signer
+  certificate outside its validity; the error thrown with nothing held is
+  `Error('trust list <reason>')`). Every token carries `signer_not_before` = the
+  signer certificate's notBefore (ADR-0019 §2: after a signer replacement, every
+  client that fetched the new list refuses lists of older signer certificates);
+  `signerNotBefore` overrides it and may not be later. `current()` gives `{ iat,
+  exp, issuers, verifiers, signerNotAfter }` of the held token, or null (ADR-0014 §7).
 - `scripts/pki/make-trust-list-source.mjs <demo-pki-dir> [--out file]` writes the
   trust-list source of the demo organisations (`validFrom` = latest notBefore,
   `validUntil` = earliest notAfter of the organisation's certificates).

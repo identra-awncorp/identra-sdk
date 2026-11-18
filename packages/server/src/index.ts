@@ -9,10 +9,11 @@ export {
   StatusRevokedError,
   type CredentialStatus,
   type StatusListService,
+  type StatusSigningProblem,
   type StatusListStorage,
   type StoredStatusList,
 } from './status-service.js';
-export { createTrustListService, type LastIatStore, type TrustListService, type TrustListSourceProblem } from './trust-list-service.js';
+export { createTrustListService, type LastIatStore, type TrustListProblem, type TrustListService } from './trust-list-service.js';
 export { createMemoryStateStore, type ProtocolStateStore } from './state-store.js';
 export type { HttpRequest, HttpResponse } from './issuance/http.js';
 export { generateIssuerKeys, type IssuerKeys } from './issuance/keys.js';
