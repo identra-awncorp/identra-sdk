@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "build": "tsc -b",
-    "typecheck": "tsc -b tsconfig.json packages/core/test",
+    "typecheck": "tsc -b tsconfig.json packages/core/test packages/app/test",
     "lint": "eslint .",
     "pretest": "npm run typecheck && sh scripts/pki/ensure-test-pki.sh",
     "test": "node --test \"packages/*/test-dist/**/*.test.js\" && node examples/gd2-e2e.mjs",
