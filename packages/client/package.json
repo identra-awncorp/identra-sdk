@@ -1,9 +1,10 @@
 {
   "name": "@identra/sdk-client",
   "version": "0.0.0",
-  "description": "Identra web verifier-session client (rebuilt in a later phase).",
+  "description": "Browser client for Identra verifier sessions: create a session, show its QR payload, poll the validated result.",
   "license": "UNLICENSED",
   "type": "module",
+  "sideEffects": false,
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
