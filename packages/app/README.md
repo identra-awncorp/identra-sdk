@@ -2,8 +2,8 @@
 
 Wallet building blocks for the Identra app (React Native 0.85 / Hermes) and for the simulated
 wallet used in Node end-to-end tests. Pure JavaScript on `@noble/curves`, `@noble/hashes` and
-`@noble/ciphers`; no `crypto.subtle`, `Buffer`, `process`, `fetch` or Node built-in. Only ES256
-(P-256) exists.
+`@noble/ciphers`, plus `@openid4vc/*` 0.10.0 and `dcql` for the protocols; no `crypto.subtle`,
+`Buffer`, `process`, global `fetch` or Node built-in. Only ES256 (P-256) exists.
 
 - `nobleVerifier`, `nobleHasher`, `createNobleSigner`, `generateSecretKey`: the `Verifier` /
   `Hasher` / `Signer` contracts of `@identra/sdk-core` (docs/architecture.md section 2). The
@@ -17,6 +17,11 @@ wallet used in Node end-to-end tests. Pure JavaScript on `@noble/curves`, `@nobl
   (`CREDENTIALS_TABLE_DDL`).
 - `buildCatalogue`, `serializeCatalogue`, `parseCatalogue`, `diffCatalogue`: the backup
   catalogue (document type and issuer only).
+- `createWallet`: the wallet object (docs/architecture.md section 8). `wallet.offers.resolve` /
+  `accept` receive a credential over OpenID4VCI 1.0 (pre-authorized code, PIN, encrypted request
+  and response) and store it only after `verifyStoredCredential` passes, the issuer matches the
+  offer and `cnf.jwk` is the new key; `wallet.credentials.list` / `get` / `refreshStatus` /
+  `remove`. Failures are `{ ok: false, code }` with a code of `WalletErrorCodes`.
 
 ## What the app provides
 
@@ -27,6 +32,12 @@ wallet used in Node end-to-end tests. Pure JavaScript on `@noble/curves`, `@nobl
 | `SecretStorage` for the vault data key | `expo-secure-store` WITHOUT `requireAuthentication`, readable while the device is unlocked, this device only | `createInMemorySecretStorage()` |
 | `CredentialRepository` | `expo-sqlite`, table from `CREDENTIALS_TABLE_DDL` | `createInMemoryCredentialRepository()` |
 | `Clock` (`now()`) | `{ now: () => new Date() }` | a fixed clock |
+| `HttpFetch` for `createWallet` | `expo/fetch` (streams the body), `redirect: 'manual'`, honouring `timeoutMs` | global `fetch` with `redirect: 'manual'`, `createMappedFetch` for a local server |
+
+The wallet wraps the app's fetch once (https only, the offer's origin only, 10 s timeout, no
+redirect, 64 KB for protocol messages and 256 KB for the trust list). It cannot see a redirect the
+app's fetch followed by itself, so that fetch must not follow redirects; React Native's built-in
+fetch always follows them, which is an open point for the app.
 
 The data key must not require biometrics: ADR-0009 section 3 asks only that it be readable while
 the device is unlocked, and on Android a biometric re-enrolment permanently invalidates a key
@@ -51,11 +62,23 @@ rows that fail for any other reason, which it keeps.
 
 ## Globals React Native must provide
 
-None beyond ECMAScript (with `BigInt`) for sdk-app itself: a tree-shaken bundle of the main
-entry references no other global identifier, and only `globalThis.crypto` as a member (noble's
-default RNG, never called). The rest of the app (sdk-core's SD-JWT code and its dependencies)
-needs `TextEncoder` and `TextDecoder`; Hermes in RN 0.85 has no `TextDecoder`, so install a
-polyfill at start-up. `test/bundle.test.ts` prints the current list.
+Measured by `test/bundle.test.ts`, which runs a whole issuance (`offers.resolve` + `accept`) from
+an esbuild `--platform=neutral` bundle in a `node:vm` realm with no `crypto`, `Buffer`, `process`
+or `fetch`, and checks that the issuance fails without each of these:
+
+| Global | Needed by |
+|---|---|
+| `TextEncoder`, `TextDecoder` | `@sd-jwt/*`, the OpenID4VC libraries (Hermes in RN 0.85 has no `TextDecoder`: polyfill) |
+| `atob` | zod inside the OpenID4VC libraries (base64 checks) |
+| `URL`, `URLSearchParams` | the OpenID4VC libraries (read at load: the bundle does not load without `URL`), the wallet's origin checks |
+| `Headers`, `Response` | the fetch layer of the OpenID4VC libraries |
+| `setTimeout`, `clearTimeout` | the wallet's request timeout |
+
+React Native's own `URL` is incomplete; install a full polyfill (e.g. `react-native-url-polyfill`)
+and check `new URL(u).origin` on the device. `globalThis.crypto` is referenced (noble's default RNG
+and the libraries' defaults) but never read or called: every random byte comes from the injected
+`RandomSource`. Minified size of the main entry: about 860 KB (sdk-app 26 KB, `@noble/*` 50 KB,
+`@openid4vc/*` 84 KB, zod 454 KB, the rest sdk-core and its dependencies).
 
 ## Randomness
 
@@ -78,6 +101,6 @@ memory disclosure of the software-stored key.
 
 ## Status
 
-Tested on Node 24 and in a `node:vm` realm that has only ECMAScript built-ins plus `TextEncoder`
-/ `TextDecoder`. **Not yet run on a physical device or emulator.** A hardware-backed
+Tested on Node 24 and in a `node:vm` realm that has only ECMAScript built-ins plus the globals
+listed above. **Not yet run on a physical device or emulator.** A hardware-backed
 `WalletKeyStore` (Secure Enclave / StrongBox) is a later drop-in behind the same interface.
