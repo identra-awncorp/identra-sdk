@@ -33,4 +33,27 @@ export default tseslint.config(
       ],
     },
   },
+  // sdk-app runs on React Native / Hermes and Node: pure JS on @noble/*, everything else injected.
+  {
+    files: ['packages/app/src/**/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        { patterns: ['node:*', 'jose', 'jose/*', 'expo-*', 'react-native', 'react-native/*', '@identra/sdk-core/webcrypto'] },
+      ],
+      'no-restricted-globals': ['error', ...PLATFORM_GLOBALS, ...INDIRECT_GLOBALS],
+      'no-restricted-properties': [
+        'error',
+        ...PLATFORM_GLOBALS.map((property) => ({ object: 'globalThis', property })),
+        { object: 'Date', property: 'now', message: 'The clock is injected.' },
+        { object: 'Math', property: 'random', message: 'Randomness comes from RandomSource.' },
+      ],
+      'no-restricted-syntax': [
+        'error',
+        { selector: "NewExpression[callee.name='Date'][arguments.length=0]", message: 'The clock is injected.' },
+        { selector: "CallExpression[callee.name='Date']", message: 'The clock is injected.' },
+        { selector: 'ImportExpression', message: 'No dynamic import in sdk-app.' },
+      ],
+    },
+  },
 );

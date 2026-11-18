@@ -1,7 +1,7 @@
 {
   "name": "@identra/sdk-app",
   "version": "0.0.0",
-  "description": "Identra wallet SDK (rebuilt in a later phase).",
+  "description": "Identra wallet SDK: @noble ES256 adapters, ECDH-ES JWE, wallet key store, encrypted credential vault and backup catalogue. React Native and Node.",
   "license": "UNLICENSED",
   "type": "module",
   "main": "./dist/index.js",
@@ -13,9 +13,16 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "dependencies": {
-    "@identra/sdk-core": "0.0.0"
+    "@identra/sdk-core": "0.0.0",
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0"
+  },
+  "devDependencies": {
+    "jose": "6.2.17"
   }
 }
