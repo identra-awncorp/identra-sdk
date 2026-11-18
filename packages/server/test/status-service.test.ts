@@ -45,6 +45,7 @@ test('collisions are retried; when the draws fail, allocation rolls over to the 
   assert.deepEqual(got.map((g) => g.idx).sort(), [7, 8, 9]);
   const next = await service.allocate('truong-mau');
   assert.equal(next.uri, URI(2));
+  assert.equal(next.n, 2);
   assert.ok([7, 8, 9].includes(next.idx));
 });
 
@@ -70,13 +71,13 @@ test('an index that is not 0 is never handed out, so no credential is born revok
   const bytes = new Uint8Array(STATUS_LIST_BYTES);
   bytes[1] = 0b01 << 2; // entry 5 (bits 2-3 of byte 1) revoked without an allocation, as old data might be
   assert.equal(await storage.save('truong-mau', 1, bytes, null), true);
-  assert.deepEqual(await service.allocate('truong-mau'), { uri: URI(1), idx: 6 });
+  assert.deepEqual(await service.allocate('truong-mau'), { uri: URI(1), n: 1, idx: 6 });
 });
 
 test('status changes only for allocated indexes; revoked is final', async () => {
   const { service, storage } = setup(indexes(5));
   await assert.rejects(service.setStatus('truong-mau', 1, 5, 'revoked'), StatusIndexNotAllocatedError);
-  assert.deepEqual(await service.allocate('truong-mau'), { uri: URI(1), idx: 5 });
+  assert.deepEqual(await service.allocate('truong-mau'), { uri: URI(1), n: 1, idx: 5 });
   const v0 = (await storage.load('truong-mau', 1))!.version;
   await service.setStatus('truong-mau', 1, 5, 'suspended');
   await service.setStatus('truong-mau', 1, 5, 'valid');
@@ -154,4 +155,25 @@ test('the token verifies with the core verifier; re-signed on change and after o
   // Signed with the status certificate of Truong Mau: not valid for another organisation's credentials.
   const other = await verifyStatusListToken(t3, { uri: URI(), issuer: { maToChuc: 'VATVN-0100000002' }, chainValidator, trustRegistry, verifier: webCryptoVerifier, now: clock.now() });
   assert.equal(other.ok, false);
+});
+
+test('setStatus with opts.storage does the whole update on that storage (the caller\'s transaction)', async () => {
+  const shared = createMemoryStatusListStorage();
+  const counting = (log: string[]): StatusListStorage => ({
+    load: (...a) => (log.push('load'), shared.load(...a)),
+    save: (...a) => (log.push('save'), shared.save(...a)),
+    recordIat: (...a) => (log.push('recordIat'), shared.recordIat(...a)),
+    reserve: (...a) => (log.push('reserve'), shared.reserve(...a)),
+    isReserved: (...a) => (log.push('isReserved'), shared.isReserved(...a)),
+  });
+  const service: string[] = [];
+  const tx: string[] = [];
+  const s = createStatusListService({ issuerUri, keyStore, storage: counting(service), random: webCryptoRandom, clock: fakeClock() });
+  const { n, idx } = await s.allocate('truong-mau');
+  service.length = 0;
+  await s.setStatus('truong-mau', n, idx, 'revoked', { storage: counting(tx) });
+  assert.deepEqual(service, [], 'the service storage is not used');
+  assert.deepEqual(tx, ['isReserved', 'load', 'save']);
+  await s.setStatus('truong-mau', n, idx, 'revoked');
+  assert.deepEqual(service, ['isReserved', 'load'], 'already revoked: read through the default storage, nothing saved');
 });

@@ -12,7 +12,7 @@ export {
   type StatusListStorage,
   type StoredStatusList,
 } from './status-service.js';
-export { createTrustListService, type TrustListService } from './trust-list-service.js';
+export { createTrustListService, type LastIatStore, type TrustListService, type TrustListSourceProblem } from './trust-list-service.js';
 export { createMemoryStateStore, type ProtocolStateStore } from './state-store.js';
 export type { HttpRequest, HttpResponse } from './issuance/http.js';
 export { generateIssuerKeys, type IssuerKeys } from './issuance/keys.js';

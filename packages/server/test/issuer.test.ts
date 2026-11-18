@@ -41,9 +41,9 @@ async function world(o: { handlers?: Partial<CredentialHandlers>; store?: (s: Pr
   const issuer = createCredentialIssuer({
     issuerUri: ISS, display: { vi: 'Trường Mẫu', en: 'Sample University' }, signer: await vcSigner,
     allocateStatus: async () => {
-      const a = await statusService.allocate('truong-mau');
-      allocations.push(a);
-      return a;
+      const { uri, idx } = await statusService.allocate('truong-mau');
+      allocations.push({ uri, idx });
+      return { uri, idx };
     },
     hasher: webCryptoHasher, verifier: webCryptoVerifier, random: o.random ?? webCryptoRandom, clock, store: (o.store ?? ((s) => s))(recording), keys,
     credentials: {

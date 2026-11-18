@@ -68,8 +68,12 @@ export class StatusListFullError extends Error {
 
 export interface StatusListService {
   /** A random unused index, already reserved in storage, of the issuer's current list (or the next one). */
-  allocate(issuer: string): Promise<{ uri: string; idx: number }>;
-  setStatus(issuer: string, n: number, idx: number, status: CredentialStatus): Promise<void>;
+  allocate(issuer: string): Promise<{ uri: string; n: number; idx: number }>;
+  /**
+   * `opts.storage` replaces the service's storage for this call only, e.g. a storage bound to the
+   * caller's database transaction, so the status change commits or rolls back with it.
+   */
+  setStatus(issuer: string, n: number, idx: number, status: CredentialStatus, opts?: { storage?: StatusListStorage }): Promise<void>;
   /** The signed Status List Token served at uri(issuer, n); null when list n does not exist (HTTP 404). */
   token(issuer: string, n: number): Promise<string | null>;
   uri(issuer: string, n: number): string;
@@ -152,13 +156,14 @@ export function createStatusListService(options: {
         const idx = await allocateIn(issuer, list);
         if (idx !== null) {
           current.set(issuer, list);
-          return { uri: uri(issuer, list), idx };
+          return { uri: uri(issuer, list), n: list, idx };
         }
       }
       throw new StatusListFullError();
     },
-    async setStatus(issuer, n, idx, status) {
+    async setStatus(issuer, n, idx, status, opts) {
       check(issuer, n);
+      const storage = opts?.storage ?? options.storage;
       if (!Number.isSafeInteger(idx) || idx < 0 || idx >= STATUS_LIST_ENTRIES) throw new RangeError('idx is outside the status list');
       if (!Object.hasOwn(STATUS_VALUE, status)) throw new TypeError('status must be valid, revoked or suspended');
       if (!(await storage.isReserved(issuer, n, idx))) throw new StatusIndexNotAllocatedError();

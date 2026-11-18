@@ -96,18 +96,19 @@ test('an invalid source: the last good token is served unchanged until its exp a
   const clock = fakeClock();
   let content: unknown = trustListSource(DEMO);
   const errors: string[] = [];
-  const service = createTrustListService({ source: () => content, keyStore, clock, onError: (e) => errors.push(e.message) });
+  const service = createTrustListService({ source: () => content, keyStore, clock, onError: (reason) => errors.push(reason) });
   const good = await service.token();
   const bad = structuredClone(content) as TrustListContent;
   bad.issuers[0]!.chung_thu[0]!.sha256 = 'not-a-fingerprint';
   content = bad;
   clock.advance(7200);
   assert.equal(await service.token(), good, 'not re-signed');
-  assert.deepEqual(errors, ['trust list source is invalid: issuers[0].chung_thu[0].sha256 is not a base64url SHA-256 fingerprint']);
-  const throwing = createTrustListService({ source: () => { throw new Error('file missing'); }, keyStore, clock });
-  await assert.rejects(throwing.token(), /file missing/, 'no good token: the call throws');
+  // Only the machine reason: no validator detail, nothing of the source.
+  assert.deepEqual(errors, ['source_invalid']);
+  const throwing = createTrustListService({ source: () => { throw new Error('{"secret": "file content"}'); }, keyStore, clock });
+  await assert.rejects(throwing.token(), (e: Error) => e.message === 'trust list source_threw', 'no good token: the call throws, without the source error');
   clock.advance(86_400 - 7200);
-  await assert.rejects(service.token(), /trust list source is invalid/, 'after exp the good token is no longer served');
+  await assert.rejects(service.token(), (e: Error) => e.message === 'trust list source_invalid', 'after exp the good token is no longer served');
 });
 
 test('signerNotBefore is carried in the payload', async () => {
@@ -118,4 +119,41 @@ test('signerNotBefore is carried in the payload', async () => {
   assert.ok(r.ok);
   assert.equal(r.payload.signer_not_before, notBefore);
   await assert.rejects(createTrustListService({ source: () => trustListSource(DEMO), keyStore, clock, signerNotBefore: notBefore + 1 }).token(), /signerNotBefore must be/);
+});
+
+test('onError reports source_threw while the last good token is served', async () => {
+  const clock = fakeClock();
+  let fail = false;
+  const reasons: string[] = [];
+  const service = createTrustListService({ source: () => { if (fail) throw new Error('EACCES /etc/identra/trust.json'); return trustListSource(DEMO); }, keyStore, clock, onError: (r) => reasons.push(r) });
+  const good = await service.token();
+  fail = true;
+  clock.advance(7200);
+  assert.equal(await service.token(), good);
+  assert.deepEqual(reasons, ['source_threw']);
+});
+
+test('current() describes the held token for monitoring', async () => {
+  const clock = fakeClock();
+  const content = trustListSource(DEMO) as TrustListContent;
+  const service = createTrustListService({ source: () => content, keyStore, clock });
+  assert.equal(service.current(), null);
+  const token = await service.token();
+  assert.deepEqual(service.current(), { iat: iatOf(token), exp: iatOf(token) + 86_400, issuers: content.issuers.length, verifiers: content.verifiers.length });
+});
+
+test('lastIatStore keeps iat strictly increasing across a restart; a failing store fails the call', async () => {
+  const clock = fakeClock();
+  const content = trustListSource(DEMO);
+  let saved: number | null = null;
+  const store = { get: async () => saved, set: async (iat: number) => void (saved = iat) };
+  const first = await createTrustListService({ source: () => content, keyStore, clock, lastIatStore: store }).token();
+  assert.equal(saved, iatOf(first));
+  clock.advance(-120); // restart with a clock that stepped back
+  const second = await createTrustListService({ source: () => content, keyStore, clock, lastIatStore: store }).token();
+  assert.equal(iatOf(second), iatOf(first) + 1);
+  assert.equal(saved, iatOf(second));
+  const broken = { get: async () => null, set: async () => { throw new Error('db down'); } };
+  await assert.rejects(createTrustListService({ source: () => content, keyStore, clock, lastIatStore: broken }).token(), /db down/);
+  await assert.rejects(createTrustListService({ source: () => content, keyStore, clock, lastIatStore: { get: async () => 1.5, set: async () => {} } }).token(), TypeError);
 });
