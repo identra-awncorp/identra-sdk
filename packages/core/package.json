@@ -10,11 +10,13 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     },
     "./webcrypto": {
       "types": "./dist/webcrypto/index.d.ts",
-      "import": "./dist/webcrypto/index.js"
+      "import": "./dist/webcrypto/index.js",
+      "default": "./dist/webcrypto/index.js"
     }
   },
   "files": [
