@@ -12,3 +12,4 @@ export {
   type StoredStatusList,
 } from './status-service.js';
 export { createTrustListService, type TrustListService } from './trust-list-service.js';
+export { appendProductEvent, checkProductEventForStorage, type AppendProductEventInput, type StorageCheck } from './product-chain.js';
