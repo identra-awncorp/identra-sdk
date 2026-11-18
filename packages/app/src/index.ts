@@ -14,7 +14,10 @@ export {
   type CredentialRow,
   type CredentialStatus,
   type CredentialVault,
+  type CredentialVaultErrorCode,
+  type UnopenableRow,
 } from './credential-vault.js';
+export { RandomSourceError } from './random.js';
 export {
   buildCatalogue,
   serializeCatalogue,

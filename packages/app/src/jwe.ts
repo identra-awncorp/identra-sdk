@@ -6,13 +6,18 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { base64UrlDecode, base64UrlEncode, concatBytes, utf8Decode, utf8Encode } from '@identra/sdk-core';
 import type { EcPublicJwk, RandomSource } from '@identra/sdk-core';
 import { generateSecretKey, P256, publicPointOf, uncompressedPointToJwk } from './crypto/noble.js';
+import { drawRandom } from './random.js';
 
 export type JweEnc = 'A128GCM' | 'A256GCM';
 
 const KEY_BYTES: Record<JweEnc, number> = { A128GCM: 16, A256GCM: 32 };
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
-/** Upper bound on a compact JWE accepted by decryptJwe, checked before any parsing. */
+/**
+ * Upper bound on a compact JWE accepted by decryptJwe, checked before any parsing. With a typical
+ * header this admits plaintexts up to about 48 954 bytes (measured); one credential is a few KB.
+ * Batch issuance (ADR-0014 section 3, a later phase) may need a larger bound.
+ */
 export const MAX_JWE_LENGTH = 65536;
 
 /** Members a protected header may carry. Anything else (zip, crit, jku, ...) is rejected. */
@@ -33,7 +38,7 @@ export interface JweHeader {
 /**
  * Decryption failure. `code` is 'JWE_INVALID' for input that is not a JWE this module accepts and
  * 'JWE_DECRYPTION_FAILED' when the key agreement or authentication fails. The message never says
- * more than the code.
+ * more than the code. The code is for local logs and UI: do not forward it to the remote party.
  */
 export class JweError extends Error {
   readonly code: 'JWE_INVALID' | 'JWE_DECRYPTION_FAILED';
@@ -53,7 +58,9 @@ const lengthPrefixed = (b: Uint8Array): Uint8Array => concatBytes(u32be(b.length
  */
 function concatKdf(z: Uint8Array, enc: JweEnc, apu: Uint8Array, apv: Uint8Array): Uint8Array {
   const keyBytes = KEY_BYTES[enc];
-  const digest = sha256(concatBytes(u32be(1), z, lengthPrefixed(utf8Encode(enc)), lengthPrefixed(apu), lengthPrefixed(apv), u32be(keyBytes * 8)));
+  const input = concatBytes(u32be(1), z, lengthPrefixed(utf8Encode(enc)), lengthPrefixed(apu), lengthPrefixed(apv), u32be(keyBytes * 8));
+  const digest = sha256(input);
+  input.fill(0);
   const key = digest.slice(0, keyBytes);
   digest.fill(0);
   return key;
@@ -101,19 +108,22 @@ export function encryptJwe(input: {
   for (const m of ['apu', 'apv'] as const) {
     if (header[m] !== undefined && !isBase64Url(header[m])) throw new TypeError(`header.${m} must be base64url`);
   }
+  // jose refuses a JWE whose apu equals apv; an empty value is simply left out.
+  const apu = header.apu || undefined;
+  const apv = header.apv || undefined;
+  if (apu !== undefined && apu === apv) throw new TypeError('header.apu and header.apv must differ');
 
   const ephemeral = generateSecretKey(random);
   let z: Uint8Array | undefined;
   let cek: Uint8Array | undefined;
   try {
     const protectedHeader: JweHeader = { alg: 'ECDH-ES', enc, epk: uncompressedPointToJwk(P256.getPublicKey(ephemeral, false)) };
-    if (header.apu !== undefined) protectedHeader.apu = header.apu;
-    if (header.apv !== undefined) protectedHeader.apv = header.apv;
+    if (apu !== undefined) protectedHeader.apu = apu;
+    if (apv !== undefined) protectedHeader.apv = apv;
     for (const m of OPTIONAL_STRING_MEMBERS) if (header[m] !== undefined) protectedHeader[m] = header[m];
     z = sharedSecret(ephemeral, recipient);
-    cek = concatKdf(z, enc, base64UrlDecode(header.apu ?? ''), base64UrlDecode(header.apv ?? ''));
-    const iv = random.bytes(IV_BYTES);
-    if (!(iv instanceof Uint8Array) || iv.length !== IV_BYTES) throw new TypeError(`RandomSource must return ${IV_BYTES} bytes`);
+    cek = concatKdf(z, enc, base64UrlDecode(apu ?? ''), base64UrlDecode(apv ?? ''));
+    const iv = drawRandom(random, IV_BYTES);
     const encodedHeader = base64UrlEncode(utf8Encode(JSON.stringify(protectedHeader)));
     const sealed = gcm(cek, iv, utf8Encode(encodedHeader)).encrypt(plaintext);
     const ciphertext = sealed.subarray(0, sealed.length - TAG_BYTES);
@@ -140,9 +150,10 @@ function parseHeader(encoded: string): { header: JweHeader; epkPoint: Uint8Array
   if (h['alg'] !== 'ECDH-ES') return null;
   const enc = h['enc'];
   if (enc !== 'A128GCM' && enc !== 'A256GCM') return null;
-  // Invalid-curve defence: the ephemeral key must be a P-256 point on the curve before any ECDH.
+  // Invalid-curve defence, two layers before any ECDH: sdk-core's JWK check (on-curve P-256) and
+  // noble's public-key validation (on-curve, not the identity).
   const epkPoint = publicPointOf(h['epk']);
-  if (!epkPoint) return null;
+  if (!epkPoint || !P256.utils.isValidPublicKey(epkPoint, false)) return null;
   const header: JweHeader = { alg: 'ECDH-ES', enc, epk: uncompressedPointToJwk(epkPoint) };
   for (const m of ['apu', 'apv'] as const) {
     const v = h[m];

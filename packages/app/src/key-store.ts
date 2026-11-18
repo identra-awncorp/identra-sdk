@@ -4,6 +4,7 @@
 import { base64UrlDecode, base64UrlEncode } from '@identra/sdk-core';
 import type { EcPublicJwk, RandomSource, Signer } from '@identra/sdk-core';
 import { createNobleSigner, generateSecretKey, P256, uncompressedPointToJwk } from './crypto/noble.js';
+import { drawRandom } from './random.js';
 
 /**
  * Small-secret storage, implemented by the app with expo-secure-store (`requireAuthentication:
@@ -68,8 +69,7 @@ export function createSoftwareKeyStore(options: { secrets: SecretStorage; random
   const { secrets, random } = options;
   return {
     async create() {
-      const id = random.bytes(16);
-      if (!(id instanceof Uint8Array) || id.length !== 16) throw new TypeError('RandomSource must return 16 bytes');
+      const id = drawRandom(random, 16);
       // No existence check before writing: with requireAuthentication a read prompts for biometrics.
       const keyId = base64UrlEncode(id);
       const secretKey = generateSecretKey(random);

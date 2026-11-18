@@ -12,7 +12,7 @@ import {
   rawSignatureToDer,
   signJws,
   utf8Encode,
-  verifyJwsSignature,
+  verifyJws,
   type EcPublicJwk,
   type Signer,
   type Verifier,
@@ -20,9 +20,9 @@ import {
 import { createWebCryptoSigner, generateWebCryptoKeyPair, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import { p256, p384 } from '@noble/curves/nist.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
-import { createDerSigningAdapter, createNobleSigner, generateSecretKey, nobleHasher, nobleVerifier } from '@identra/sdk-app';
+import { createDerSigningAdapter, createNobleSigner, generateSecretKey, nobleHasher, nobleVerifier, RandomSourceError } from '@identra/sdk-app';
 import { P256 } from '../dist/crypto/noble.js';
-import { constantRandom, countingRandom, seededRandom } from './helpers/random.js';
+import { constantRandom, countingRandom, queuedRandom, seededRandom } from './helpers/random.js';
 
 const N = p256.Point.CURVE().n;
 const HALF_N = N >> 1n;
@@ -70,9 +70,9 @@ describe('P-256 instance', () => {
 
 describe('nobleVerifier', () => {
   test('RFC 7515 A.3 verifies; a one-byte change of input or signature fails', async () => {
-    const r = decodeJws(RFC7515_A3.jws);
+    const r = decodeJws(RFC7515_A3.jws, 16384);
     assert.ok(r.ok);
-    assert.equal(await verifyJwsSignature(r.jws, RFC7515_PUBLIC, nobleVerifier), true);
+    assert.equal(await verifyJws(r.jws, RFC7515_PUBLIC, nobleVerifier), null);
     const flipped = (b: Uint8Array, i: number) => {
       const c = b.slice();
       c[i]! ^= 1;
@@ -85,7 +85,7 @@ describe('nobleVerifier', () => {
   test('cross-backend: noble signs, WebCrypto verifies, and the reverse', async () => {
     const noble = createNobleSigner(generateSecretKey(countingRandom()));
     const fresh = await generateWebCryptoKeyPair();
-    const web = await createWebCryptoSigner({ privateKey: fresh.privateKey });
+    const web = await createWebCryptoSigner({ privateKey: fresh.privateKey, publicJwk: fresh.publicJwk });
     const pairs: [Signer, Verifier][] = [
       [noble, webCryptoVerifier],
       [web, nobleVerifier],
@@ -93,9 +93,9 @@ describe('nobleVerifier', () => {
     ];
     for (const [signer, verifier] of pairs) {
       const compact = await signJws({ typ: 'JWT' }, utf8Encode('{"iss":"https://example.test"}'), signer);
-      const r = decodeJws(compact);
+      const r = decodeJws(compact, 16384);
       assert.ok(r.ok);
-      assert.equal(await verifyJwsSignature(r.jws, signer.publicJwk, verifier), true);
+      assert.equal(await verifyJws(r.jws, signer.publicJwk, verifier), null);
     }
   });
 
@@ -231,19 +231,26 @@ describe('generateSecretKey', () => {
     assert.ok(P256.utils.isValidSecretKey(key));
   });
 
-  test('all-zero and all-0xFF sources neither hang nor yield an invalid scalar', () => {
-    for (const value of [0x00, 0xff]) {
-      const key = generateSecretKey(constantRandom(value));
-      assert.ok(P256.utils.isValidSecretKey(key), `fill ${value}`);
-      assert.ok(toBig(key) >= 1n && toBig(key) < N);
-    }
-    // Mapping is (seed mod (n - 1)) + 1, so an all-zero seed gives the scalar 1.
-    assert.equal(toBig(generateSecretKey(constantRandom(0))), 1n);
+  test('all-equal output (all-zero, all-0xFF: would give the scalar 1 or a fixed key) is refused, without hanging', () => {
+    for (const value of [0x00, 0x01, 0xff]) assert.throws(() => generateSecretKey(constantRandom(value)), RandomSourceError, `fill ${value}`);
+    // Any other 48 bytes map into [1, n-1]: the largest seed still gives a valid scalar.
+    const top = new Uint8Array(48).fill(0xff);
+    top[0] = 0xfe;
+    const key = generateSecretKey(queuedRandom(top));
+    assert.ok(P256.utils.isValidSecretKey(key));
+    assert.ok(toBig(key) >= 1n && toBig(key) < N);
   });
 
-  test('a RandomSource returning the wrong length is refused', () => {
-    assert.throws(() => generateSecretKey({ bytes: () => new Uint8Array(32) }), TypeError);
-    assert.throws(() => generateSecretKey({ bytes: () => [] as unknown as Uint8Array }), TypeError);
+  test('a source that repeats its previous block is refused on the repeat', () => {
+    const block = seededRandom(3).bytes(48);
+    const repeating = { bytes: () => block.slice() };
+    generateSecretKey(repeating);
+    assert.throws(() => generateSecretKey(repeating), RandomSourceError);
+  });
+
+  test('a RandomSource returning the wrong length or type is refused', () => {
+    assert.throws(() => generateSecretKey({ bytes: () => new Uint8Array(32) }), RandomSourceError);
+    assert.throws(() => generateSecretKey({ bytes: () => [] as unknown as Uint8Array }), RandomSourceError);
   });
 
   test('nothing in the adapters calls globalThis.crypto.getRandomValues', async (t) => {
@@ -272,7 +279,7 @@ describe('createDerSigningAdapter', () => {
     return { publicJwk, signDer: async (data: Uint8Array) => new Uint8Array(nodeSign('sha256', data, { key: privateKey, dsaEncoding: 'der' })) };
   }
 
-  test('OpenSSL DER (high-S, leading-zero and short integers) becomes r||s that verifies', async () => {
+  test('OpenSSL DER (high-S, leading-zero and short integers) becomes low-S r||s that verifies', async () => {
     const key = opensslKey();
     const signer = createDerSigningAdapter(key);
     assert.deepEqual(signer.publicJwk, key.publicJwk);
@@ -283,10 +290,13 @@ describe('createDerSigningAdapter', () => {
       const der = await key.signDer(data);
       const raw = await createDerSigningAdapter({ publicJwk: key.publicJwk, signDer: async () => der }).sign(data);
       assert.equal(raw.length, 64);
-      assert.deepEqual(raw, derSignatureToRaw(der));
+      const fromDer = derSignatureToRaw(der);
+      const highS = toBig(fromDer.subarray(32)) > HALF_N;
+      // r unchanged; s normalised to the low half: n - s when the keystore returned high-S.
+      assert.deepEqual(raw, highS ? rs(toBig(fromDer.subarray(0, 32)), N - toBig(fromDer.subarray(32))) : fromDer);
+      assert.ok(toBig(raw.subarray(32)) <= HALF_N);
       const rLen = der[3]!;
       const sLen = der[5 + rLen]!;
-      const highS = toBig(raw.subarray(32)) > HALF_N;
       const leadingZero = rLen === 33 || sLen === 33;
       const short = rLen < 32 || sLen < 32;
       if ((highS && !seen.highS) || (leadingZero && !seen.leadingZero) || (short && !seen.short) || i < 5) {

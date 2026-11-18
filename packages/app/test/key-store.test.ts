@@ -1,10 +1,10 @@
 // Software WalletKeyStore (ADR-0009 sections 1 and 2).
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { base64UrlDecode, utf8Encode } from '@identra/sdk-core';
+import { base64UrlDecode, utf8Encode, type RandomSource } from '@identra/sdk-core';
 import { webCryptoVerifier } from '@identra/sdk-core/webcrypto';
-import { createInMemorySecretStorage, createNobleSigner, createSoftwareKeyStore, nobleVerifier, WalletKeyError, type SecretStorage } from '@identra/sdk-app';
-import { countingRandom } from './helpers/random.js';
+import { createInMemorySecretStorage, createNobleSigner, createSoftwareKeyStore, nobleVerifier, RandomSourceError, WalletKeyError, type SecretStorage } from '@identra/sdk-app';
+import { constantRandom, countingRandom, seededRandom } from './helpers/random.js';
 
 function setup() {
   const map = new Map<string, string>();
@@ -76,6 +76,32 @@ describe('createSoftwareKeyStore', () => {
     await assert.rejects(store.signer(a.keyId), notFound);
     assert.deepEqual([...map.keys()], [`identra.key.${b.keyId}`]);
     await store.signer(b.keyId);
+  });
+
+  test('the key-id format is checked before any lookup, even if the storage would answer', async () => {
+    const valid = 'jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI';
+    let gets = 0;
+    const permissive: SecretStorage = { get: async () => (gets++, valid), set: async () => {}, delete: async () => {} };
+    const store = createSoftwareKeyStore({ secrets: permissive, random: countingRandom() });
+    for (const id of ['../identra.vault.data-key', 'identra.vault.data-key', 'AAAAAAAAAAAAAAAAAAAAA', 'AAAAAAAAAAAAAAAAAAAAAAA', 'AAAAAAAAAAAAAAAAAAAAA=', 'AAAAAAAAAAAAAAAAAAAAA\n', '']) {
+      await assert.rejects(store.signer(id), notFound, JSON.stringify(id));
+    }
+    assert.equal(gets, 0);
+    await store.signer('AAAAAAAAAAAAAAAAAAAAAA');
+    assert.equal(gets, 1);
+  });
+
+  test('a broken RandomSource is refused: all-equal output, and a repeat of the previous id', async () => {
+    const map = new Map<string, string>();
+    await assert.rejects(createSoftwareKeyStore({ secrets: createInMemorySecretStorage(map), random: constantRandom(7) }).create(), RandomSourceError);
+    const ids = seededRandom(11);
+    const id = ids.bytes(16);
+    const seeds = seededRandom(12);
+    const repeatsIds: RandomSource = { bytes: (n) => (n === 16 ? id.slice() : seeds.bytes(n)) };
+    const store = createSoftwareKeyStore({ secrets: createInMemorySecretStorage(map), random: repeatsIds });
+    await store.create();
+    await assert.rejects(store.create(), RandomSourceError);
+    assert.equal(map.size, 1);
   });
 
   test('a storage failure propagates', async () => {

@@ -41,7 +41,7 @@ export default tseslint.config(
         'error',
         { patterns: ['node:*', 'jose', 'jose/*', 'expo-*', 'react-native', 'react-native/*', '@identra/sdk-core/webcrypto'] },
       ],
-      'no-restricted-globals': ['error', ...PLATFORM_GLOBALS],
+      'no-restricted-globals': ['error', ...PLATFORM_GLOBALS, ...INDIRECT_GLOBALS],
       'no-restricted-properties': [
         'error',
         ...PLATFORM_GLOBALS.map((property) => ({ object: 'globalThis', property })),
@@ -52,6 +52,7 @@ export default tseslint.config(
         'error',
         { selector: "NewExpression[callee.name='Date'][arguments.length=0]", message: 'The clock is injected.' },
         { selector: "CallExpression[callee.name='Date']", message: 'The clock is injected.' },
+        { selector: 'ImportExpression', message: 'No dynamic import in sdk-app.' },
       ],
     },
   },

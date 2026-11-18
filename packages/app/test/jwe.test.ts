@@ -5,8 +5,9 @@ import { base64UrlDecode, base64UrlEncode, hexDecode, utf8Decode, utf8Encode, ty
 import { gcm } from '@noble/ciphers/aes.js';
 import { p256 } from '@noble/curves/nist.js';
 import { CompactEncrypt, compactDecrypt, importJWK } from 'jose';
-import { createNobleSigner, decryptJwe, encryptJwe, generateSecretKey, JweError, MAX_JWE_LENGTH, type JweEnc } from '@identra/sdk-app';
-import { countingRandom, queuedRandom, seededRandom } from './helpers/random.js';
+import { createNobleSigner, decryptJwe, encryptJwe, generateSecretKey, JweError, MAX_JWE_LENGTH, RandomSourceError, type JweEnc } from '@identra/sdk-app';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { constantRandom, countingRandom, queuedRandom, seededRandom } from './helpers/random.js';
 
 const ENCS: JweEnc[] = ['A128GCM', 'A256GCM'];
 const toBytes = (v: bigint, len: number): Uint8Array => hexDecode(v.toString(16).padStart(len * 2, '0'));
@@ -77,7 +78,7 @@ describe('RFC 7518 Appendix C (ECDH-ES direct, A128GCM, apu "Alice", apv "Bob")'
   test('Alice ephemeral -> Bob: the content key is the RFC derived key', () => {
     // generateSecretKey maps a 48-byte seed to (seed mod (n - 1)) + 1, so seed = d - 1 yields d.
     const aliceD = BigInt('0x' + Array.from(base64UrlDecode(ALICE.d), (b) => b.toString(16).padStart(2, '0')).join(''));
-    const iv = new Uint8Array(12).fill(9);
+    const iv = Uint8Array.from({ length: 12 }, (_, i) => i + 1);
     const jwe = encryptJwe({
       recipientPublicJwk: { kty: 'EC', crv: 'P-256', x: BOB.x, y: BOB.y },
       enc: 'A128GCM',
@@ -216,13 +217,70 @@ describe('decryptJwe rejects', () => {
     const epkPoint = P0.multiply(p256.Point.Fn.inv(d)).toBytes(false);
     const epk = { kty: 'EC', crv: 'P-256', x: base64UrlEncode(epkPoint.subarray(1, 33)), y: base64UrlEncode(epkPoint.subarray(33)) };
     assert.throws(() => open(withHeader(good, { ...headerOf(good), epk })), jweCode('JWE_DECRYPTION_FAILED'));
-    // Sender side: recipient P0 and an all-zero seed (ephemeral scalar 1) give Z = 0 too.
+    // Sender side: recipient P0 and the ephemeral scalar n - 1 (seed n - 2, since the mapping is
+    // (seed mod (n - 1)) + 1) give (n - 1) * P0 = -P0, whose x is 0 too.
     const p0Bytes = P0.toBytes(false);
     const p0Jwk: EcPublicJwk = { kty: 'EC', crv: 'P-256', x: base64UrlEncode(p0Bytes.subarray(1, 33)), y: base64UrlEncode(p0Bytes.subarray(33)) };
+    const n = p256.Point.CURVE().n;
     assert.throws(
-      () => encryptJwe({ recipientPublicJwk: p0Jwk, enc: 'A128GCM', plaintext: new Uint8Array(1), random: queuedRandom(new Uint8Array(48), new Uint8Array(12)) }),
+      () => encryptJwe({ recipientPublicJwk: p0Jwk, enc: 'A128GCM', plaintext: new Uint8Array(1), random: queuedRandom(toBytes(n - 2n, 48)) }),
       jweCode('JWE_DECRYPTION_FAILED'),
     );
+  });
+});
+
+describe('the protected header used as AAD is the received bytes', () => {
+  // An independent Concat KDF (RFC 7518 section 4.6.2) to build a JWE by hand.
+  function kdf(z: Uint8Array, enc: string, bits: number): Uint8Array {
+    const u32 = (n: number) => [n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+    const encBytes = [...utf8Encode(enc)];
+    return sha256(Uint8Array.from([...u32(1), ...z, ...u32(encBytes.length), ...encBytes, ...u32(0), ...u32(0), ...u32(bits)])).slice(0, bits / 8);
+  }
+
+  test('a header with spaces and its own member order decrypts; re-serialising it would not', () => {
+    const r = recipient();
+    const eph = p256.utils.randomSecretKey();
+    const epkPoint = p256.getPublicKey(eph, false);
+    const z = p256.getSharedSecret(eph, Uint8Array.from([4, ...base64UrlDecode(r.publicJwk.x), ...base64UrlDecode(r.publicJwk.y)]), true).slice(1);
+    const headerText = `{ "epk" : { "y":"${base64UrlEncode(epkPoint.subarray(33))}", "x":"${base64UrlEncode(epkPoint.subarray(1, 33))}", "crv":"P-256", "kty":"EC" },  "enc":"A128GCM", "alg" : "ECDH-ES" }`;
+    assert.notEqual(JSON.stringify(JSON.parse(headerText)), headerText);
+    const encodedHeader = base64UrlEncode(utf8Encode(headerText));
+    const iv = Uint8Array.from({ length: 12 }, (_, i) => 100 + i);
+    const sealed = gcm(kdf(z, 'A128GCM', 128), iv, utf8Encode(encodedHeader)).encrypt(utf8Encode('hand made'));
+    const jwe = [encodedHeader, '', base64UrlEncode(iv), base64UrlEncode(sealed.subarray(0, -16)), base64UrlEncode(sealed.subarray(-16))].join('.');
+    assert.equal(utf8Decode(decryptJwe({ jwe, recipientSecretKey: r.secretKey }).plaintext), 'hand made');
+  });
+});
+
+describe('a broken RandomSource is refused by encryptJwe', () => {
+  const r = recipient();
+  const base = { recipientPublicJwk: r.publicJwk, enc: 'A128GCM' as JweEnc, plaintext: utf8Encode('x') };
+  test('all-zero output (the ephemeral key would be the generator)', () => {
+    assert.throws(() => encryptJwe({ ...base, random: constantRandom(0) }), RandomSourceError);
+  });
+  test('a repeating source (same key and IV twice)', () => {
+    const fixed = seededRandom(5);
+    const a = fixed.bytes(48);
+    const iv = fixed.bytes(12);
+    const repeating = { bytes: (n: number) => (n === 48 ? a : iv).slice() };
+    encryptJwe({ ...base, random: repeating });
+    assert.throws(() => encryptJwe({ ...base, random: repeating }), RandomSourceError);
+  });
+  test('an all-equal IV', () => {
+    assert.throws(() => encryptJwe({ ...base, random: queuedRandom(seededRandom(9).bytes(48), new Uint8Array(12).fill(7)) }), RandomSourceError);
+  });
+});
+
+describe('apu / apv', () => {
+  const r = recipient();
+  const base = { recipientPublicJwk: r.publicJwk, enc: 'A128GCM' as JweEnc, plaintext: utf8Encode('x') };
+  test('empty values are left out of the header', () => {
+    const jwe = encryptJwe({ ...base, random: countingRandom(), header: { apu: '', apv: '' } });
+    assert.deepEqual(Object.keys(headerOf(jwe)).sort(), ['alg', 'enc', 'epk']);
+    assert.equal(utf8Decode(decryptJwe({ jwe, recipientSecretKey: r.secretKey }).plaintext), 'x');
+  });
+  test('apu equal to apv is refused', () => {
+    assert.throws(() => encryptJwe({ ...base, random: countingRandom(), header: { apu: 'QWxpY2U', apv: 'QWxpY2U' } }), TypeError);
   });
 });
 

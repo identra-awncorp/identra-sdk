@@ -7,8 +7,9 @@
 // and never touches a global. Every random byte comes from an injected RandomSource.
 import { ecdsa, weierstrass } from '@noble/curves/abstract/weierstrass.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { base64UrlDecode, base64UrlEncode, derSignatureToRaw, normalizeEcPublicJwk } from '@identra/sdk-core';
+import { base64UrlDecode, base64UrlEncode, derSignatureToRaw, hexDecode, hexEncode, normalizeEcPublicJwk } from '@identra/sdk-core';
 import type { EcPublicJwk, Hasher, RandomSource, Signer, Verifier } from '@identra/sdk-core';
+import { drawRandom } from '../random.js';
 
 const noImplicitRandomness = (): Uint8Array => {
   throw new Error('implicit randomness is disabled');
@@ -49,18 +50,12 @@ export function uncompressedPointToJwk(point: Uint8Array): EcPublicJwk {
 }
 
 /**
- * The validated public point of a JWK: P-256, strict coordinates, on the curve, not the identity.
- * Returns null on anything else, including JWK objects whose getters throw.
+ * The public point of a JWK that sdk-core's normalizeEcPublicJwk accepts (P-256, strict
+ * coordinates, on the curve; it never throws), or null.
  */
 export function publicPointOf(publicJwk: unknown): Uint8Array | null {
-  try {
-    const jwk = normalizeEcPublicJwk(publicJwk);
-    if (!jwk) return null;
-    const point = jwkToUncompressedPoint(jwk);
-    return P256.utils.isValidPublicKey(point, false) ? point : null;
-  } catch {
-    return null;
-  }
+  const jwk = normalizeEcPublicJwk(publicJwk);
+  return jwk ? jwkToUncompressedPoint(jwk) : null;
 }
 
 /** P-256 / SHA-256, low-S and high-S accepted (OpenSSL does not normalise S). Never throws. */
@@ -85,12 +80,12 @@ export const nobleHasher: Hasher = {
 
 /**
  * A fresh P-256 secret key from the injected RandomSource: 48 random bytes mapped into [1, n-1]
- * with noble's documented hash-to-scalar utility (mapHashToField, bias about 2^-128). One call to
- * `random.bytes`, no loop, so a broken source cannot hang it; the result is always a valid scalar.
+ * with noble's documented hash-to-scalar utility (mapHashToField, bias about 2^-128). One draw,
+ * no loop, so a broken source cannot hang it; all-equal or repeated output is refused
+ * (RandomSourceError, see drawRandom) and anything else gives a valid scalar.
  */
 export function generateSecretKey(random: RandomSource): Uint8Array {
-  const seed = random.bytes(SEED_BYTES);
-  if (!(seed instanceof Uint8Array) || seed.length !== SEED_BYTES) throw new TypeError(`RandomSource must return ${SEED_BYTES} bytes`);
+  const seed = drawRandom(random, SEED_BYTES);
   try {
     return P256.utils.randomSecretKey(seed);
   } finally {
@@ -124,10 +119,13 @@ export function createNobleSigner(secretKey: Uint8Array, opts: { kid?: string } 
   return signer;
 }
 
+const N = P256.Point.Fn.ORDER;
+
 /**
  * Signer for hardware keystores (Secure Enclave, Android Keystore) whose sign call returns a DER
- * ECDSA signature. The DER is converted to r||s with sdk-core's strict converter; S is passed
- * through unchanged (hardware may return high-S, which every Identra Verifier accepts).
+ * ECDSA signature. The DER is converted to r||s with sdk-core's strict converter and S is
+ * normalised to low-S (s > n/2 becomes n - s), like the software signer: hardware returns high-S
+ * about half the time and strict third-party verifiers refuse it.
  */
 export function createDerSigningAdapter(input: { publicJwk: EcPublicJwk; signDer(data: Uint8Array): Promise<Uint8Array> }): Signer {
   const point = publicPointOf(input.publicJwk);
@@ -138,7 +136,10 @@ export function createDerSigningAdapter(input: { publicJwk: EcPublicJwk; signDer
     alg: 'ES256',
     publicJwk: uncompressedPointToJwk(point),
     async sign(data) {
-      return derSignatureToRaw(await signDer(data));
+      const raw = derSignatureToRaw(await signDer(data));
+      const s = BigInt('0x' + hexEncode(raw.subarray(32)));
+      if (s > N >> 1n && s < N) raw.set(hexDecode((N - s).toString(16).padStart(64, '0')), 32);
+      return raw;
     },
   };
 }

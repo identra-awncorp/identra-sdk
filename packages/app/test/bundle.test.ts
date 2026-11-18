@@ -37,7 +37,7 @@ function restrictedRealm(extra: Record<string, unknown> = {}): vm.Context {
 // Runs inside the realm. Randomness is a deterministic test generator: there is no crypto object.
 const ENTRY = `
   import * as app from '@identra/sdk-app';
-  import { base64UrlDecode, base64UrlEncode, utf8Encode, utf8Decode, decodeJws, verifyJwsSignature } from '@identra/sdk-core';
+  import { base64UrlDecode, base64UrlEncode, utf8Encode, utf8Decode, decodeJws, verifyJws } from '@identra/sdk-core';
   function testRandom(seed) {
     let state = seed >>> 0;
     return { bytes(n) { const o = new Uint8Array(n); for (let i = 0; i < n; i++) { state = (Math.imul(state ^ (state >>> 15), 0x2c1b3c6d) + 0x9e3779b9) >>> 0; o[i] = state >>> 24; } return o; } };
@@ -47,8 +47,8 @@ const ENTRY = `
     const random = testRandom(input.seed);
     const out = {};
     // ES256: RFC 7515 A.3, then a fresh key
-    const a3 = decodeJws(input.rfcJws);
-    out.rfcA3 = await verifyJwsSignature(a3.jws, input.rfcJwk, app.nobleVerifier);
+    const a3 = decodeJws(input.rfcJws, 16384);
+    out.rfcA3 = (await verifyJws(a3.jws, input.rfcJwk, app.nobleVerifier)) === null;
     const signer = app.createNobleSigner(app.generateSecretKey(random));
     const data = utf8Encode('in the realm');
     const sig = await signer.sign(data);
@@ -96,7 +96,7 @@ test('the sdk-app main entry bundles for a neutral platform without any Node bui
   const output = Object.values(r.metafile!.outputs)[0]!;
   const bytes = (match: (p: string) => boolean) => Object.entries(output.inputs).reduce((n, [p, v]) => n + (match(p) ? v.bytesInOutput : 0), 0);
   console.log(
-    `# minified sdk-app main entry: ${r.outputFiles![0]!.text.length} bytes from ${inputs.length} files;` +
+    `# minified sdk-app main entry: ${r.outputFiles![0]!.text.length} bytes from ${Object.values(output.inputs).filter((v) => v.bytesInOutput > 0).length} files;` +
       ` sdk-app ${bytes((p) => p.startsWith('../dist/'))}, @noble/* ${bytes((p) => p.includes('@noble/'))}, sdk-core and its dependencies the rest`,
   );
 });
