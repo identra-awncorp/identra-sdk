@@ -7,7 +7,6 @@ import {
   createCertificateChainValidator,
   createPresentation,
   issueDiploma,
-  verifyCredential,
   type Hasher,
   type Signer,
   type Verifier,
@@ -15,7 +14,7 @@ import {
 import { webCryptoHasher, webCryptoRandom, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import { nobleHasher, nobleSigner, nobleVerifier, P256_N } from './helpers/noble.js';
 import { ca, NOW, pemFile, x5c } from './helpers/pki.js';
-import { AUD, clock, codes, DIPLOMA, holderKey, ISS, issuerSigner, NONCE, presentationOptions, STATUS } from './helpers/sdjwt.js';
+import { AUD, clock, codes, DIPLOMA, holderKey, ISS, issuerSigner, NONCE, presentationOptions, STATUS , verifyAny } from './helpers/sdjwt.js';
 
 async function nobleIssuer(): Promise<Signer> {
   const der = Buffer.from(pemFile('test/leaf/vc.key.pem').replace(/-----[A-Z ]+-----|\s/g, ''), 'base64');
@@ -28,7 +27,7 @@ async function roundTrip(issuer: Signer, holder: Signer, hasher: Hasher, verifie
   const compact = await issueDiploma({ signer: issuer, hasher, random: webCryptoRandom, clock, iss: ISS, cnfJwk: holder.publicJwk, status: STATUS, claims: DIPLOMA });
   const presentation = await createPresentation({ compact, disclose: ['ho_ten'], holderSigner: holder, audience: AUD, nonce: NONCE, now: NOW, hasher });
   const chainValidator = createCertificateChainValidator({ trustedRoots: [ca('root')], verifier, hasher });
-  return verifyCredential(presentation, presentationOptions({ verifier, hasher, chainValidator }));
+  return verifyAny(presentation, presentationOptions({ verifier, hasher, chainValidator }));
 }
 
 test('issue and present with noble, verify with WebCrypto, and the reverse', async () => {

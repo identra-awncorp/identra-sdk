@@ -35,7 +35,7 @@ test('the bundle validates certificate chains in a realm without crypto, Buffer,
       const validator = createCertificateChainValidator({ trustedRoots: [base64Decode(input.root)], verifier: nobleVerifier, hasher: nobleHasher });
       const out = [];
       for (const c of input.cases) {
-        const r = await validator.validate({ x5c: c.x5c, profile: c.profile, now: new Date(input.now) });
+        const r = await validator.validate({ x5c: c.x5c, profile: c.profile, now: new Date(input.now), expectedIssuerUri: c.iss });
         out.push([r.code, r.fingerprint ?? null, r.leaf?.subject.O ?? null]);
       }
       return JSON.stringify(out);
@@ -44,11 +44,11 @@ test('the bundle validates certificate chains in a realm without crypto, Buffer,
   const code = built.outputFiles![0]!.text;
 
   const cases = [
-    { x5c: x5c('vc'), profile: 'vc' },
-    { x5c: x5c('utf8'), profile: 'vc' },
+    { x5c: x5c('vc'), profile: 'vc', iss: 'https://api-identra.awncorp.vn/issuers/truong-mau' },
+    { x5c: x5c('utf8'), profile: 'vc', iss: 'https://api-identra.awncorp.vn/issuers/truong-mau' },
     { x5c: [b64(leaf('trust-list'))], profile: 'trust-list' },
-    { x5c: x5c('evil-vc', 'evil-issuing'), profile: 'vc' },
-    { x5c: x5c('expired'), profile: 'vc' },
+    { x5c: x5c('evil-vc', 'evil-issuing'), profile: 'vc', iss: 'https://api-identra.awncorp.vn/issuers/truong-mau' },
+    { x5c: x5c('expired'), profile: 'vc', iss: 'https://api-identra.awncorp.vn/issuers/truong-mau' },
   ];
   const input = JSON.stringify({ root: b64(ca('root')), now: NOW.toISOString(), cases });
 
@@ -61,10 +61,60 @@ test('the bundle validates certificate chains in a realm without crypto, Buffer,
   const validator = createCertificateChainValidator({ trustedRoots: [ca('root')], verifier: nobleVerifier, hasher: nobleHasher });
   const expected: unknown[][] = [];
   for (const c of cases) {
-    const r = await validator.validate({ x5c: c.x5c, profile: c.profile as 'vc', now: NOW });
+    const r = await validator.validate({ x5c: c.x5c, profile: c.profile as 'vc', now: NOW, expectedIssuerUri: c.iss as string });
     expected.push([r.code, r.fingerprint ?? null, r.leaf?.subject.O ?? null]);
   }
   assert.deepEqual(got, expected);
   assert.deepEqual(got.map((r) => r[0]), [null, null, null, 'CERT_CHAIN_UNTRUSTED', 'CERT_EXPIRED']);
   assert.equal(got[1]?.[2], 'Trường Mẫu TEST');
+});
+
+// Platform access in the neutral bundle of the core main entry, attributed to the module it comes
+// from (esbuild marks each module with a "// <path>" comment). Our modules must have none; the
+// third-party occurrences are listed exactly, so a new one cannot slip in unnoticed.
+const PLATFORM_PATTERNS: Record<string, RegExp> = {
+  'Date.now': /\bDate\.now\b/,
+  'new Date()': /\bnew Date\(\)/,
+  'Math.random': /\bMath\.random\b/,
+  'crypto.subtle': /\bcrypto\.subtle\b/,
+  'getRandomValues': /\bgetRandomValues\b/,
+  'process.': /\bprocess\./,
+  Buffer: /\bBuffer\b/,
+  'performance.': /\bperformance\./,
+  'Reflect.construct': /\bReflect\.construct\b/,
+  'import(': /\bimport\(/,
+  fetch: /\bfetch\(/,
+};
+const THIRD_PARTY_PLATFORM_ACCESS: Record<string, number> = {
+  'Math.random @ zod': 1, // zod's random-id helper; not reached by sdk-core
+  'new Date() @ @owf/identity-common': 1, // its "now" default; sdk-core always passes the time
+  'new Date() @ @owf/jose': 1,
+  'new Date() @ @owf/cose': 1,
+  'Buffer @ cbor-x': 3, // feature probes (typeof Buffer), absent in the vm realm
+  'import( @ zod': 1, // a comment in zod's source, not code
+  // Network paths of SdJwtVcInstance.verify (status list, type metadata): sdk-core never calls verify.
+  'fetch @ @owf/identity-common': 2,
+  'fetch @ @sd-jwt/sd-jwt-vc': 2,
+};
+
+test('no platform access from our modules in the core bundle; third-party occurrences are exactly the known ones', async () => {
+  const r = await esbuild.build({ ...options, format: 'esm', entryPoints: ['@identra/sdk-core'], absWorkingDir: testDist });
+  let module = '?';
+  const ours: string[] = [];
+  const thirdParty: Record<string, number> = {};
+  for (const line of r.outputFiles![0]!.text.split('\n')) {
+    const marker = /^\/\/ (\S+\.m?js)$/.exec(line);
+    if (marker) {
+      module = marker[1]!;
+      continue;
+    }
+    for (const [name, re] of Object.entries(PLATFORM_PATTERNS)) {
+      if (!re.test(line)) continue;
+      const pkg = /node_modules\/((?:@[^/]+\/)?[^/]+)/.exec(module)?.[1];
+      if (pkg) thirdParty[`${name} @ ${pkg}`] = (thirdParty[`${name} @ ${pkg}`] ?? 0) + 1;
+      else ours.push(`${name} in ${module}: ${line.trim()}`);
+    }
+  }
+  assert.deepEqual(ours, []);
+  assert.deepEqual(thirdParty, THIRD_PARTY_PLATFORM_ACCESS);
 });

@@ -15,23 +15,30 @@ function failure(error: string, message: string): DidResolutionResult {
 export const didJwkResolver: DidResolver = {
   async resolve(did) {
     if (typeof did !== 'string' || !did.startsWith(PREFIX)) return failure('methodNotSupported', 'only did:jwk is supported');
-    let jwk: EcPublicJwk | null;
+    let raw: unknown;
     try {
-      jwk = normalizeEcPublicJwk(JSON.parse(utf8Decode(base64UrlDecode(did.slice(PREFIX.length)))));
+      raw = JSON.parse(utf8Decode(base64UrlDecode(did.slice(PREFIX.length))));
     } catch {
-      jwk = null;
+      return failure('invalidDid', 'not base64url JSON');
     }
-    if (!jwk) return failure('invalidDid', 'not an EC P-256 public JWK');
+    const jwk = normalizeEcPublicJwk(raw);
+    const use = (raw as { use?: unknown } | null)?.use;
+    if (!jwk || (use !== undefined && use !== 'sig' && use !== 'enc')) return failure('invalidDid', 'not an EC P-256 public JWK');
     const vm = `${did}#0`;
+    // did:jwk: "use": "enc" keys are offered for keyAgreement only, "use": "sig" keys never for it.
+    const relations = use === 'enc' ? { keyAgreement: [vm] } : {
+      authentication: [vm],
+      assertionMethod: [vm],
+      capabilityInvocation: [vm],
+      capabilityDelegation: [vm],
+      ...(use === undefined ? { keyAgreement: [vm] } : {}),
+    };
     return {
       didDocument: {
         '@context': ['https://www.w3.org/ns/did/v1', 'https://w3id.org/security/suites/jws-2020/v1'],
         id: did,
         verificationMethod: [{ id: vm, type: 'JsonWebKey2020', controller: did, publicKeyJwk: { ...jwk } }],
-        authentication: [vm],
-        assertionMethod: [vm],
-        capabilityInvocation: [vm],
-        capabilityDelegation: [vm],
+        ...relations,
       },
       didDocumentMetadata: {},
       didResolutionMetadata: { contentType: 'application/did+ld+json' },
@@ -49,21 +56,32 @@ export type DidKeyResult =
  * unusable key is KEY_NOT_FOUND.
  */
 export async function resolveDidVerificationKey(kid: unknown, resolver: DidResolver): Promise<DidKeyResult> {
-  if (typeof kid !== 'string' || !kid.includes('#')) return { ok: false, code: ErrorCodes.KEY_NOT_FOUND, detail: 'kid is not a DID URL with a fragment' };
+  try {
+    return await resolveKey(kid, resolver);
+  } catch {
+    return { ok: false, code: ErrorCodes.DID_RESOLUTION_FAILED, detail: 'unusable resolver output' };
+  }
+}
+
+async function resolveKey(kid: unknown, resolver: DidResolver): Promise<DidKeyResult> {
+  const notFound = (detail: string): DidKeyResult => ({ ok: false, code: ErrorCodes.KEY_NOT_FOUND, detail });
+  const failed = (detail: string): DidKeyResult => ({ ok: false, code: ErrorCodes.DID_RESOLUTION_FAILED, detail });
+  if (typeof kid !== 'string' || !kid.includes('#')) return notFound('kid is not a DID URL with a fragment');
   const did = kid.slice(0, kid.indexOf('#'));
   let result: DidResolutionResult;
   try {
     result = await resolver.resolve(did);
   } catch {
-    return { ok: false, code: ErrorCodes.DID_RESOLUTION_FAILED, detail: 'resolver failed' };
+    return failed('resolver failed');
   }
-  const doc = result.didDocument;
-  if (!doc || result.didResolutionMetadata.error || doc.id !== did) {
-    return { ok: false, code: ErrorCodes.DID_RESOLUTION_FAILED, detail: result.didResolutionMetadata.error ?? 'no DID document' };
+  const doc = result?.didDocument;
+  const meta = result?.didResolutionMetadata;
+  if (!doc || typeof doc !== 'object' || typeof meta !== 'object' || meta === null || meta.error !== undefined || doc.id !== did) {
+    return failed('no DID document for this DID');
   }
-  const asserted = (doc.assertionMethod ?? []).includes(kid);
-  const method = doc.verificationMethod?.find((m) => m.id === kid);
+  const asserted = Array.isArray(doc.assertionMethod) && doc.assertionMethod.includes(kid);
+  const method = Array.isArray(doc.verificationMethod) ? doc.verificationMethod.find((m) => m?.id === kid) : undefined;
   const jwk = asserted && method?.controller === did ? normalizeEcPublicJwk(method.publicKeyJwk) : null;
-  if (!jwk) return { ok: false, code: ErrorCodes.KEY_NOT_FOUND, detail: 'no EC P-256 assertionMethod key for kid' };
+  if (!jwk) return notFound('no EC P-256 assertionMethod key for kid');
   return { ok: true, publicJwk: jwk };
 }
