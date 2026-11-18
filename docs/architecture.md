@@ -95,30 +95,55 @@ later check is listed with `ok: false, code: 'SKIPPED', skipped: true`. From
 step 5 on, all checks run. A check that does not apply to the credential kind
 is not listed.
 
+```ts
+verifyCredential(compact: string, options: {
+  verifier: Verifier; hasher: Hasher; chainValidator: CertificateChainValidator;
+  trustRegistry: TrustRegistry; statusChecker: StatusChecker;
+  supportedVcts: string[]; now: Date;
+  presentation?: { nonce: string; audience: string };   // given = verifying a presentation
+}): Promise<{ ok: boolean; checks: Check[]; chainChecks?: Check[]; credential?: VerifiedCredential }>
+
+interface VerifiedCredential {          // only when steps 1–4 passed
+  vct: string; iss: string; fingerprint: string;
+  issuer: { maToChuc: string; ten: string } | null;   // null unless step 7 passed
+  iat: number; nbf?: number; exp?: number; status?: { idx: number; uri: string }; cnfJwk?: EcPublicJwk;
+  claims?: Record<string, unknown>;     // subject claims: visible + verified disclosures; only when step 9 passed or is not listed
+}
+```
+
 | # | `id` | What | Codes |
 |---|---|---|---|
-| 1 | `structure` | Compact form, `typ` = `dc+sd-jwt`, ≤ 16 384 bytes, ≤ 50 disclosures | `MALFORMED`, `TYP_INVALID`, `TOO_LARGE` |
+| 1 | `structure` | ≤ 16 384 bytes and ≤ 50 disclosures, checked before any decoding (`TOO_LARGE`). ASCII compact `<jwt>~<disclosure>~…~[<kb-jwt>]`; strict JWS; every disclosure is base64url of a JSON array; payload is a JSON object with string `iss` and `vct`, numeric `iat`, numeric `nbf` / `exp` and object `cnf` / `status` when present (shape only, nothing is trusted yet). Header `typ` is exactly `dc+sd-jwt`. Without `options.presentation` a KB-JWT is `MALFORMED`: a stored credential never has one | `MALFORMED`, `TYP_INVALID`, `TOO_LARGE` |
 | 2 | `algorithm` | Header `alg` is `ES256` | `ALG_NOT_ALLOWED` |
-| 3 | `certificate_chain` | `x5c` chain to a pinned root, profile `vc`; `iss` equals a SAN URI of the leaf | `CERT_CHAIN_MALFORMED`, `CERT_CHAIN_UNTRUSTED`, `CERT_NOT_YET_VALID`, `CERT_EXPIRED`, `CERT_CONSTRAINT_INVALID`, `CERT_KEY_NOT_ALLOWED`, `ISSUER_MISMATCH` |
+| 3 | `certificate_chain` | `CertificateChainValidator` (section 4) with profile `vc` and `expectedIssuerUri` = `iss`; the check carries the code of the failing chain step, and `chainChecks` lists the chain steps without details | `CERT_CHAIN_MALFORMED`, `CERT_CHAIN_UNTRUSTED`, `CERT_NOT_YET_VALID`, `CERT_EXPIRED`, `CERT_CONSTRAINT_INVALID`, `CERT_KEY_NOT_ALLOWED`, `ISSUER_MISMATCH` |
 | 4 | `signature` | Issuer signature with the leaf key | `SIGNATURE_INVALID` |
-| 5 | `validity_time` | `iat` not in the future, `nbf` ≤ now, `exp` > now, ±60 s | `NOT_YET_VALID`, `EXPIRED` |
-| 6 | `credential_type` | `vct` is in the caller's supported list | `VCT_UNSUPPORTED` |
-| 7 | `issuer_trust` | Leaf fingerprint is in the trust list with purpose `vc`, `organizationIdentifier` equals `maToChuc`, entry covers this `vct` (and `cong_doan` for product events) | `ISSUER_NOT_TRUSTED`, `TRUST_LIST_UNAVAILABLE` |
-| 8 | `status` | Status list entry is 0. Skipped (`SKIPPED`) when step 7 failed: no request is sent on behalf of an untrusted issuer | `REVOKED`, `SUSPENDED`, `STATUS_UNAVAILABLE` |
-| 9 | `holder_binding` | Presentations only: disclosures and KB-JWT (ADR-0008) | `DISCLOSURE_INVALID`, `KB_INVALID`, `NONCE_MISMATCH`, `AUD_MISMATCH` |
-| 10 | `product_chain` | Product events only: `prev` matches the previous credential, stage order | `CHAIN_BROKEN` |
+| 5 | `validity_time` | `iat` ≤ now + 60 s, `nbf` ≤ now + 60 s, `exp` > now − 60 s | `NOT_YET_VALID`, `EXPIRED` |
+| 6 | `credential_type` | `vct` is in `supportedVcts` | `VCT_UNSUPPORTED` |
+| 7 | `issuer_trust` | `trustRegistry.lookup(fingerprint, now)` returns an entry with `mucDich` `vc`, `maToChuc` equal to the leaf `organizationIdentifier`, `vct` containing the credential `vct`, and for product events `congDoan` containing the event's `cong_doan`. `TrustListUnavailableError` is `TRUST_LIST_UNAVAILABLE`; any other failure (null, mismatch, other exception) is `ISSUER_NOT_TRUSTED` | `ISSUER_NOT_TRUSTED`, `TRUST_LIST_UNAVAILABLE` |
+| 8 | `status` | Only when step 7 passed, otherwise `SKIPPED` and the `StatusChecker` is not called (no request on behalf of an untrusted issuer). Rules below, then the checker's answer: `valid` passes, `revoked` / `suspended` map to their codes, anything else or an exception is `STATUS_UNAVAILABLE` | `REVOKED`, `SUSPENDED`, `STATUS_UNAVAILABLE` |
+| 9 | `holder_binding` | Listed when the compact carries disclosures or `options.presentation` is given. Disclosures (ADR-0008 §6), any failure `DISCLOSURE_INVALID`: `_sd_alg` is `sha-256`; each disclosure is `[salt, name, value]` with string salt and name (array-element disclosures are refused); name not `_sd`, `...`, `_sd_alg` nor a metadata claim (`iss`, `vct`, `iat`, `nbf`, `exp`, `cnf`, `status`); no duplicate disclosure; digest referenced by the top-level `_sd`; no two disclosures with one name; no clash with a visible payload claim; no nested `_sd` or array-element digest anywhere. With `options.presentation`, the KB-JWT, any failure `KB_INVALID`: present; credential has a valid P-256 `cnf.jwk`; header `typ` `kb+jwt` and `alg` `ES256`; signature by `cnf.jwk`; `sd_hash` = base64url(SHA-256(`<jwt>~<disclosures>~`)) recomputed by the verifier; `iat` within [now − 300 s − 60 s, now + 60 s]. Then `nonce` (`NONCE_MISMATCH`), then `aud` (`AUD_MISMATCH`), so an unsigned KB-JWT never yields a mismatch | `DISCLOSURE_INVALID`, `KB_INVALID`, `NONCE_MISMATCH`, `AUD_MISMATCH` |
+| 10 | `product_chain` | Product events only: `prev` matches the previous credential, stage order (GĐ6b) | `CHAIN_BROKEN` |
 
 Other codes: `CLIENT_ID_MISMATCH`, `VERIFIER_NOT_TRUSTED` (wallet checking a
 presentation request), `DID_RESOLUTION_FAILED`, `KEY_NOT_FOUND` (`did:jwk`
 helper only; the credential path no longer resolves DIDs, ADR-0015), `SKIPPED`.
 
 All codes are exported as one `ErrorCodes` constant object; UI and logs branch
-on codes, never on messages.
+on codes, never on messages. Library error messages are never inspected:
+verification does not call `@sd-jwt/*` at all; the library is used to issue and
+to present only (ADR-0004, "Bổ sung 2026-11-19" point 3).
 
 Status rules enforced by the policy before the `StatusChecker` is called: the
-credential must carry `status.status_list.{uri, idx}`, and `uri` must be
-`https:` and start with `<iss>/status/` (ADR-0015 §11). Anything else is
-`STATUS_UNAVAILABLE` without a network call.
+credential must carry `status.status_list.{uri, idx}` with `idx` a non-negative
+integer, and `uri` must be `https:` and start with `<iss>/status/` (ADR-0015 §11).
+Anything else is `STATUS_UNAVAILABLE` without a network call.
+
+Issuance and presentation (programmer errors throw `TypeError`):
+`issueCredential` (generic), `issueDiploma`, `issueProductEvent`,
+`createPresentation`, and `decodeCredentialUnverified` (display only, verifies
+nothing). The issuer refuses a signer without `x5c` [leaf, issuing CA], an
+`iss` that is not a SAN URI of the leaf, a status `uri` outside `<iss>/status/`
+and any disclosable metadata claim, `iat` included.
 
 ## 4. X.509 (ADR-0015 §7, §14, §15)
 
@@ -161,14 +186,16 @@ value as an OpenID4VP `x509_hash`.
 - Diploma: `vct` `https://identra.awncorp.vn/vct/bang-tot-nghiep/v1`; always
   visible `iss`, `vct`, `iat`, `cnf.jwk`, `status`; seven subject claims
   (`ho_ten`, `ngay_sinh`, `ma_sinh_vien`, `nganh`, `hang_tot_nghiep`,
-  `nam_tot_nghiep`, `so_hieu_bang`), each its own top-level disclosure; `_sd`
-  padded with decoys to exactly 10 digests; no `exp`.
+  `nam_tot_nghiep`, `so_hieu_bang`), all non-empty strings, each its own
+  top-level disclosure; `_sd` padded with decoys to exactly 10 digests; 128-bit
+  salts from `RandomSource`; no `exp`.
 - Product lifecycle event: `vct`
   `https://identra.awncorp.vn/vct/su-kien-vong-doi/v1`; no disclosures, no
   `cnf`; claims `ma_san_pham` (GS1 element string `(01)<GTIN>(21)<serial>`),
   `cong_doan` (`san_xuat` | `kiem_dinh` | `phan_phoi`), `thoi_diem`,
   `dia_diem`, `mo_ta`, and `prev` = base64url(SHA-256(previous compact)) on
-  every event but the first; has `status`; no `exp`.
+  every event but the first; all strings of at most 500 characters; has
+  `status`; no `exp`.
 - Header of both: `{ alg: 'ES256', typ: 'dc+sd-jwt', x5c: [leaf, issuingCa] }`,
   no `kid`. `iss` = `https://api-identra.awncorp.vn/issuers/<name>`.
 - Metadata claims (`iss`, `vct`, `iat`, `nbf`, `exp`, `cnf`, `status`) are never
@@ -197,6 +224,12 @@ with no valid copy the answer is `unavailable` / `TrustListUnavailableError`.
 - Test PKI is generated by `scripts/pki/` (OpenSSL) into a git-ignored
   directory; private keys are never committed.
 - Every error code above has at least one test that provokes exactly that code.
+- `examples/gd2-e2e.mjs` (issue → store → present → verify, then a tampered
+  disclosure) runs as part of `npm test`.
+- A bundle test runs issue → present → verify from an esbuild
+  `--platform=neutral` bundle in a `node:vm` realm without `crypto`, `Buffer`,
+  `process` or `fetch`; beyond ECMAScript it needs only `TextEncoder` and
+  `TextDecoder` (the latter for `@sd-jwt/*`; React Native needs a polyfill).
 - Crypto adapters: RFC 7515 Appendix A.3 ES256 vector; sign → verify →
   one-byte tamper fails; `alg: none` and `HS256` rejected; high-S accepted;
   DER → r||s conversion.

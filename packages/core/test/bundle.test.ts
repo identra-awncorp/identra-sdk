@@ -9,6 +9,7 @@ import * as esbuild from 'esbuild';
 import { createCertificateChainValidator } from '@identra/sdk-core';
 import { nobleHasher, nobleVerifier } from './helpers/noble.js';
 import { b64, ca, leaf, NOW, x5c } from './helpers/pki.js';
+import { restrictedRealm } from './helpers/realm.js';
 
 const testDist = new URL('.', import.meta.url).pathname;
 const options: esbuild.BuildOptions = { bundle: true, platform: 'neutral', mainFields: ['module', 'main'], write: false, logLevel: 'silent' };
@@ -24,21 +25,6 @@ test('the core main entry bundles for a neutral platform without any Node built-
   await assert.rejects(esbuild.build({ ...options, stdin: { contents: "import 'node:crypto';", resolveDir: testDist } }));
 });
 
-// A realm with ECMAScript built-ins only, plus what React Native provides (with a TextDecoder polyfill).
-function restrictedRealm(): vm.Context {
-  const ctx = vm.createContext({});
-  // TextEncoder is defined inside the realm so that it returns this realm's Uint8Array, as on Hermes.
-  vm.runInContext(
-    `{ const u = unescape, e = encodeURIComponent, U8 = Uint8Array, S = String;
-      globalThis.TextEncoder = class TextEncoder {
-        get encoding() { return 'utf-8'; }
-        encode(s = '') { const b = u(e(S(s))); const o = new U8(b.length); for (let i = 0; i < b.length; i++) o[i] = b.charCodeAt(i); return o; }
-      }; }`,
-    ctx,
-  );
-  Object.assign(ctx, { TextDecoder, atob, btoa });
-  return ctx;
-}
 
 test('the bundle validates certificate chains in a realm without crypto, Buffer, process or fetch', async () => {
   const entry = `

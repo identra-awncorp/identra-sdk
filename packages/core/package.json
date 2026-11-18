@@ -20,6 +20,8 @@
     "dist"
   ],
   "dependencies": {
+    "@sd-jwt/core": "0.25.0",
+    "@sd-jwt/sd-jwt-vc": "0.25.0",
     "micro-key-producer": "0.10.2"
   }
 }
