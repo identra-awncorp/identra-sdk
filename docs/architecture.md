@@ -156,7 +156,11 @@ interface VerifiedCredential {          // only when steps 1–4 passed
 
 Other codes: `CLIENT_ID_MISMATCH`, `VERIFIER_NOT_TRUSTED` (wallet checking a
 presentation request), `DID_RESOLUTION_FAILED`, `KEY_NOT_FOUND` (`did:jwk`
-helper only; the credential path no longer resolves DIDs, ADR-0015), `SKIPPED`.
+helper only; the credential path no longer resolves DIDs, ADR-0015), `SKIPPED`,
+and the wallet operation codes of section 8 (`OFFER_INVALID`, `URL_NOT_ALLOWED`,
+`TX_CODE_WRONG`, `OFFER_EXPIRED`, `NETWORK_ERROR`, `ISSUER_ERROR`,
+`CREDENTIAL_INVALID`, `CNF_MISMATCH`, `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`,
+`CREDENTIAL_NOT_FOUND`).
 
 All codes are exported as one `ErrorCodes` constant object; UI and logs branch
 on codes, never on messages. Library error messages are never inspected:
@@ -327,6 +331,8 @@ empty.
   `--platform=neutral` bundle in a `node:vm` realm without `crypto`, `Buffer`,
   `process` or `fetch`; beyond ECMAScript it needs only `TextEncoder` and
   `TextDecoder` (the latter for `@sd-jwt/*`; React Native needs a polyfill).
+  The `sdk-app` bundle test also runs a whole issuance there (section 8) and
+  pins the web globals the wallet needs.
 - Crypto adapters: RFC 7515 Appendix A.3 ES256 vector; sign → verify →
   one-byte tamper fails; `alg: none` and `HS256` rejected; high-S accepted;
   DER → r||s conversion.
@@ -433,3 +439,173 @@ Known limitations:
   an older list still inside its 24 h, or a list of a replaced trust-list signer
   until that certificate expires, by an attacker who controls the connection
   (ADR-0019, "Giới hạn còn lại").
+
+## 8. Issuance: OpenID4VCI 1.0, pre-authorized code (GĐ5)
+
+ADR-0010; the HTTP routes are those of `identra-server/docs/vc-api.md` section 4.
+The `@openid4vc/*` libraries (0.10.0) are imported in one adapter per package
+(`sdk-server/src/issuance/library.ts`, `sdk-app/src/wallet/library.ts`); they
+build and parse (zod) the protocol messages, never decide.
+
+### Protocol state (`sdk-server`)
+
+```ts
+interface ProtocolStateStore {            // the server implements it on Redis
+  put(key, value: string, ttlSeconds): Promise<void>;     // SET EX
+  get(key): Promise<string | null>;
+  take(key): Promise<string | null>;                       // GETDEL: atomic get-and-delete
+  increment(key, ttlSeconds): Promise<number>;             // INCR, EXPIRE NX on a new key
+}
+createMemoryStateStore(clock)             // tests and development
+```
+
+Keys are `vci:<issuerUri>:<kind>:<id>`. Every single-use value is consumed with
+`take`, so of two concurrent requests at most one succeeds.
+
+| Kind | Value | TTL |
+|---|---|---|
+| `offer:<offerId>` | offer JSON, subject, configuration, PIN key and HMAC, expiry | 600 s; taken when the code is redeemed or destroyed |
+| `code:<pre-authorized code>` | offerId | 600 s; taken by the one successful token request |
+| `attempts:<offerId>` | PIN attempt counter | 600 s |
+| `status:<offerId>` | `pending` / `issued` / `destroyed`, subject, credentialId | 1800 s from creation |
+| `token:<jti>` | offerId, subject, configuration | 300 s; taken by the one credential request |
+| `nonce:<c_nonce>` | `1` | 300 s; taken by the proof that names it |
+
+### Issuer (`sdk-server`)
+
+```ts
+generateIssuerKeys(random): Promise<IssuerKeys>   // ES256 access-token key + ECDH P-256 request key, in memory
+createCredentialIssuer({
+  issuerUri, display: { vi, en }, signer /* vc: x5c, SAN = issuerUri */, allocateStatus,
+  hasher, verifier, random, clock, store, keys,
+  credentials: { 'bang-tot-nghiep-v1': { resolveClaims(subjectRef), onIssued(event) } },
+}): CredentialIssuer
+```
+
+| Operation | Route (vc-api.md §4) | Returns |
+|---|---|---|
+| `metadata()` | `GET /.well-known/openid-credential-issuer/issuers/:name` | `HttpResponse` |
+| `authorizationServerMetadata()` | `GET /.well-known/oauth-authorization-server/issuers/:name` | `HttpResponse` |
+| `jwks()` | `GET /issuers/:name/jwks` | `HttpResponse` (access-token key only) |
+| `createOffer({ subjectRef, configurationId })` | portal `POST /v1/demo/school/offers` | `{ offerId, offerUri, txCode, expiresAt }` |
+| `offer(offerId)` | `GET /issuers/:name/offers/:offerId` | `HttpResponse`, 404 when expired, used or unknown |
+| `offerStatus(offerId)` | portal `GET /v1/demo/school/offers/:offerId` | `{ status, subjectRef, credentialId? }` or null |
+| `token(request)` | `POST /issuers/:name/token` | `HttpResponse` |
+| `nonce()` | `POST /issuers/:name/nonce` | `HttpResponse` |
+| `credential(request)` | `POST /issuers/:name/credential` | `HttpResponse` |
+
+`HttpRequest` is `{ headers /* lower-case names */, body /* raw text */ }`,
+`HttpResponse` is `{ status, headers, body /* text */ }`, sent unchanged. Bad input
+never throws; it gets the OAuth error of the specification with a fixed
+description of ours. A failing dependency (state store, callback, signer) throws.
+
+- Metadata: issuer identifier with a path (well-known path insertion);
+  `nonce_endpoint`; `credential_request_encryption` (one ECDH-ES key with `kid`)
+  and `credential_response_encryption` (`ECDH-ES`; `A256GCM`, `A128GCM`), neither
+  required; pre-authorized grant with anonymous access; display names in
+  Vietnamese and English; the seven diploma claims with labels
+  (`CREDENTIAL_CONFIGURATIONS`).
+- Offer: by reference, `openid-credential-offer://?credential_offer_uri=<issuerUri>/offers/<offerId>`;
+  offerId 128 bits, pre-authorized code 256 bits; 10 minutes. `tx_code` is 6
+  digits, drawn without modulo bias (32-bit draws at or above 4 294 000 000 are
+  drawn again), returned once, stored only as HMAC-SHA-256 under a per-offer
+  256-bit key and compared with `timingSafeEqual`. Status readable 30 minutes.
+- Token: form-encoded, no repeated parameter, `grant_type` pre-authorized code
+  (`unsupported_grant_type`), code and `tx_code` present (`invalid_request`).
+  Unknown, expired, used code or wrong PIN: `invalid_grant`, identical. Each
+  attempt is counted (`increment`) before the comparison; attempt 6 and later
+  are refused unseen, a wrong 5th attempt destroys the offer. The code is then
+  `take`n: of concurrent requests with the right PIN exactly one gets a token.
+  Access token: JWS `typ: at+jwt`, `kid`, `iss` = `aud` = issuerUri, `iat`, `exp`
+  (300 s), random `jti`; one credential per token.
+- Nonce: 128-bit `c_nonce`, 300 s, single use, `Cache-Control: no-store`.
+- Credential, in this order: access token (`Bearer`, signature by the in-memory
+  key, `typ`, `kid`, `iss`, `aud`, `exp`, record present; else `401 invalid_token`
+  with `WWW-Authenticate`); body ≤ 64 KB; the library parses and, for
+  `application/jwt`, decrypts (jose, `ECDH-ES`, `A128GCM`/`A256GCM`, the
+  advertised `kid` only); `credential_configuration_id` = the token's; response
+  encryption, when asked, needs an encrypted request, a valid P-256 public `jwk`
+  with `alg: ECDH-ES` and `A256GCM`/`A128GCM` (`invalid_encryption_parameters`);
+  exactly one `jwt` proof (`invalid_proof`); the proof (below); its `c_nonce`
+  taken (`invalid_nonce`); the token taken (`invalid_token`). A failure up to
+  here spends nothing but a taken nonce.
+- Proof (`proof.ts`, our own code on `decodeJws` / `verifyJws`): ≤ 4 KB; `typ`
+  `openid4vci-proof+jwt`; `alg` ES256; header `jwk` a valid on-curve P-256 public
+  key with no private member and no `kid` / `x5c` / `x5u` / `jku` /
+  `trust_chain` / `key_attestation`; signature by that key; `aud` = issuerUri (a
+  string); `iat` within [now − 360 s, now + 60 s]; non-empty `nonce`.
+- Order of effects after the token is taken: `resolveClaims` (null:
+  `credential_request_denied`, nothing allocated) → `allocateStatus` →
+  `issueDiploma` (`iss` = issuerUri, `cnf.jwk` = the proof key) → the response
+  is built (and encrypted) → `onIssued({ offerId, subjectRef, statusUri,
+  statusIdx, cnfThumbprint, issuedAt })` → offer status `issued` (a failure here
+  is ignored: the credential exists and is recorded) → response. Anything that
+  throws before `onIssued` returns leaves no record; the offer is not marked
+  issued; an allocated status index stays reserved (never reused, never set);
+  the token is spent, so the user scans a new offer.
+- Restart: the access-token key and the request-encryption key are generated at
+  start; a restart invalidates outstanding tokens (≤ 300 s) and the encryption
+  key a wallet read just before.
+
+### Wallet (`sdk-app`)
+
+```ts
+createWallet({ keyStore, vault, fetch, random, clock, trustedRoots, trustListUrl,
+               supportedVcts? /* [diploma] */, seen?, verifier? /* noble */, hasher? /* noble */ })
+wallet.offers.resolve(qrText) → { ok: true, offer: ResolvedOffer } | WalletFailure
+wallet.offers.accept(offer, { txCode }) → { ok: true, credentialId, vct, issuerName } | WalletFailure
+wallet.credentials.list() → CredentialSummary[]            // metadata only, no decryption
+wallet.credentials.get(id) → { ok: true, credential: CredentialDetails } | WalletFailure
+wallet.credentials.refreshStatus(id) → { ok: true, status, checks } | WalletFailure
+wallet.credentials.remove(id) → { ok: true } | WalletFailure   // row and key
+// WalletFailure = { ok: false, code: WalletErrorCode, checks? }
+```
+
+`createWallet` builds the chain validator, the trust registry and the status
+checker once. Network: every request goes through `guardFetch` (one wrapper):
+https only, no userinfo, an allow-list, 10 s timeout (enforced with a timer and
+passed down as `timeoutMs`), a 3xx is refused (never followed), response size
+capped (64 KB for protocol messages, 256 KB for the lists; `Content-Length`
+first, then the text read). Protocol requests of an offer may reach only the
+origin of its `credential_offer_uri`; list requests only the configured trust
+list URL and URLs ending in `/status/<n>` (which the credential policy has
+already reduced to `<iss>/status/<n>`).
+
+- `resolve`: the QR text must be exactly `openid-credential-offer://?credential_offer_uri=<https URL>`
+  (`OFFER_INVALID`; non-https `URL_NOT_ALLOWED`); offer 404 → `OFFER_EXPIRED`;
+  `credential_issuer`, credential, nonce, token endpoints and authorization
+  servers on the offer's origin (`URL_NOT_ALLOWED`); OpenID4VCI 1.0 metadata,
+  one configuration, pre-authorized grant, request and response encryption with
+  ECDH-ES, `dc+sd-jwt`, a supported `vct`, `jwt` proofs with ES256, `jwk`
+  binding (`OFFER_INVALID`). No key is created and nothing is stored.
+- `accept`: token with the PIN (`invalid_grant`: the offer is fetched again; still
+  there → `TX_CODE_WRONG`, retryable on the same resolved offer; gone →
+  `OFFER_EXPIRED`) → `c_nonce` → a NEW key from the key store (one per
+  credential) → proof → credential request asking for a response encrypted to an
+  ephemeral key from `RandomSource` (the library encrypts the request to the
+  issuer and refuses a plain response) → exactly one credential string
+  (`ISSUER_ERROR`) → `verifyStoredCredential` passes completely
+  (`CREDENTIAL_INVALID` with `checks`) → `iss` = the offer's issuer
+  (`ISSUER_MISMATCH`) → `vct` = the configuration's → `cnf.jwk` thumbprint = the
+  new key's (`CNF_MISMATCH`) → every claim of the type (`REQUIRED_CLAIMS`) is a
+  disclosed non-empty string (`CLAIMS_INCOMPLETE`) → `vault.save` and status
+  `valid` (`STORAGE_ERROR`). Any failure after the key was created deletes the
+  key; nothing is half saved.
+- `refreshStatus` re-runs `verifyStoredCredential`: `valid`, `revoked`,
+  `suspended`, else `unavailable` (status or trust list could not be checked, or
+  another check failed; ADR-0013 section 4); cached in the vault row.
+- Codes (`WalletErrorCodes`, entries of `ErrorCodes`): `OFFER_INVALID`,
+  `URL_NOT_ALLOWED`, `TX_CODE_WRONG`, `OFFER_EXPIRED`, `NETWORK_ERROR`,
+  `ISSUER_ERROR`, `CREDENTIAL_INVALID`, `ISSUER_MISMATCH`, `CNF_MISMATCH`,
+  `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`, `CREDENTIAL_NOT_FOUND`.
+
+Known limitations:
+
+- A redirect followed by the app's own fetch is invisible to `guardFetch`; the
+  app's `HttpFetch` must not follow redirects (React Native's fetch always does:
+  open point for the app).
+- Library schemas refuse some input before our checks: an unsigned proof JWT is
+  `invalid_credential_request`, an http URL in issuer metadata is `ISSUER_ERROR`.
+- Server-side key material (access-token key, request-encryption key, jose's
+  ephemeral keys and IVs) comes from WebCrypto, not from the injected
+  `RandomSource`; identifiers, codes, PINs, nonces and PIN keys do.

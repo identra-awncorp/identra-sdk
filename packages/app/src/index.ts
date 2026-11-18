@@ -1,4 +1,4 @@
-// Main entry of @identra/sdk-app: wallet crypto, JWE, keys, credential vault and backup catalogue.
+// Main entry of @identra/sdk-app: wallet crypto, JWE, keys, credential vault, backup catalogue and the wallet object.
 // Pure JavaScript on @noble/*; storage, randomness and the clock are injected.
 export { nobleVerifier, nobleHasher, createNobleSigner, generateSecretKey, createDerSigningAdapter } from './crypto/noble.js';
 export { encryptJwe, decryptJwe, JweError, MAX_JWE_LENGTH, type JweEnc, type JweHeader } from './jwe.js';
@@ -27,3 +27,9 @@ export {
   type Catalogue,
   type CatalogueItem,
 } from './catalogue.js';
+// The wallet object: OpenID4VCI issuance (GĐ5); OpenID4VP presentation comes in GĐ6.
+export { createWallet, type Wallet, type WalletConfig } from './wallet/wallet.js';
+export { WalletErrorCodes, type WalletErrorCode, type WalletFailure } from './wallet/errors.js';
+export { REQUIRED_CLAIMS, type AcceptResult, type DisplayEntry, type ResolvedOffer } from './wallet/issuance.js';
+export type { CredentialDetails, CredentialSummary } from './wallet/credentials.js';
+export { PROTOCOL_MAX_BYTES, PROTOCOL_TIMEOUT_MS } from './wallet/fetch.js';

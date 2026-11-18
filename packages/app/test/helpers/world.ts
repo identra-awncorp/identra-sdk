@@ -1,0 +1,205 @@
+// A demo-like world over REAL HTTP on 127.0.0.1: a tiny node:http server mounting the sdk-server
+// issuer at the paths of vc-api.md section 4 (each route is "parse HTTP -> call the SDK -> write
+// HTTP"), plus the trust list and the status lists of the same server, all signed with the test
+// PKI. Wallets reach it through createMappedFetch from the canonical origin.
+import http from 'node:http';
+import { readFileSync } from 'node:fs';
+import {
+  base64Decode, base64Encode, base64UrlEncode, createMappedFetch, VCT,
+  type DiplomaClaims, type EcPublicJwk, type HttpFetch, type Signer, type TrustListContent,
+} from '@identra/sdk-core';
+import { createWebCryptoSigner, generateWebCryptoKeyPair, webCryptoHasher, webCryptoRandom, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
+import {
+  createCredentialIssuer, createMemoryStateStore, createMemoryStatusListStorage, createStatusListService, createTrustListService, generateIssuerKeys,
+  type CredentialHandlers, type CredentialIssuer, type HttpResponse, type IssuedEvent, type IssuerKeyStore, type ProtocolStateStore,
+} from '@identra/sdk-server';
+import { createCredentialVault, createInMemoryCredentialRepository, createInMemorySecretStorage, createSoftwareKeyStore, createWallet, type CredentialRow, type WalletKeyStore } from '@identra/sdk-app';
+
+export const ORIGIN = 'https://api-identra.awncorp.vn';
+export const ISSUERS = `${ORIGIN}/issuers`;
+export const ISS = `${ISSUERS}/truong-mau`;
+export const TRUST_URL = `${ORIGIN}/trust-list`;
+/** Every certificate of the test PKI is valid at this instant. */
+export const NOW = new Date('2026-06-01T00:00:00Z');
+export const DIPLOMA: DiplomaClaims = {
+  ho_ten: 'Nguyễn Văn A', ngay_sinh: '2001-02-03', ma_sinh_vien: 'SV123456', nganh: 'Khoa học máy tính',
+  hang_tot_nghiep: 'Giỏi', nam_tot_nghiep: '2024', so_hieu_bang: 'B-0001',
+};
+
+const PKI = new URL('../../../../.pki/test/', import.meta.url);
+const pem = (path: string) => readFileSync(new URL(path, PKI), 'utf8');
+const der = (path: string) => base64Decode(/-----BEGIN CERTIFICATE-----([\s\S]+?)-----END/.exec(pem(path))![1]!.replace(/\s+/g, ''));
+export const rootDer = () => der('ca/root/ca.cert.pem');
+const fingerprint = async (d: Uint8Array) => base64UrlEncode(await webCryptoHasher.sha256(d));
+/** Signer of a test PKI leaf with its CA, e.g. leafSigner('vc') or leafSigner('evil-vc', 'evil-issuing'). */
+export const leafSigner = (name: string, ca = 'issuing') =>
+  createWebCryptoSigner({ privateKey: pem(`leaf/${name}.key.pem`), x5c: [base64Encode(der(`leaf/${name}.cert.pem`)), base64Encode(der(`ca/${ca}/ca.cert.pem`))] });
+
+export function fakeClock(start = NOW) {
+  let t = start.getTime();
+  return { now: () => new Date(t), advance: (seconds: number) => void (t += seconds * 1000) };
+}
+
+/** The test's HttpFetch on Node: never follows a redirect, honours timeoutMs. */
+export const nodeHttpFetch: HttpFetch = async (url, init) => {
+  const r = await fetch(url, {
+    method: init?.method ?? 'GET', redirect: 'manual', signal: AbortSignal.timeout(init?.timeoutMs ?? 10_000),
+    ...(init?.headers ? { headers: init.headers } : {}), ...(init?.body !== undefined ? { body: init.body } : {}),
+  });
+  return { status: r.status, headers: r.headers, text: () => r.text() };
+};
+
+export interface Request { method: string; path: string; headers: Record<string, string | undefined>; body: string }
+export type Handler = (req: Request) => Promise<HttpResponse>;
+
+/** Calls the handler of "METHOD /path" in `routes` (a trailing * matches one segment); 404 when there is none, 500 when it throws. */
+export async function dispatch(routes: Map<string, Handler>, req: Request): Promise<HttpResponse> {
+  const key = `${req.method} ${req.path}`;
+  const handler = routes.get(key) ?? routes.get(key.replace(/\/[^/]+$/, '/*'));
+  if (!handler) return { status: 404, headers: {}, body: '' };
+  return handler(req).catch(() => ({ status: 500, headers: {}, body: '{"error":"server_error"}' }));
+}
+
+/** One listener per test file, serving `routes`. */
+export async function startListener(port: number) {
+  const routes = new Map<string, Handler>();
+  const requests: string[] = [];
+  const log: { path: string; contentType: string | undefined; body: string; status: number; responseType: string | undefined }[] = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.setEncoding('utf8').on('data', (c: string) => (body += c)).on('end', async () => {
+      const path = (req.url ?? '/').split('?')[0]!;
+      requests.push(`${req.method} ${path}`);
+      const r = await dispatch(routes, { method: req.method!, path, headers: req.headers as Record<string, string | undefined>, body });
+      log.push({ path, contentType: req.headers['content-type'], body, status: r.status, responseType: r.headers['Content-Type'] });
+      res.writeHead(r.status, r.headers).end(r.body);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
+  return {
+    routes, requests, log,
+    localOrigin: `http://127.0.0.1:${port}`,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+/** The same routes without a socket, for a fetch that calls them in-process. */
+export function inProcessListener(): Listener {
+  return { routes: new Map(), requests: [], log: [], localOrigin: 'http://in-process.invalid', close: async () => {} };
+}
+export type Listener = Awaited<ReturnType<typeof startListener>>;
+
+/** The controller of vc-api.md section 4: HTTP in, SDK call, HTTP out. */
+export function mountIssuer(routes: Map<string, Handler>, name: string, issuer: CredentialIssuer) {
+  routes.set(`GET /.well-known/openid-credential-issuer/issuers/${name}`, async () => issuer.metadata());
+  routes.set(`GET /.well-known/oauth-authorization-server/issuers/${name}`, async () => issuer.authorizationServerMetadata());
+  routes.set(`GET /issuers/${name}/jwks`, async () => issuer.jwks());
+  routes.set(`GET /issuers/${name}/offers/*`, (req) => issuer.offer(req.path.split('/').pop()!));
+  routes.set(`POST /issuers/${name}/token`, (req) => issuer.token(req));
+  routes.set(`POST /issuers/${name}/nonce`, () => issuer.nonce());
+  routes.set(`POST /issuers/${name}/credential`, (req) => issuer.credential(req));
+}
+
+/** IssuerKeyStore over the test PKI: truong-mau `vc` and `status`, and the trust-list signer. */
+function testKeyStore(): IssuerKeyStore {
+  const signers = { vc: leafSigner('vc'), status: leafSigner('status') };
+  return {
+    async signer(organisation, purpose) {
+      if (organisation !== 'truong-mau' || purpose === 'request') throw new Error('no such key in the test key store');
+      return signers[purpose];
+    },
+    trustListSigner: () => createWebCryptoSigner({ privateKey: pem('leaf/trust-list.key.pem'), x5c: [base64Encode(der('leaf/trust-list.cert.pem'))] }),
+    trustedRoots: () => [rootDer()],
+  };
+}
+
+async function trustContent(): Promise<TrustListContent> {
+  return {
+    issuers: [{
+      ma_to_chuc: 'VATVN-0100000001', ten: 'Trường Mẫu (TEST)',
+      chung_thu: [{ sha256: await fingerprint(der('leaf/vc.cert.pem')), muc_dich: 'vc' }, { sha256: await fingerprint(der('leaf/status.cert.pem')), muc_dich: 'status' }],
+      vct: [VCT.diploma], validFrom: '2026-01-01T00:00:00Z', validUntil: '2029-01-01T00:00:00Z',
+    }],
+    verifiers: [{ ma_to_chuc: 'VATVN-0100000005', ten: 'Nhà Tuyển Dụng Mẫu (TEST)', chung_thu: [{ sha256: await fingerprint(der('leaf/request.cert.pem')), muc_dich: 'request' }] }],
+  };
+}
+
+/** WalletKeyStore on WebCrypto (non-extractable keys), to run the wallet on a second crypto backend. */
+function webCryptoKeyStore(secrets: Map<string, Signer>): WalletKeyStore {
+  return {
+    async create() {
+      const { privateKey, publicJwk } = await generateWebCryptoKeyPair();
+      const keyId = base64UrlEncode(webCryptoRandom.bytes(16));
+      secrets.set(keyId, await createWebCryptoSigner({ privateKey, publicJwk }));
+      return { keyId, publicJwk };
+    },
+    async signer(keyId) {
+      const s = secrets.get(keyId);
+      if (!s) throw new Error('KEY_NOT_FOUND');
+      return s;
+    },
+    async delete(keyId) {
+      secrets.delete(keyId);
+    },
+  };
+}
+
+export interface WorldOptions {
+  handlers?: Partial<CredentialHandlers>;
+  store?: (inner: ProtocolStateStore) => ProtocolStateStore;
+  issuerName?: string;
+}
+
+/** The issuer, its lists and its routes on `listener`; wallets are made with newWallet. */
+export async function createWorld(listener: Listener, o: WorldOptions = {}) {
+  listener.routes.clear();
+  listener.requests.length = 0;
+  const clock = fakeClock();
+  const keyStore = testKeyStore();
+  const statusStorage = createMemoryStatusListStorage();
+  const statusService = createStatusListService({ issuerUri: (n) => `${ISSUERS}/${n}`, keyStore, storage: statusStorage, random: webCryptoRandom, clock });
+  const content = await trustContent();
+  const trustList = createTrustListService({ source: () => content, keyStore, clock });
+  const store = (o.store ?? ((s) => s))(createMemoryStateStore(clock));
+  const keys = await generateIssuerKeys(webCryptoRandom);
+  const issued: IssuedEvent[] = [];
+  const name = o.issuerName ?? 'truong-mau';
+  const issuer = createCredentialIssuer({
+    issuerUri: `${ISSUERS}/${name}`, display: { vi: 'Trường Mẫu', en: 'Sample University' },
+    signer: await keyStore.signer('truong-mau', 'vc'), allocateStatus: () => statusService.allocate('truong-mau'),
+    hasher: webCryptoHasher, verifier: webCryptoVerifier, random: webCryptoRandom, clock, store, keys,
+    credentials: {
+      'bang-tot-nghiep-v1': {
+        resolveClaims: o.handlers?.resolveClaims ?? (async () => ({ ...DIPLOMA })),
+        onIssued: o.handlers?.onIssued ?? (async (e) => (issued.push(e), { credentialId: `cred-${issued.length}` })),
+      },
+    },
+  });
+  mountIssuer(listener.routes, name, issuer);
+  listener.routes.set('GET /trust-list', async () => ({ status: 200, headers: { 'Content-Type': 'application/jwt' }, body: await trustList.token() }));
+  listener.routes.set('GET /issuers/truong-mau/status/*', async (req) => {
+    const token = await statusService.token('truong-mau', Number(req.path.split('/').pop()));
+    return token ? { status: 200, headers: { 'Content-Type': 'application/statuslist+jwt' }, body: token } : { status: 404, headers: {}, body: '' };
+  });
+
+  function newWallet(backend: 'noble' | 'webcrypto' = 'noble', fetch: HttpFetch = createMappedFetch(nodeHttpFetch, { [ORIGIN]: listener.localOrigin })) {
+    const secrets = new Map<string, unknown>();
+    const rows = new Map<string, CredentialRow>();
+    const keyStore =
+      backend === 'noble'
+        ? createSoftwareKeyStore({ secrets: createInMemorySecretStorage(secrets as Map<string, string>), random: webCryptoRandom })
+        : webCryptoKeyStore(secrets as Map<string, Signer>);
+    const vault = createCredentialVault({ repository: createInMemoryCredentialRepository(rows), secrets: createInMemorySecretStorage(), random: webCryptoRandom, clock });
+    const wallet = createWallet({
+      keyStore,
+      vault,
+      fetch, random: webCryptoRandom, clock, trustedRoots: [rootDer()], trustListUrl: TRUST_URL,
+      ...(backend === 'webcrypto' ? { verifier: webCryptoVerifier, hasher: webCryptoHasher } : {}),
+    });
+    return { wallet, keyStore, vault, secrets, rows };
+  }
+
+  return { clock, issuer, keys, store, statusService, statusStorage, issued, newWallet, offer: () => issuer.createOffer({ subjectRef: 'sv001', configurationId: 'bang-tot-nghiep-v1' }) };
+}
+export type World = Awaited<ReturnType<typeof createWorld>>;
+export type { EcPublicJwk };
