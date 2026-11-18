@@ -1,6 +1,7 @@
 // React Native proxy check (ADR-0004 "Bổ sung 2026-11-19"): the sdk-app main entry bundles with
-// esbuild --platform=neutral and runs sign / verify, JWE, key store, vault, catalogue and a whole
-// OpenID4VCI issuance (wallet.offers.resolve + accept against an in-process fetch) inside a
+// esbuild --platform=neutral and runs sign / verify, JWE, key store, vault, catalogue, a whole
+// OpenID4VCI issuance (wallet.offers.resolve + accept) and an OpenID4VP presentation
+// (wallet.presentations.resolve + submit) against an in-process fetch inside a
 // node:vm realm holding only ECMAScript built-ins plus the web globals listed in WEB_GLOBALS: no
 // crypto object at all, no Buffer, process or fetch. This is a proxy, not Hermes on a phone.
 import assert from 'node:assert/strict';
@@ -13,7 +14,7 @@ import { CompactEncrypt, compactDecrypt, importJWK } from 'jose';
 import { createNobleSigner, generateSecretKey } from '@identra/sdk-app';
 import { base64Encode } from '@identra/sdk-core';
 import { countingRandom } from './helpers/random.js';
-import { createWorld, dispatch, inProcessListener, NOW, ORIGIN, rootDer, TRUST_URL } from './helpers/world.js';
+import { createWorld, inProcessFetch, inProcessListener, NOW, rootDer, TRUST_URL } from './helpers/world.js';
 
 const testDist = new URL('.', import.meta.url).pathname;
 const options: esbuild.BuildOptions = { bundle: true, platform: 'neutral', mainFields: ['module', 'main'], write: false, logLevel: 'silent' };
@@ -94,7 +95,7 @@ const ENTRY = `
     out.catalogue = app.serializeCatalogue(app.buildCatalogue(out.listed));
     return JSON.stringify(out);
   }
-  // A whole issuance, wallet side, with the default noble crypto; the issuer answers through hostFetch.
+  // A whole issuance and presentation, wallet side, with the default noble crypto; the issuer and the verifier answer through hostFetch.
   export async function issue(json, hostFetch) {
     const input = JSON.parse(json);
     const random = testRandom(input.seed);
@@ -108,23 +109,21 @@ const ENTRY = `
     if (!resolved.ok) return JSON.stringify({ resolved });
     const accepted = await wallet.offers.accept(resolved.offer, { txCode: input.txCode });
     const details = accepted.ok ? await wallet.credentials.get(accepted.credentialId) : null;
-    return JSON.stringify({ accepted, claims: details && details.ok ? details.credential.claims : null, rows: rows.size, keys: secrets.size });
+    // ... then presented to the verifier: claim set 2 (ho_ten, nganh).
+    const request = accepted.ok ? await wallet.presentations.resolve(input.verifierQr) : null;
+    const presented = request && request.ok ? await wallet.presentations.submit(request.request, { credentialId: accepted.credentialId, claimSetIndex: 1 }) : request;
+    return JSON.stringify({ accepted, claims: details && details.ok ? details.credential.claims : null, rows: rows.size, keys: secrets.size, verifier: request && request.ok ? request.request.verifier : null, presented });
   }`;
 
-/** An issuer world answering in-process, an offer, and the realm's input for issue(). */
+/** An issuer and verifier world answering in-process, an offer, a verification session, and the realm's input for issue(). */
 async function issuanceInput(seed: number) {
   const listener = inProcessListener();
   const world = await createWorld(listener);
+  const verifier = await world.newVerifier();
+  const session = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
   const { offerUri, txCode } = await world.offer();
-  const hostFetch = async (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string }) => {
-    assert.ok(url.startsWith(`${ORIGIN}/`), url);
-    const headers = Object.fromEntries(Object.entries(init?.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
-    const r = await dispatch(listener.routes, { method: init?.method ?? 'GET', path: url.slice(ORIGIN.length).split('?')[0]!, headers, body: init?.body ?? '' });
-    const rh = Object.fromEntries(Object.entries(r.headers).map(([k, v]) => [k.toLowerCase(), v]));
-    return { status: r.status, headers: { get: (n: string) => rh[n.toLowerCase()] ?? null }, text: async () => r.body };
-  };
-  const input = JSON.stringify({ seed, now: NOW.toISOString(), root: base64Encode(rootDer()), trustListUrl: TRUST_URL, offerUri, txCode });
-  return { input, hostFetch, world };
+  const input = JSON.stringify({ seed, now: NOW.toISOString(), root: base64Encode(rootDer()), trustListUrl: TRUST_URL, offerUri, txCode, verifierQr: session.qr });
+  return { input, hostFetch: inProcessFetch(listener), world, verifier, session };
 }
 
 test('the sdk-app main entry bundles for a neutral platform without any Node built-in', async () => {
@@ -187,6 +186,11 @@ test('the bundle runs in a realm without crypto, Buffer, process or fetch; the g
   assert.equal(issued.claims.ho_ten, 'Nguyễn Văn A');
   assert.deepEqual([issued.rows, issued.keys], [1, 1]);
   assert.equal(issuance.world.issued.length, 1);
+  assert.equal(issued.verifier.trusted, true);
+  assert.deepEqual(issued.presented, { ok: true });
+  const done = await issuance.verifier.session(issuance.session.id);
+  assert.equal(done?.status, 'verified');
+  assert.deepEqual(Object.keys(done!.result!.claims!), ['ho_ten', 'nganh']);
 
   assert.equal(got.rfcA3, true);
   assert.equal(got.signVerify, true);
@@ -231,7 +235,7 @@ test('the bundle runs in a realm without crypto, Buffer, process or fetch; the g
   assert.equal(freeIdentifiers.includes('fetch'), false);
 });
 
-test('every web global the realm provides is needed: without any one of them, loading or the issuance fails', async () => {
+test('every web global the realm provides is needed: without any one of them, loading, issuance or presentation fails', async () => {
   const built = await esbuild.build({ ...options, format: 'iife', globalName: 'IdentraBundle', stdin: { contents: ENTRY, resolveDir: testDist } });
   const code = built.outputFiles![0]!.text;
   const missing: string[] = [];
@@ -242,11 +246,12 @@ test('every web global the realm provides is needed: without any one of them, lo
     ctx['__hostFetch'] = issuance.hostFetch;
     const outcome = await (async () => {
       vm.runInContext(code, ctx);
-      return JSON.parse(await vm.runInContext(`IdentraBundle.issue(${JSON.stringify(issuance.input)}, __hostFetch)`, ctx)).accepted?.ok === true;
+      const out = JSON.parse(await vm.runInContext(`IdentraBundle.issue(${JSON.stringify(issuance.input)}, __hostFetch)`, ctx));
+      return out.accepted?.ok === true && out.presented?.ok === true;
     })().catch(() => false);
     if (!outcome) missing.push(name);
   }
-  console.log(`# globals the wallet needs (issuance fails without each): ${missing.join(', ')}`);
+  console.log(`# globals the wallet needs (issuance or presentation fails without each): ${missing.join(', ')}`);
   assert.deepEqual(missing, [...Object.keys(WEB_GLOBALS), 'TextEncoder']);
 });
 
@@ -280,7 +285,8 @@ test('with a counting crypto object present, the sdk-app operations never call g
   JSON.parse(await vm.runInContext(`IdentraBundle.run(${JSON.stringify(input)})`, ctx));
   const issuance = await issuanceInput(778);
   ctx['__hostFetch'] = issuance.hostFetch;
-  assert.equal(JSON.parse(await vm.runInContext(`IdentraBundle.issue(${JSON.stringify(issuance.input)}, __hostFetch)`, ctx)).accepted.ok, true);
-  console.log(`# getRandomValues calls: ${atLoad} at bundle load, ${calls - atLoad} during the sdk-app operations and an issuance`);
+  const out = JSON.parse(await vm.runInContext(`IdentraBundle.issue(${JSON.stringify(issuance.input)}, __hostFetch)`, ctx));
+  assert.deepEqual([out.accepted.ok, out.presented], [true, { ok: true }]);
+  console.log(`# getRandomValues calls: ${atLoad} at bundle load, ${calls - atLoad} during the sdk-app operations, an issuance and a presentation`);
   assert.equal(calls - atLoad, 0);
 });

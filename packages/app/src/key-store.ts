@@ -13,7 +13,10 @@ import { drawRandom } from './random.js';
  *
  * `get` must resolve null only when the item does not exist, and must reject when the storage is
  * unavailable (device locked, biometric prompt cancelled): a null is taken as "absent" and the
- * credential vault would then create a new data key.
+ * credential vault would then create a new data key. Reject with a SecretStorageError when the
+ * platform says why: `KEY_INVALIDATED` (the item can never be read again, e.g. Android after a
+ * biometric change), `CANCELLED` (the user dismissed the prompt), `LOCKED` (the device is locked);
+ * the key store passes that code on. Any other rejection is reported as it is.
  */
 export interface SecretStorage {
   get(key: string): Promise<string | null>;
@@ -39,18 +42,57 @@ export function createInMemorySecretStorage(map: Map<string, string> = new Map()
 export interface WalletKeyStore {
   /** A fresh key pair; `keyId` is what the credential row stores in `key_id`. */
   create(): Promise<{ keyId: string; publicJwk: EcPublicJwk }>;
-  /** Rejects with WalletKeyError 'KEY_NOT_FOUND' for an unknown keyId. */
+  /**
+   * Rejects with WalletKeyError: 'KEY_NOT_FOUND' for an unknown keyId, 'KEY_CORRUPT', or the code
+   * of a SecretStorageError ('KEY_INVALIDATED', 'CANCELLED', 'LOCKED').
+   */
   signer(keyId: string): Promise<Signer>;
   /** Idempotent. */
   delete(keyId: string): Promise<void>;
 }
 
+export type SecretStorageErrorCode = 'KEY_INVALIDATED' | 'CANCELLED' | 'LOCKED';
+const STORAGE_CODES: readonly string[] = ['KEY_INVALIDATED', 'CANCELLED', 'LOCKED'];
+
+/** What the app's SecretStorage adapter throws when the platform says why a read or write failed. */
+export class SecretStorageError extends Error {
+  readonly code: SecretStorageErrorCode;
+  constructor(code: SecretStorageErrorCode) {
+    super(`secret storage: ${code}`);
+    this.name = 'SecretStorageError';
+    this.code = code;
+  }
+}
+
+/** True for a SecretStorageError, also one from another copy of this package (checked by name and code). */
+export function isSecretStorageError(e: unknown): e is SecretStorageError {
+  return e instanceof Error && e.name === 'SecretStorageError' && STORAGE_CODES.includes((e as { code?: unknown }).code as string);
+}
+
+export type WalletKeyErrorCode = 'KEY_NOT_FOUND' | 'KEY_CORRUPT' | SecretStorageErrorCode;
+const KEY_MESSAGES: Record<WalletKeyErrorCode, string> = {
+  KEY_NOT_FOUND: 'wallet key not found',
+  KEY_CORRUPT: 'stored wallet key is corrupt',
+  KEY_INVALIDATED: 'wallet key was invalidated by the platform',
+  CANCELLED: 'the user cancelled the key prompt',
+  LOCKED: 'the device is locked',
+};
+
 export class WalletKeyError extends Error {
-  readonly code: 'KEY_NOT_FOUND' | 'KEY_CORRUPT';
-  constructor(code: 'KEY_NOT_FOUND' | 'KEY_CORRUPT') {
-    super(code === 'KEY_NOT_FOUND' ? 'wallet key not found' : 'stored wallet key is corrupt');
+  readonly code: WalletKeyErrorCode;
+  constructor(code: WalletKeyErrorCode) {
+    super(KEY_MESSAGES[code]);
     this.name = 'WalletKeyError';
     this.code = code;
+  }
+}
+
+/** A SecretStorageError becomes the WalletKeyError of its code; anything else is rethrown. */
+async function storageCall<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (e) {
+    throw isSecretStorageError(e) ? new WalletKeyError(e.code) : e;
   }
 }
 
@@ -75,7 +117,7 @@ export function createSoftwareKeyStore(options: { secrets: SecretStorage; random
       const secretKey = generateSecretKey(random);
       try {
         const publicJwk = uncompressedPointToJwk(P256.getPublicKey(secretKey, false));
-        await secrets.set(secretName(keyId), base64UrlEncode(secretKey));
+        await storageCall(() => secrets.set(secretName(keyId), base64UrlEncode(secretKey)));
         return { keyId, publicJwk };
       } finally {
         secretKey.fill(0);
@@ -84,7 +126,7 @@ export function createSoftwareKeyStore(options: { secrets: SecretStorage; random
 
     async signer(keyId) {
       if (typeof keyId !== 'string' || !KEY_ID.test(keyId)) throw new WalletKeyError('KEY_NOT_FOUND');
-      const stored = await secrets.get(secretName(keyId));
+      const stored = await storageCall(() => secrets.get(secretName(keyId)));
       if (stored === null) throw new WalletKeyError('KEY_NOT_FOUND');
       let secretKey: Uint8Array;
       try {

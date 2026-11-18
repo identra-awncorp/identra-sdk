@@ -93,9 +93,9 @@ export type Route = { status: number; body: string } | Error;
  * an Error answer and an unknown URL reject like an unreachable host. Every call is recorded.
  */
 export function scriptedFetch(routes: Record<string, Route | (() => Route | Promise<Route>)>) {
-  const calls: { url: string; timeoutMs: number | undefined }[] = [];
+  const calls: { url: string; timeoutMs: number | undefined; maxBytes?: number | undefined }[] = [];
   const fetch: HttpFetch = async (url, init) => {
-    calls.push({ url, timeoutMs: init?.timeoutMs });
+    calls.push({ url, timeoutMs: init?.timeoutMs, maxBytes: init?.maxBytes });
     const route = routes[url];
     if (route === undefined) throw new Error('host unreachable');
     const r = typeof route === 'function' ? await route() : route;

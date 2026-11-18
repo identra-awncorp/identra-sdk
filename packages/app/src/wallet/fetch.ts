@@ -17,6 +17,8 @@ export class WalletFetchError extends Error {
 }
 
 export const PROTOCOL_TIMEOUT_MS = 10_000;
+/** The size cap when neither the guard nor the call names one. */
+export const DEFAULT_MAX_BYTES = 262_144;
 /** Protocol responses (offer, metadata, token, nonce, credential); a credential is at most 16 KB. */
 export const PROTOCOL_MAX_BYTES = 65_536;
 
@@ -32,30 +34,36 @@ export function httpsOrigin(url: unknown): string | null {
   return u.protocol === 'https:' && u.username === '' && u.password === '' ? u.origin : null;
 }
 
-export function guardFetch(inner: HttpFetch, o: { allow(url: string, origin: string): boolean; maxBytes: number; timeoutMs: number }): HttpFetch {
+/**
+ * `o.maxBytes` and `o.timeoutMs` are ceilings: a call may ask for less (`init.maxBytes`,
+ * `init.timeoutMs`), never for more. Both are passed down to `inner`, which must enforce them too.
+ */
+export function guardFetch(inner: HttpFetch, o: { allow(url: string, origin: string): boolean; timeoutMs: number; maxBytes?: number }): HttpFetch {
+  const ceiling = o.maxBytes ?? DEFAULT_MAX_BYTES;
   return async (url, init) => {
     const origin = httpsOrigin(url);
     if (origin === null || !o.allow(url, origin)) throw new WalletFetchError('URL_NOT_ALLOWED', `refused to contact ${origin ?? 'a non-https URL'}`);
     const timeoutMs = Math.min(init?.timeoutMs ?? o.timeoutMs, o.timeoutMs);
+    const maxBytes = Math.min(init?.maxBytes ?? ceiling, ceiling);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new WalletFetchError('NETWORK_ERROR', `no answer from ${origin} within ${timeoutMs} ms`)), timeoutMs);
     });
     try {
       const response = await Promise.race([
-        inner(url, { ...init, timeoutMs }).catch((e: unknown) => {
+        inner(url, { ...init, timeoutMs, maxBytes }).catch((e: unknown) => {
           throw e instanceof WalletFetchError ? e : new WalletFetchError('NETWORK_ERROR', `${origin} is unreachable`);
         }),
         timeout,
       ]);
       if (response.status >= 300 && response.status < 400) throw new WalletFetchError('ISSUER_ERROR', `${origin} answered with a redirect`);
       const declared = Number(response.headers.get('content-length') ?? '0');
-      if (!(declared <= o.maxBytes)) throw new WalletFetchError('ISSUER_ERROR', `${origin} sent more than ${o.maxBytes} bytes`);
+      if (!(declared <= maxBytes)) throw new WalletFetchError('ISSUER_ERROR', `${origin} sent more than ${maxBytes} bytes`);
       const body = response.text().catch(() => {
         throw new WalletFetchError('NETWORK_ERROR', `${origin} broke off the response`);
       });
       const text = await Promise.race([body, timeout]);
-      if (text.length > o.maxBytes) throw new WalletFetchError('ISSUER_ERROR', `${origin} sent more than ${o.maxBytes} bytes`);
+      if (text.length > maxBytes) throw new WalletFetchError('ISSUER_ERROR', `${origin} sent more than ${maxBytes} bytes`);
       return { status: response.status, headers: response.headers, text: async () => text };
     } finally {
       clearTimeout(timer);

@@ -1,7 +1,7 @@
 // Backup catalogue (ADR-0009 section 5, ADR-0014 section 2).
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { buildCatalogue, diffCatalogue, MAX_CATALOGUE_LENGTH, parseCatalogue, serializeCatalogue, type CredentialRow } from '@identra/sdk-app';
+import { buildCatalogue, diffCatalogue, MAX_CATALOGUE_LENGTH, mergeCatalogue, parseCatalogue, serializeCatalogue, type CredentialRow } from '@identra/sdk-app';
 
 const DIPLOMA = 'https://identra.awncorp.vn/vct/bang-tot-nghiep/v1';
 const EVENT = 'https://identra.awncorp.vn/vct/su-kien-vong-doi/v1';
@@ -79,5 +79,29 @@ describe('catalogue', () => {
 
   test('build refuses rows without vct or issuer', () => {
     assert.throws(() => buildCatalogue([{ vct: '', issuer: SCHOOL }]), TypeError);
+  });
+});
+
+describe('mergeCatalogue', () => {
+  const OTHER = 'https://api-identra.awncorp.vn/issuers/truong-khac';
+  test('a restored phone receiving its first document keeps the rest of the list', () => {
+    const previous = buildCatalogue([row('a', DIPLOMA, SCHOOL), row('b', EVENT, FACTORY), row('c', DIPLOMA, OTHER)]);
+    const merged = mergeCatalogue(previous, [row('n', DIPLOMA, SCHOOL)]);
+    assert.deepEqual(merged, previous);
+    assert.deepEqual(diffCatalogue(merged, [row('n', DIPLOMA, SCHOOL)]).map((i) => i.issuer), [OTHER, FACTORY]);
+  });
+
+  test('held items are added; removed items go only when no longer held; order is deterministic', () => {
+    const previous = buildCatalogue([row('a', DIPLOMA, SCHOOL), row('b', EVENT, FACTORY)]);
+    const merged = mergeCatalogue(previous, [row('x', DIPLOMA, OTHER), row('y', DIPLOMA, SCHOOL)], [{ vct: EVENT, issuer: FACTORY }, { vct: DIPLOMA, issuer: SCHOOL }]);
+    assert.deepEqual(merged, buildCatalogue([row('1', DIPLOMA, OTHER), row('2', DIPLOMA, SCHOOL)]));
+    assert.deepEqual(mergeCatalogue(merged, [], []), merged);
+    assert.equal(serializeCatalogue(mergeCatalogue(previous, [row('y', DIPLOMA, SCHOOL)])), serializeCatalogue(mergeCatalogue(previous, [row('y', DIPLOMA, SCHOOL)])));
+  });
+
+  test('the caps of parseCatalogue apply', () => {
+    const many = Array.from({ length: 501 }, (_, i) => row(`r${i}`, DIPLOMA, `${SCHOOL}-${i}`));
+    assert.throws(() => mergeCatalogue({ version: 1, items: [] }, many), TypeError);
+    assert.throws(() => mergeCatalogue({ version: 1, items: [] }, [row('l', DIPLOMA, `https://x/${'a'.repeat(2048)}`)]), TypeError);
   });
 });

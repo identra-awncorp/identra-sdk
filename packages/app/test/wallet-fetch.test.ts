@@ -41,3 +41,14 @@ test('the timeout is enforced here and passed to the app fetch, capped by the gu
   const slowBody: HttpFetch = async () => ({ status: 200, headers: { get: () => null }, text: () => new Promise(() => {}) });
   assert.equal(await code(guarded(slowBody, 50)('https://a.example/x')), 'NETWORK_ERROR');
 });
+
+test('maxBytes: per call, capped by the guard, 256 KB by default, and passed to the app fetch', async () => {
+  const seen: (number | undefined)[] = [];
+  const recording = (body: string): HttpFetch => async (_u, init) => (seen.push(init?.maxBytes), { status: 200, headers: { get: () => null }, text: async () => body });
+  const open = (inner: HttpFetch, maxBytes?: number) => guardFetch(inner, { allow: () => true, timeoutMs: 1000, ...(maxBytes !== undefined ? { maxBytes } : {}) });
+  assert.equal(await code(open(recording('x'.repeat(262_145)))('https://a.example/x')), 'ISSUER_ERROR');
+  assert.equal(await code(open(recording('x'.repeat(262_144)))('https://a.example/x')), 'resolved');
+  assert.equal(await code(open(recording('12345'))('https://a.example/x', { maxBytes: 4 })), 'ISSUER_ERROR');
+  assert.equal(await code(open(recording('12345'), 4)('https://a.example/x', { maxBytes: 100 })), 'ISSUER_ERROR', 'a call cannot raise the ceiling');
+  assert.deepEqual(seen, [262_144, 262_144, 4, 4]);
+});

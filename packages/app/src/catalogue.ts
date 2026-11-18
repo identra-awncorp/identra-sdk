@@ -75,3 +75,19 @@ export function diffCatalogue(catalogue: Catalogue, currentRows: readonly Catalo
   const held = new Set(currentRows.map(itemKey));
   return catalogue.items.filter((i) => !held.has(itemKey(i)));
 }
+
+/**
+ * The catalogue to back up after the wallet's holdings changed: the previous items plus every item
+ * held now, minus the items in `removed` that are no longer held. On a restored phone the vault
+ * starts empty, so receiving the first document again must not drop the others still to request.
+ * Pure; sorted like buildCatalogue; throws TypeError past the limits parseCatalogue accepts.
+ */
+export function mergeCatalogue(previous: Catalogue, rowsNowHeld: readonly CatalogueItem[], removed: readonly CatalogueItem[] = []): Catalogue {
+  const held = new Set(rowsNowHeld.map(itemKey));
+  const dropped = new Set(removed.map(itemKey).filter((k) => !held.has(k)));
+  const merged = buildCatalogue([...previous.items.filter((i) => !dropped.has(itemKey(i))), ...rowsNowHeld]);
+  if (merged.items.length > MAX_ITEMS || merged.items.some((i) => !isField(i.vct) || !isField(i.issuer))) {
+    throw new TypeError(`a catalogue holds at most ${MAX_ITEMS} items of at most ${MAX_FIELD_LENGTH} characters per field`);
+  }
+  return merged;
+}

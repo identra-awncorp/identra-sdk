@@ -53,9 +53,9 @@ interface Verifier {
 interface Hasher { sha256(data: Uint8Array): Promise<Uint8Array> }
 interface RandomSource { bytes(n: number): Uint8Array }
 interface Clock { now(): Date }
-// Implementations MUST enforce timeoutMs (reject when it passes) and a response size limit:
-// sdk-core has no timer and reads text() whole.
-type HttpFetch = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number })
+// Implementations MUST enforce timeoutMs (reject when it passes) and maxBytes (default 262 144)
+// and MUST NOT follow redirects: sdk-core has no timer and reads text() whole.
+type HttpFetch = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number; maxBytes?: number })
   => Promise<{ status: number; headers: { get(name: string): string | null }; text(): Promise<string> }>;
 
 interface CertificateChainValidator {
@@ -565,8 +565,9 @@ wallet.credentials.remove(id) → { ok: true } | WalletFailure   // row and key
 checker once. Network: every request goes through `guardFetch` (one wrapper):
 https only, no userinfo, an allow-list, 10 s timeout (enforced with a timer and
 passed down as `timeoutMs`), a 3xx is refused (never followed), response size
-capped (64 KB for protocol messages, 256 KB for the lists; `Content-Length`
-first, then the text read). Protocol requests of an offer may reach only the
+capped (`maxBytes` per call, never above the guard's ceiling: 64 KB for protocol
+messages, 256 KB for the lists, which ask for their own token caps;
+`Content-Length` first, then the text read), both passed down to the app's fetch. Protocol requests of an offer may reach only the
 origin of its `credential_offer_uri`; list requests only the configured trust
 list URL and URLs ending in `/status/<n>` (which the credential policy has
 already reduced to `<iss>/status/<n>`).
@@ -592,12 +593,18 @@ already reduced to `<iss>/status/<n>`).
   `valid` (`STORAGE_ERROR`). Any failure after the key was created deletes the
   key; nothing is half saved.
 - `refreshStatus` re-runs `verifyStoredCredential`: `valid`, `revoked`,
-  `suspended`, else `unavailable` (status or trust list could not be checked, or
-  another check failed; ADR-0013 section 4); cached in the vault row.
+  `suspended`, else `unknown` (status or trust list could not be checked, or
+  another check failed; ADR-0013 section 4); cached in the vault row, where the
+  column value is `unavailable` (the wallet API says `unknown` only).
+- Key store: a `SecretStorageError` (`KEY_INVALIDATED`, `CANCELLED`, `LOCKED`)
+  thrown by the app's storage adapter becomes a `WalletKeyError` of that code and
+  then the wallet codes `KEY_INVALIDATED`, `USER_CANCELLED`, `DEVICE_LOCKED`;
+  `KEY_NOT_FOUND` stays itself; anything else is `STORAGE_ERROR`.
 - Codes (`WalletErrorCodes`, entries of `ErrorCodes`): `OFFER_INVALID`,
   `URL_NOT_ALLOWED`, `TX_CODE_WRONG`, `OFFER_EXPIRED`, `NETWORK_ERROR`,
   `ISSUER_ERROR`, `CREDENTIAL_INVALID`, `ISSUER_MISMATCH`, `CNF_MISMATCH`,
-  `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`, `CREDENTIAL_NOT_FOUND`.
+  `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`, `CREDENTIAL_NOT_FOUND`, plus the key and
+  presentation codes of section 9.
 
 Known limitations:
 
@@ -609,3 +616,126 @@ Known limitations:
 - Server-side key material (access-token key, request-encryption key, jose's
   ephemeral keys and IVs) comes from WebCrypto, not from the injected
   `RandomSource`; identifiers, codes, PINs, nonces and PIN keys do.
+
+## 9. Presentation: OpenID4VP 1.0, cross-device, `direct_post.jwt` (GĐ6)
+
+ADR-0011 (points 2, 3, 8 replaced by ADR-0015 sections 5 and 6), ADR-0008 sections
+4–6; the HTTP routes are those of `identra-server/docs/vc-api.md` section 6.
+Adapters: `sdk-server/src/presentation/library.ts` (`@openid4vc/openid4vp`,
+`dcql`, `jose`) and `sdk-app/src/wallet/library.ts`.
+
+### Verifier (`sdk-server`)
+
+```ts
+createPresentationVerifier({
+  apiOrigin,                    // https://api-identra.awncorp.vn
+  signer,                       // the `request` signer, x5c [leaf, issuing CA]
+  verification: { verifier, hasher, chainValidator, trustRegistry, statusChecker, supportedVcts },
+  random, clock, store,
+  scenarios: { 'ung-tuyen': { vct, claimSets: [[...], [...]], purpose: { vi, en } } },
+}): Promise<PresentationVerifier>
+// .clientId, .name
+// .createSession({ scenario }) → { id, requestId, qr, expiresAt, serverTime } | null (unknown scenario)
+// .requestObject(requestId) → HttpResponse   GET  /oid4vp/request/:requestId
+// .handleResponse(requestId, request) → HttpResponse   POST /oid4vp/response/:requestId
+// .session(id) → SessionResource | null      GET  /v1/verification/sessions/:id
+```
+
+- Construction validates the request chain (profile `request`) and looks its
+  fingerprint up in the trust list once: purpose `request` and the certificate's
+  organisation, or it throws. `client_id` = `x509_hash:<fingerprint>`; `name` =
+  the trust-list `ten`. The query of each scenario is built once (one `dc+sd-jwt`
+  credential query `credential` of `vct`, one claim per name, `claim_sets` in
+  order of preference, `credential_sets[0].purpose`) and validated by `dcql`; no
+  HTTP input reaches it.
+- Session: `id` and `requestId` independent 128-bit values; `nonce` and `state`
+  256 bits; 5 minutes; an ephemeral ECDH P-256 key whose private JWK lives only in
+  the state store (`key:<requestId>`, taken when the session is final). The
+  request object is signed once by `signJws` (`typ: oauth-authz-req+jwt`, `x5c`
+  from the signer): `response_type: vp_token`, `client_id`, `response_mode:
+  direct_post.jwt`, `response_uri`, `nonce`, `state`, `dcql_query`,
+  `client_metadata` (`jwks` with the session key, `alg: ECDH-ES`, `use: enc`, a
+  `kid`; `encrypted_response_enc_values_supported` `A256GCM`, `A128GCM`;
+  `vp_formats_supported`), `aud`, `iat`, `exp` (+300 s). QR:
+  `openid4vp://?client_id=<client_id>&request_uri=<apiOrigin>/oid4vp/request/<requestId>`.
+- `requestObject` serves the JWT until the session is final (then 404) and
+  marks the session `request_retrieved`.
+- `handleResponse`, in this order, anything wrong → `400 invalid_request` with a
+  fixed description and nothing changes: request known and unexpired; form-encoded
+  body ≤ 64 KB with exactly one parameter, `response`, holding a compact JWE (no
+  `vp_token`/`state` in the clear, no signed-only JWT: no downgrade); the session
+  key still there; the library decrypts (jose, ECDH-ES, A128GCM/A256GCM, that key
+  only), checks `state` and parses `vp_token`; then the open marker is `take`n:
+  exactly one response per session is processed, a concurrent or later one is
+  400 and cannot touch the result. Processing: exactly one presentation for the
+  one credential id (else a `structure` / `MALFORMED` result); `verifyPresentation`
+  with `audience` = client_id and the session `nonce`; then `query`: `dcql`
+  evaluates the VERIFIED claims against the query, the first satisfied claim set
+  wins (`QUERY_NOT_SATISFIED` otherwise). The stored result is `{ ok, checks:
+  [{ id, ok, code }], claims?, issuer?, verifiedAt }`: claims and issuer only when
+  ok, claims = the string claims of the satisfied claim set only; any other
+  disclosed claim is dropped, not stored and not a failure. Answer `200 {}`.
+- `session(id)`: `status` = `verified` / `failed` from the result, else `expired`
+  after 5 minutes, else `request_retrieved` / `pending`; `result` absent until
+  final; `verifier.name`; `expiresAt` with `serverTime`. Deleted 30 minutes after
+  creation, or after verification when that is later.
+
+State: `vp:<client_id>:session:<id>` (1800 s, rewritten at verification),
+`request:<requestId>`, `key:<requestId>`, `open:<requestId>` (300 s each),
+`retrieved:<id>` and `result:<id>` (1800 s).
+
+### Wallet (`sdk-app`)
+
+```ts
+wallet.presentations.resolve(qrText) → { ok: true, request: ResolvedPresentation } | WalletFailure
+// ResolvedPresentation = { clientId, verifier: { trusted: true, ten, maToChuc } | { trusted: false },
+//   warning?: 'VERIFIER_NOT_TRUSTED', purpose?, expiresAt,
+//   matches: [{ credentialId, vct, issuerName, claimSets: [{ index, claims: string[] }] }] }
+wallet.presentations.submit(request, { credentialId, claimSetIndex, allowUntrusted? }) → { ok: true } | WalletFailure
+wallet.presentations.decline(request) → { ok: true }      // local only, no network call
+```
+
+- QR: exactly `openid4vp://?client_id=x509_hash:<43 base64url>&request_uri=<https URL>`
+  and nothing else: no `request` by value, no `request_uri_method` (the library's
+  POST body is wrong in 0.10.0, so GET only; pinned by a test), no other client
+  identifier prefix (`REQUEST_INVALID`; non-https `URL_NOT_ALLOWED`).
+- The request object is fetched with GET from the QR's origin only (64 KB). The
+  library calls our check as its `verifyJws`; it decides, in order: `alg` ES256
+  (`ALG_NOT_ALLOWED`); `typ` `oauth-authz-req+jwt`; `x5c` chain with profile
+  `request` to the pinned root (`CERT_*`); signature (`SIGNATURE_INVALID`);
+  `x509_hash:<fingerprint>` = QR `client_id` = JWT `client_id`
+  (`CLIENT_ID_MISMATCH`); `response_mode` `direct_post.jwt`; `response_uri` https
+  on the QR's origin (`URL_NOT_ALLOWED`); `nonce` ≥ 16 characters; `exp` >
+  now − 60 s (`REQUEST_EXPIRED`), `iat` ≤ now + 60 s; exactly one ECDH-ES
+  encryption key, a valid on-curve P-256 public JWK; `A256GCM` (preferred) or
+  `A128GCM`; one `dc+sd-jwt` credential query whose claims are single top-level
+  names. Anything else is `REQUEST_INVALID`. The library then checks the
+  `x509_hash` itself (it demands a `getX509CertificateMetadata` callback that it
+  does not use for that prefix: a stub, pinned by a test). Time checks use the
+  injected clock.
+- Trust: the fingerprint in the trust list with purpose `request` and the
+  certificate's organisation → `verifier: { trusted: true, ten, maToChuc }`;
+  absent → `{ trusted: false }` and `warning: VERIFIER_NOT_TRUSTED` (red warning,
+  ADR-0011 point 3); no trust list → `TRUST_LIST_UNAVAILABLE` (fail closed).
+- Matching: `dcql` over the vault's credentials of the query's `vct` values (the
+  claims are the stored disclosures); per credential the satisfiable claim sets
+  in the verifier's order. No matching credential → `matches: []`. Nothing is
+  signed and no key is read in `resolve`.
+- `submit`: `allowUntrusted: true` required for an untrusted verifier
+  (`VERIFIER_NOT_TRUSTED`); request not expired on the wallet clock
+  (`REQUEST_EXPIRED`); `createPresentation` with exactly the chosen claim set's
+  names, KB-JWT `aud` = client_id, `nonce`, `iat` = now, signed by the
+  credential's own key (where the platform prompts: `USER_CANCELLED`,
+  `KEY_INVALIDATED`, `DEVICE_LOCKED`, `KEY_NOT_FOUND`, `STORAGE_ERROR`); JWE
+  (noble, ECDH-ES, the verifier's `kid`) of `{ vp_token: { <id>: [presentation] },
+  state }`; POST `response=<jwe>` form-encoded to `response_uri`; 200 → ok,
+  anything else `VERIFIER_ERROR`. No other network call: the credential's status
+  is not refreshed first. The verifier's verdict is not returned to the wallet
+  (cross-device: the website shows it).
+
+Known limitations:
+
+- DCQL `claims` with nested paths, `values`, several credential queries or
+  `credential_sets` options are refused by the wallet (`REQUEST_INVALID`); the
+  Identra scenarios use none.
+- `purpose` is the verifier's own text, shown as sent.

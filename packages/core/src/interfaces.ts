@@ -41,12 +41,13 @@ export interface Clock {
 }
 
 /**
- * Implementations MUST enforce `timeoutMs` (rejecting when it passes) and a response size limit of
- * their own: sdk-core has no timer and reads `text()` whole (ADR-0019, review F6).
+ * Implementations MUST enforce `timeoutMs` (rejecting when it passes) and `maxBytes` (rejecting a
+ * larger response body, default 262 144 bytes when absent) and MUST NOT follow redirects (a 3xx is
+ * returned as it is): sdk-core has no timer and reads `text()` whole (ADR-0019, review F6).
  */
 export type HttpFetch = (
   url: string,
-  init?: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number },
+  init?: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number; maxBytes?: number },
 ) => Promise<{ status: number; headers: { get(name: string): string | null }; text(): Promise<string> }>;
 
 export type CertificateProfile = 'vc' | 'status' | 'request' | 'trust-list';

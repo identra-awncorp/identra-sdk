@@ -217,3 +217,19 @@ describe('a malicious or failing issuer after the wallet key exists: exact code,
     assert.equal(world.issued.length, 0);
   });
 });
+
+describe('status vocabulary at the wallet boundary', () => {
+  test('a status that cannot be checked is `unknown` in the wallet API and `unavailable` in the vault row', async () => {
+    const world = await createWorld(listener);
+    const w = world.newWallet();
+    const { offer, txCode } = await resolvedOffer(world, w);
+    const accepted = await w.wallet.offers.accept(offer, { txCode });
+    assert.ok(accepted.ok);
+    listener.routes.delete('GET /issuers/truong-mau/status/*');
+    world.clock.advance(86_461); // past the held status list's exp
+    const refreshed = await w.wallet.credentials.refreshStatus(accepted.credentialId);
+    assert.deepEqual([refreshed.ok, refreshed.ok && refreshed.status], [true, 'unknown']);
+    assert.equal((await w.wallet.credentials.list())[0]!.status, 'unknown');
+    assert.equal([...w.rows.values()][0]!.status_cache, 'unavailable');
+  });
+});

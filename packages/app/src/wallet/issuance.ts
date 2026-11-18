@@ -5,7 +5,7 @@
 // the key was created deletes the key again, and nothing is saved.
 import { DIPLOMA_CLAIMS, jwkThumbprint, VCT, verifyStoredCredential, type EcPublicJwk, type HttpFetch } from '@identra/sdk-core';
 import { generateSecretKey, P256, uncompressedPointToJwk } from '../crypto/noble.js';
-import { Fail, WalletErrorCodes as C, type WalletFailure } from './errors.js';
+import { Fail, keyFailureCode, WalletErrorCodes as C, type WalletFailure } from './errors.js';
 import { guardFetch, httpsOrigin, PROTOCOL_MAX_BYTES, PROTOCOL_TIMEOUT_MS } from './fetch.js';
 import { createProof, failureOf, requestAccessToken, requestCredential, requestNonce, resolveMetadata, resolveOffer, type IssuerSession, type LibraryDeps } from './library.js';
 import type { WalletContext } from './context.js';
@@ -122,6 +122,13 @@ async function storage<T>(call: () => Promise<T>): Promise<T> {
     throw new Fail(C.STORAGE_ERROR);
   }
 }
+async function keyStoreCall<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (e) {
+    throw new Fail(keyFailureCode(e));
+  }
+}
 
 export function createIssuance(ctx: WalletContext) {
   /** Network access of one offer: its origin only. */
@@ -198,14 +205,14 @@ export function createIssuance(ctx: WalletContext) {
     let keyId: string;
     let publicJwk: EcPublicJwk;
     try {
-      ({ keyId, publicJwk } = await storage(() => ctx.keyStore.create()));
+      ({ keyId, publicJwk } = await keyStoreCall(() => ctx.keyStore.create()));
     } catch (e) {
       return failure(e);
     }
     let responseSecret: Uint8Array | undefined;
     try {
       responseSecret = generateSecretKey(ctx.random);
-      const signer = await storage(() => ctx.keyStore.signer(keyId));
+      const signer = await keyStoreCall(() => ctx.keyStore.signer(keyId));
       const proof = await library(() => createProof(state.session, { configurationId: state.configurationId, nonce, signer, now: ctx.clock.now() }, deps));
       const responseKey = { secretKey: responseSecret, publicJwk: uncompressedPointToJwk(P256.getPublicKey(responseSecret, false)) };
       const credentials = await library(() => requestCredential(state.session, { configurationId: state.configurationId, accessToken, proof, responseKey }, deps));

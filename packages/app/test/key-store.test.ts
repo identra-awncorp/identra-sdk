@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { base64UrlDecode, utf8Encode, type RandomSource } from '@identra/sdk-core';
 import { webCryptoVerifier } from '@identra/sdk-core/webcrypto';
-import { createInMemorySecretStorage, createNobleSigner, createSoftwareKeyStore, nobleVerifier, RandomSourceError, WalletKeyError, type SecretStorage } from '@identra/sdk-app';
+import { createInMemorySecretStorage, createNobleSigner, createSoftwareKeyStore, isSecretStorageError, nobleVerifier, RandomSourceError, SecretStorageError, WalletKeyError, type SecretStorage } from '@identra/sdk-app';
 import { constantRandom, countingRandom, seededRandom } from './helpers/random.js';
 
 function setup() {
@@ -114,5 +114,33 @@ describe('createSoftwareKeyStore', () => {
     };
     const store = createSoftwareKeyStore({ secrets: failing, random: countingRandom() });
     await assert.rejects(store.create(), /keychain unavailable/);
+  });
+});
+
+describe('platform storage refusals', () => {
+  test('a SecretStorageError from get or set becomes the WalletKeyError of its code; other errors pass unchanged', async () => {
+    for (const code of ['KEY_INVALIDATED', 'CANCELLED', 'LOCKED'] as const) {
+      const map = new Map<string, string>();
+      const inner = createInMemorySecretStorage(map);
+      let failing = false;
+      const secrets: SecretStorage = { ...inner, get: (k) => (failing ? Promise.reject(new SecretStorageError(code)) : inner.get(k)) };
+      const store = createSoftwareKeyStore({ secrets, random: seededRandom(7) });
+      const { keyId } = await store.create();
+      failing = true;
+      await assert.rejects(store.signer(keyId), (e) => e instanceof WalletKeyError && e.code === code);
+      const writing = createSoftwareKeyStore({ secrets: { ...inner, set: () => Promise.reject(new SecretStorageError(code)) }, random: seededRandom(8) });
+      await assert.rejects(writing.create(), (e) => e instanceof WalletKeyError && e.code === code);
+    }
+    const odd = new Error('keychain exploded');
+    const store = createSoftwareKeyStore({ secrets: { ...createInMemorySecretStorage(), get: () => Promise.reject(odd) }, random: seededRandom(9) });
+    await assert.rejects(store.signer('AAAAAAAAAAAAAAAAAAAAAA'), (e) => e === odd);
+  });
+
+  test('isSecretStorageError recognises the class and a copy from another bundle, nothing else', () => {
+    assert.equal(isSecretStorageError(new SecretStorageError('LOCKED')), true);
+    const copy = Object.assign(new Error('x'), { name: 'SecretStorageError', code: 'CANCELLED' });
+    assert.equal(isSecretStorageError(copy), true);
+    assert.equal(isSecretStorageError(Object.assign(new Error('x'), { name: 'SecretStorageError', code: 'OTHER' })), false);
+    assert.equal(isSecretStorageError({ name: 'SecretStorageError', code: 'LOCKED' }), false);
   });
 });

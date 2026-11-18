@@ -186,7 +186,7 @@ describe('registry cache', async () => {
     await w.registry.lookup(FP.vc);
     w.clock.advance(3599);
     await w.registry.lookup(FP.status);
-    assert.deepEqual(w.calls, [{ url: TRUST_URL, timeoutMs: 5000 }]);
+    assert.deepEqual(w.calls, [{ url: TRUST_URL, timeoutMs: 5000, maxBytes: 262_144 }]);
     assert.deepEqual(w.registry.current(), { iat: NOW_S, exp: NOW_S + 86_400, ttl: 3600, issuers: 2, verifiers: 1 });
     w.clock.advance(1);
     w.routes[TRUST_URL] = ok(await trustToken(undefined, w.clock.now()));

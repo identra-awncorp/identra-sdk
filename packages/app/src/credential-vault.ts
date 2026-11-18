@@ -9,7 +9,8 @@ import type { Clock, RandomSource } from '@identra/sdk-core';
 import type { SecretStorage, WalletKeyStore } from './key-store.js';
 import { drawRandom } from './random.js';
 
-export type CredentialStatus = 'valid' | 'revoked' | 'suspended' | 'unavailable';
+/** The `status_cache` column. `unavailable`: the status could not be checked (the wallet API calls it `unknown`). */
+export type StoredCredentialStatus = 'valid' | 'revoked' | 'suspended' | 'unavailable';
 
 /** One row of the `credentials` table, columns exactly as in ADR-0009 section 3. */
 export interface CredentialRow {
@@ -19,7 +20,7 @@ export interface CredentialRow {
   key_id: string;
   /** base64url(version 0x02 || 8-byte key-check value || 12-byte nonce || AES-256-GCM ciphertext || 16-byte tag) */
   ciphertext: string;
-  status_cache: CredentialStatus | null;
+  status_cache: StoredCredentialStatus | null;
   /** ISO 8601 */
   status_checked_at: string | null;
   /** ISO 8601 */
@@ -43,7 +44,7 @@ export interface CredentialRepository {
   insert(row: CredentialRow): Promise<void>;
   list(): Promise<CredentialRow[]>;
   get(id: string): Promise<CredentialRow | null>;
-  update(id: string, patch: { status_cache: CredentialStatus | null; status_checked_at: string | null }): Promise<void>;
+  update(id: string, patch: { status_cache: StoredCredentialStatus | null; status_checked_at: string | null }): Promise<void>;
   /** Idempotent. */
   delete(id: string): Promise<void>;
 }
@@ -108,6 +109,10 @@ export interface CredentialVault {
   save(input: { compact: string; vct: string; issuer: string; keyId: string }): Promise<string>;
   /** Metadata of every row; never decrypts, never reads the data key. */
   list(): Promise<CredentialMetadata[]>;
+  /** Metadata of one row, or null; never decrypts, never reads the data key. */
+  getMeta(id: string): Promise<CredentialMetadata | null>;
+  /** Whether a data key is stored. Reads the secret storage, never writes it. */
+  dataKeyState(): Promise<'present' | 'missing'>;
   /** The compact credential. Rejects with NOT_FOUND, DATA_KEY_MISSING, DATA_KEY_INVALID or UNDECRYPTABLE. */
   open(id: string): Promise<string>;
   /** Deletes the row only (idempotent) and leaves its wallet key behind; prefer removeWithKey. */
@@ -125,7 +130,7 @@ export interface CredentialVault {
    * has decided so with the user (ADR-0009 section 5); the next save creates a fresh data key.
    */
   resetForNewDevice(): Promise<void>;
-  setStatus(id: string, status: CredentialStatus, checkedAt: Date): Promise<void>;
+  setStatus(id: string, status: StoredCredentialStatus, checkedAt: Date): Promise<void>;
 }
 
 /** SecretStorage item holding base64url of the 32-byte data key. */
@@ -188,6 +193,16 @@ function openSealed(row: CredentialRow, sealed: Uint8Array, dataKey: Uint8Array)
     return null;
   }
 }
+
+const metadataOf = (r: CredentialRow): CredentialMetadata => ({
+  id: r.id,
+  vct: r.vct,
+  issuer: r.issuer,
+  key_id: r.key_id,
+  status_cache: r.status_cache,
+  status_checked_at: r.status_checked_at,
+  created_at: r.created_at,
+});
 
 function requireString(v: unknown, name: string): string {
   if (typeof v !== 'string' || v.length === 0) throw new TypeError(`${name} must be a non-empty string`);
@@ -279,15 +294,16 @@ export function createCredentialVault(options: { repository: CredentialRepositor
     },
 
     async list() {
-      return (await repository.list()).map((r) => ({
-        id: r.id,
-        vct: r.vct,
-        issuer: r.issuer,
-        key_id: r.key_id,
-        status_cache: r.status_cache,
-        status_checked_at: r.status_checked_at,
-        created_at: r.created_at,
-      }));
+      return (await repository.list()).map(metadataOf);
+    },
+
+    async getMeta(id) {
+      const row = await repository.get(id);
+      return row ? metadataOf(row) : null;
+    },
+
+    async dataKeyState() {
+      return (await secrets.get(DATA_KEY_NAME)) === null ? 'missing' : 'present';
     },
 
     async open(id) {

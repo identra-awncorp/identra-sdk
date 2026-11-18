@@ -1,6 +1,5 @@
 // createWallet: the object the app and the simulated wallet use (docs/architecture.md section 8).
-// It builds the chain validator, the trust registry and the status checker once; GĐ6 adds
-// `presentations` on the same context.
+// It builds the chain validator, the trust registry and the status checker once.
 import {
   createCertificateChainValidator, createSignedTrustListRegistry, createStatusListChecker, TRUST_LIST_TOKEN_MAX_BYTES, VCT,
   type Clock, type Hasher, type HttpFetch, type RandomSource, type SeenStore, type Verifier,
@@ -12,6 +11,7 @@ import type { WalletContext } from './context.js';
 import { createCredentials } from './credentials.js';
 import { guardFetch, httpsOrigin, PROTOCOL_TIMEOUT_MS } from './fetch.js';
 import { createIssuance, REQUIRED_CLAIMS } from './issuance.js';
+import { createPresentations } from './presentation.js';
 
 export interface WalletConfig {
   keyStore: WalletKeyStore;
@@ -47,7 +47,7 @@ export function createWallet(config: WalletConfig) {
   // The trust list and the status lists the credential policy names; nothing else.
   const listsFetch = guardFetch(fetch, {
     allow: (url) => url === trustListUrl || STATUS_LIST_URL.test(url),
-    maxBytes: TRUST_LIST_TOKEN_MAX_BYTES,
+    maxBytes: TRUST_LIST_TOKEN_MAX_BYTES, // the larger of the two lists; each call asks for its own cap
     timeoutMs: PROTOCOL_TIMEOUT_MS,
   });
   const chainValidator = createCertificateChainValidator({ trustedRoots, verifier, hasher });
@@ -58,6 +58,7 @@ export function createWallet(config: WalletConfig) {
   return {
     offers: createIssuance(ctx),
     credentials: createCredentials(ctx),
+    presentations: createPresentations(ctx),
   };
 }
 

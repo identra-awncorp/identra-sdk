@@ -15,29 +15,33 @@ wallet used in Node end-to-end tests. Pure JavaScript on `@noble/curves`, `@nobl
 - `createSoftwareKeyStore`: `WalletKeyStore`, one P-256 key per credential (ADR-0009).
 - `createCredentialVault`: credentials sealed with AES-256-GCM in a `credentials` table
   (`CREDENTIALS_TABLE_DDL`).
-- `buildCatalogue`, `serializeCatalogue`, `parseCatalogue`, `diffCatalogue`: the backup
-  catalogue (document type and issuer only).
+- `buildCatalogue`, `serializeCatalogue`, `parseCatalogue`, `diffCatalogue`, `mergeCatalogue`: the
+  backup catalogue (document type and issuer only).
 - `createWallet`: the wallet object (docs/architecture.md section 8). `wallet.offers.resolve` /
   `accept` receive a credential over OpenID4VCI 1.0 (pre-authorized code, PIN, encrypted request
   and response) and store it only after `verifyStoredCredential` passes, the issuer matches the
   offer and `cnf.jwk` is the new key; `wallet.credentials.list` / `get` / `refreshStatus` /
-  `remove`. Failures are `{ ok: false, code }` with a code of `WalletErrorCodes`.
+  `remove` (status `valid` / `revoked` / `suspended` / `unknown`);
+  `wallet.presentations.resolve` / `submit` / `decline` answer an OpenID4VP 1.0 request
+  (section 9). Failures are `{ ok: false, code }` with a code of `WalletErrorCodes`.
 
 ## What the app provides
 
 | Interface | React Native | Node / tests |
 |---|---|---|
-| `RandomSource` (`bytes(n)`) | `expo-crypto` `getRandomBytes` | `webCryptoRandom` from `@identra/sdk-core/webcrypto` |
+| `RandomSource` (`bytes(n)`) | `expo-crypto` `getRandomValues(new Uint8Array(n))` (not `getRandomBytes`, which can fall back to `Math.random` in development builds on the old bridge) | `webCryptoRandom` from `@identra/sdk-core/webcrypto` |
 | `SecretStorage` for wallet keys | `expo-secure-store`, `requireAuthentication: true`, a this-device-only keychain class | `createInMemorySecretStorage()` |
 | `SecretStorage` for the vault data key | `expo-secure-store` WITHOUT `requireAuthentication`, readable while the device is unlocked, this device only | `createInMemorySecretStorage()` |
 | `CredentialRepository` | `expo-sqlite`, table from `CREDENTIALS_TABLE_DDL` | `createInMemoryCredentialRepository()` |
 | `Clock` (`now()`) | `{ now: () => new Date() }` | a fixed clock |
-| `HttpFetch` for `createWallet` | `expo/fetch` (streams the body), `redirect: 'manual'`, honouring `timeoutMs` | global `fetch` with `redirect: 'manual'`, `createMappedFetch` for a local server |
+| `HttpFetch` for `createWallet` | `expo/fetch` with `redirect: 'manual'` (or `'error'`), honouring `timeoutMs` and `maxBytes` | global `fetch` with `redirect: 'manual'`, `createMappedFetch` for a local server |
 
-The wallet wraps the app's fetch once (https only, the offer's origin only, 10 s timeout, no
-redirect, 64 KB for protocol messages and 256 KB for the trust list). It cannot see a redirect the
-app's fetch followed by itself, so that fetch must not follow redirects; React Native's built-in
-fetch always follows them, which is an open point for the app.
+Wrap `expo/fetch` on React Native, not the built-in fetch: the built-in one always follows
+redirects and has no body stream to stop a large response early; `expo/fetch` honours `redirect`
+and streams the body. The wallet wraps the app's fetch once (https only, the QR's origin only,
+10 s timeout, no redirect, `maxBytes` per call: 64 KB for protocol messages, the list caps for the
+trust list and status lists, 256 KB at most) and passes `timeoutMs` and `maxBytes` down; it cannot
+see a redirect the app's fetch followed by itself.
 
 The data key must not require biometrics: ADR-0009 section 3 asks only that it be readable while
 the device is unlocked, and on Android a biometric re-enrolment permanently invalidates a key
@@ -45,7 +49,13 @@ created with `requireAuthentication`, which would make every credential unreadab
 per-credential signing keys do require biometrics.
 
 `SecretStorage.get` must resolve `null` only when the item does not exist and should reject when
-the storage cannot be read (device locked, prompt cancelled). The vault no longer trusts a `null`
+the storage cannot be read (device locked, prompt cancelled). Reject with
+`new SecretStorageError('KEY_INVALIDATED' | 'CANCELLED' | 'LOCKED')` when the platform says why
+(Android key invalidated by a biometric change, prompt dismissed, device locked): the key store
+reports that code (`WalletKeyError`) and the wallet maps it to `KEY_INVALIDATED`, `USER_CANCELLED`
+or `DEVICE_LOCKED`; a hardware signer may reject `sign()` the same way.
+`vault.dataKeyState()` (never writes) and `vault.getMeta(id)` (no decryption) replace reading
+`DATA_KEY_NAME` or the repository directly. The vault no longer trusts a `null`
 blindly: only `save()` into an empty repository creates the data key; with rows present a missing
 key is `DATA_KEY_MISSING` and nothing is written. Use one vault per data-key storage (concurrent
 first saves are serialised per `SecretStorage` object).
@@ -54,7 +64,9 @@ The SQLite file must be excluded from the phone backup; the serialized catalogue
 that is backed up (ADR-0009 section 5). On a restored phone the rows come back without the data
 key: the vault reports `DATA_KEY_MISSING`; once the app has decided with the user that this is a
 new device, call `resetForNewDevice()`, then `diffCatalogue` to list the documents to request
-again. `purgeUndecryptable()` deletes only rows sealed under a different data key and returns the
+again. Back up `mergeCatalogue(previous, vault.list(), removed)` after every change, not
+`buildCatalogue(vault.list())`: on a restored phone the first document received again must not
+drop the others still to request. `purgeUndecryptable()` deletes only rows sealed under a different data key and returns the
 rows that fail for any other reason, which it keeps.
 
 `remove()` deletes the row and leaves its wallet key in secure storage; prefer
@@ -62,14 +74,15 @@ rows that fail for any other reason, which it keeps.
 
 ## Globals React Native must provide
 
-Measured by `test/bundle.test.ts`, which runs a whole issuance (`offers.resolve` + `accept`) from
-an esbuild `--platform=neutral` bundle in a `node:vm` realm with no `crypto`, `Buffer`, `process`
-or `fetch`, and checks that the issuance fails without each of these:
+Measured by `test/bundle.test.ts`, which runs a whole issuance (`offers.resolve` + `accept`) and a
+presentation (`presentations.resolve` + `submit`) from an esbuild `--platform=neutral` bundle in a
+`node:vm` realm with no `crypto`, `Buffer`, `process` or `fetch`, and checks that the flow fails
+without each of these:
 
 | Global | Needed by |
 |---|---|
 | `TextEncoder`, `TextDecoder` | `@sd-jwt/*`, the OpenID4VC libraries (Hermes in RN 0.85 has no `TextDecoder`: polyfill) |
-| `atob` | zod inside the OpenID4VC libraries (base64 checks) |
+| `atob` | zod inside the OpenID4VC libraries (base64 checks, e.g. the request object's `x5c`) |
 | `URL`, `URLSearchParams` | the OpenID4VC libraries (read at load: the bundle does not load without `URL`), the wallet's origin checks |
 | `Headers`, `Response` | the fetch layer of the OpenID4VC libraries |
 | `setTimeout`, `clearTimeout` | the wallet's request timeout |
@@ -77,8 +90,9 @@ or `fetch`, and checks that the issuance fails without each of these:
 React Native's own `URL` is incomplete; install a full polyfill (e.g. `react-native-url-polyfill`)
 and check `new URL(u).origin` on the device. `globalThis.crypto` is referenced (noble's default RNG
 and the libraries' defaults) but never read or called: every random byte comes from the injected
-`RandomSource`. Minified size of the main entry: about 860 KB (sdk-app 26 KB, `@noble/*` 50 KB,
-`@openid4vc/*` 84 KB, zod 454 KB, the rest sdk-core and its dependencies).
+`RandomSource`. Minified size of the main entry: about 990 KB (sdk-app 35 KB, `@noble/*` 50 KB,
+`@openid4vc/*` 126 KB, zod 454 KB, the rest sdk-core, `dcql` and their dependencies).
+`AbortSignal` is referenced by `@openid4vc/openid4vp` but not needed by the wallet's flows.
 
 ## Randomness
 

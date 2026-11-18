@@ -55,6 +55,15 @@ export const ErrorCodes = Object.freeze({
   CLAIMS_INCOMPLETE: 'CLAIMS_INCOMPLETE',
   STORAGE_ERROR: 'STORAGE_ERROR',
   CREDENTIAL_NOT_FOUND: 'CREDENTIAL_NOT_FOUND',
+  // presentation (docs/architecture.md section 9); CLIENT_ID_MISMATCH, VERIFIER_NOT_TRUSTED, CERT_*,
+  // SIGNATURE_INVALID, ALG_NOT_ALLOWED and TRUST_LIST_UNAVAILABLE above are reused
+  QUERY_NOT_SATISFIED: 'QUERY_NOT_SATISFIED',
+  REQUEST_INVALID: 'REQUEST_INVALID',
+  REQUEST_EXPIRED: 'REQUEST_EXPIRED',
+  VERIFIER_ERROR: 'VERIFIER_ERROR',
+  KEY_INVALIDATED: 'KEY_INVALIDATED',
+  USER_CANCELLED: 'USER_CANCELLED',
+  DEVICE_LOCKED: 'DEVICE_LOCKED',
 } as const);
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -71,6 +80,7 @@ export type CheckId =
   | 'status'
   | 'holder_binding'
   | 'product_chain'
+  | 'query'
   | 'chain_format'
   | 'chain_signatures'
   | 'chain_validity'

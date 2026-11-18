@@ -345,3 +345,24 @@ describe('createCredentialVault', () => {
     assert.deepEqual(columns, ['id', 'vct', 'issuer', 'key_id', 'ciphertext', 'status_cache', 'status_checked_at', 'created_at']);
   });
 });
+
+describe('metadata without decryption', () => {
+  test('dataKeyState never writes; getMeta reads one row without the data key', async () => {
+    const map = new Map<string, string>();
+    const writes: string[] = [];
+    const inner = createInMemorySecretStorage(map);
+    const secrets: SecretStorage = { ...inner, set: (k, v) => (writes.push(k), inner.set(k, v)) };
+    const rows = new Map<string, CredentialRow>();
+    const vault = createCredentialVault({ repository: createInMemoryCredentialRepository(rows), secrets, random: countingRandom(), clock: { now: () => new Date('2026-06-01T00:00:00Z') } });
+    assert.equal(await vault.dataKeyState(), 'missing');
+    assert.deepEqual(writes, []);
+    const id = await vault.save({ compact: 'a.b.c~', vct: 'https://v.example', issuer: 'https://i.example', keyId: 'k1' });
+    assert.equal(await vault.dataKeyState(), 'present');
+    map.delete(DATA_KEY_NAME);
+    const meta = await vault.getMeta(id);
+    assert.deepEqual(meta, { id, vct: 'https://v.example', issuer: 'https://i.example', key_id: 'k1', status_cache: null, status_checked_at: null, created_at: '2026-06-01T00:00:00.000Z' });
+    assert.equal('ciphertext' in meta!, false);
+    assert.equal(await vault.getMeta('missing'), null);
+    assert.equal(await vault.dataKeyState(), 'missing');
+  });
+});

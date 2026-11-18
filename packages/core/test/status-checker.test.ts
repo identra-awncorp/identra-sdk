@@ -38,7 +38,7 @@ describe('answers', () => {
   test('valid, revoked, suspended; one fetch with the 5 s timeout', async () => {
     const w = world({ [URI]: ok(await token({ 42: 1, 43: 2 })) });
     assert.deepEqual([await w.check(41), await w.check(42), await w.check(43)], ['valid', 'revoked', 'suspended']);
-    assert.deepEqual(w.calls, [{ url: URI, timeoutMs: 5000 }]);
+    assert.deepEqual(w.calls, [{ url: URI, timeoutMs: 5000, maxBytes: 131_072 }]);
   });
   test('refused before any fetch: non-https uri, idx out of range, no issuer organisation', async () => {
     const w = world({ [URI]: ok(await token()) });

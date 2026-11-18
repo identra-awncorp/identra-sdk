@@ -1,5 +1,5 @@
 // @identra/sdk-server (Node only): key store, status and trust lists, the OpenID4VCI issuer.
-// The OpenID4VP verifier comes in GĐ6.
+// The OpenID4VP verifier (GĐ6).
 export { createFileKeyStore, type IssuerKeyStore, type OrganisationPurpose } from './key-store.js';
 export {
   createMemoryStatusListStorage,
@@ -7,7 +7,7 @@ export {
   StatusIndexNotAllocatedError,
   StatusListFullError,
   StatusRevokedError,
-  type CredentialStatus,
+  type StatusListValue,
   type StatusListService,
   type StatusListStorage,
   type StoredStatusList,
@@ -31,3 +31,14 @@ export {
 } from './issuance/issuer.js';
 export { ACCESS_TOKEN_SECONDS } from './issuance/access-token.js';
 export { PROOF_TYP } from './issuance/proof.js';
+export {
+  createPresentationVerifier,
+  SESSION_KEEP_SECONDS,
+  SESSION_SECONDS,
+  type PresentationVerifier,
+  type PresentationVerifierConfig,
+  type SessionResource,
+  type SessionResult,
+  type SessionStatus,
+} from './presentation/verifier.js';
+export type { Scenario } from './presentation/library.js';

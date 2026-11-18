@@ -8,7 +8,7 @@ import {
 } from '@identra/sdk-core';
 import type { IssuerKeyStore } from './key-store.js';
 
-export type CredentialStatus = keyof typeof STATUS_VALUE;
+export type StatusListValue = keyof typeof STATUS_VALUE;
 
 export interface StoredStatusList {
   /** The raw 32 768-byte list. */
@@ -69,7 +69,7 @@ export class StatusListFullError extends Error {
 export interface StatusListService {
   /** A random unused index, already reserved in storage, of the issuer's current list (or the next one). */
   allocate(issuer: string): Promise<{ uri: string; idx: number }>;
-  setStatus(issuer: string, n: number, idx: number, status: CredentialStatus): Promise<void>;
+  setStatus(issuer: string, n: number, idx: number, status: StatusListValue): Promise<void>;
   /** The signed Status List Token served at uri(issuer, n); null when list n does not exist (HTTP 404). */
   token(issuer: string, n: number): Promise<string | null>;
   uri(issuer: string, n: number): string;

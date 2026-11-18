@@ -7,7 +7,7 @@ test('maps exact-origin prefixes only and passes init through', async () => {
   const seen: [string, unknown][] = [];
   const inner: HttpFetch = async (url, init) => (seen.push([url, init]), { status: 200, headers: { get: () => null }, text: async () => '' });
   const f = createMappedFetch(inner, { 'https://api-identra.awncorp.vn': 'http://127.0.0.1:47610' });
-  const init = { timeoutMs: 5000 };
+  const init = { timeoutMs: 5000, maxBytes: 4096 };
   const cases: [string, string][] = [
     ['https://api-identra.awncorp.vn/issuers/truong-mau/status/1', 'http://127.0.0.1:47610/issuers/truong-mau/status/1'],
     ['https://api-identra.awncorp.vn', 'http://127.0.0.1:47610'],

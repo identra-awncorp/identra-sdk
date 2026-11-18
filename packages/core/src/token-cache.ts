@@ -46,12 +46,12 @@ export interface TokenCache<T> {
 }
 
 /**
- * GET `url` (https only) with `timeoutMs: 5000`; the body when the answer is 200 and fits `maxBytes`,
- * else null. The injected fetch must enforce the timeout and its own response size limit.
+ * GET `url` (https only) with `timeoutMs: 5000` and `maxBytes`; the body when the answer is 200 and
+ * fits `maxBytes`, else null. The injected fetch must enforce both.
  */
 export async function fetchToken(httpFetch: HttpFetch, url: string, maxBytes: number, accept: string): Promise<string | null> {
   if (typeof url !== 'string' || !url.startsWith('https://')) return null;
-  const res = await httpFetch(url, { method: 'GET', headers: { accept }, timeoutMs: FETCH_TIMEOUT_MS });
+  const res = await httpFetch(url, { method: 'GET', headers: { accept }, timeoutMs: FETCH_TIMEOUT_MS, maxBytes });
   if (res.status !== 200) return null;
   const body = await res.text();
   return typeof body === 'string' && body.length <= maxBytes ? body : null;
