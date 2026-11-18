@@ -60,7 +60,7 @@ const okResult = {
   ok: true,
   checks: okChecks,
   claims: { ho_ten: 'Nguyễn Văn A', nganh: 'CNTT', nam_tot_nghiep: '2026' },
-  issuer: { maToChuc: 'truong-mau', ten: 'Trường Đại học Mẫu (DEMO)' },
+  issuer: { maToChuc: 'VATVN-0100000001', ten: 'Trường Đại học Mẫu (DEMO)' },
   verifiedAt: '2026-11-19T10:01:00.000Z',
 };
 const revokedResult = {
@@ -234,7 +234,7 @@ test('getSession rejects malformed sessions at the trust boundary, naming only t
     [JSON.stringify(session('verified', { result: revokedResult })), 'status'],
     // a failure carries no claims and no issuer, and names a failing check
     [failedWith({ claims: { ho_ten: LEAK } }), 'result.claims'],
-    [failedWith({ issuer: { maToChuc: 'truong-mau', ten: 'x' } }), 'result.issuer'],
+    [failedWith({ issuer: { maToChuc: 'VATVN-0100000001', ten: 'x' } }), 'result.issuer'],
     [failedWith({ issuer: null }), 'result.issuer'],
     [failedWith({ checks: okChecks }), 'result.ok'],
     // a success lists every presentation check, each passed, with issuer and string claims
@@ -244,7 +244,9 @@ test('getSession rejects malformed sessions at the trust boundary, naming only t
     [withResult('verified', { checks: [...okChecks.slice(1), { id: 'structure', ok: true, code: 'MALFORMED' }] }), 'result.checks[8].code'],
     [withResult('verified', { issuer: undefined }), 'result.issuer'],
     [withResult('verified', { issuer: { maToChuc: LEAK, ten: 'x' } }), 'result.issuer'],
-    [withResult('verified', { issuer: { maToChuc: 'truong-mau', ten: `x\u200B${LEAK}` } }), 'result.issuer'],
+    // A slug is not an organisation identifier: the trust list uses VATVN-<tax code> (ADR-0015 section 9).
+    [withResult('verified', { issuer: { maToChuc: 'truong-mau', ten: 'x' } }), 'result.issuer'],
+    [withResult('verified', { issuer: { maToChuc: 'VATVN-0100000001', ten: `x\u200B${LEAK}` } }), 'result.issuer'],
     [withResult('verified', { claims: undefined }), 'result.claims'],
     [withResult('verified', { claims: {} }), 'result.claims'],
     [withResult('verified', { claims: { nam_tot_nghiep: 2026 } }), 'result.claims'],

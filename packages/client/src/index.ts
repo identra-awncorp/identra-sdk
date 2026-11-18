@@ -122,7 +122,8 @@ const STATUSES: readonly string[] = ['pending', 'request_retrieved', 'verified',
 const CHECK_CODE = /^[A-Z0-9_]{1,64}$/;
 const CHECK_ID = /^[a-z_]{1,64}$/;
 const CLAIM_KEY = /^[A-Za-z0-9_]{1,64}$/;
-const ORG_ID = /^[a-z0-9-]{1,64}$/;
+// ma_to_chuc of the trust list: VATVN-<10-digit tax code>[-<3-digit branch>] (ADR-0015 section 9).
+const ORG_ID = /^VATVN-[0-9]{10}(-[0-9]{3})?$/;
 const SESSION_ID = /^[A-Za-z0-9_-]{16,256}$/;
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 /** C0/C1 controls, bidirectional overrides and isolates, zero-width characters and the BOM. */
