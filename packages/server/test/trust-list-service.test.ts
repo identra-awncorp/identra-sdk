@@ -22,14 +22,14 @@ test('the source script: content, fingerprints, organisation ids, validity', () 
   const content = trustListSource(DEMO) as TrustListContent;
   assert.equal(validateTrustListContent(content).ok, true);
   assert.deepEqual(content.issuers.map((e) => [e.ma_to_chuc, e.ten, e.vct, e.cong_doan, e.chung_thu.map((c) => c.muc_dich)]), [
-    ['VATVN-0100000001', 'Trường Mẫu (DEMO)', [VCT.diploma], undefined, ['vc', 'status']],
-    ['VATVN-0100000002', 'Nhà Sản Xuất (DEMO)', [VCT.productEvent], ['san_xuat'], ['vc', 'status']],
-    ['VATVN-0100000003', 'Kiểm Định (DEMO)', [VCT.productEvent], ['kiem_dinh'], ['vc', 'status']],
-    ['VATVN-0100000004', 'Phân Phối (DEMO)', [VCT.productEvent], ['phan_phoi'], ['vc', 'status']],
+    ['VATVN-0100000001', 'Trường Đại học Mẫu (DEMO)', [VCT.diploma], undefined, ['vc', 'status']],
+    ['VATVN-0100000002', 'Công ty Sản xuất Mẫu (DEMO)', [VCT.productEvent], ['san_xuat'], ['vc', 'status']],
+    ['VATVN-0100000003', 'Trung tâm Kiểm định Mẫu (DEMO)', [VCT.productEvent], ['kiem_dinh'], ['vc', 'status']],
+    ['VATVN-0100000004', 'Công ty Phân phối Mẫu (DEMO)', [VCT.productEvent], ['phan_phoi'], ['vc', 'status']],
   ]);
   assert.deepEqual(content.issuers[1]!.chung_thu.map((c) => c.sha256), [fp('orgs/nha-san-xuat/vc-product.cert.pem'), fp('orgs/nha-san-xuat/status.cert.pem')]);
   assert.deepEqual(content.verifiers, [{
-    ma_to_chuc: 'VATVN-0100000005', ten: 'Nhà Tuyển Dụng Mẫu (DEMO)', chung_thu: [{ sha256: fp('orgs/nha-tuyen-dung-mau/request.cert.pem'), muc_dich: 'request' }],
+    ma_to_chuc: 'VATVN-0100000005', ten: 'Nhà tuyển dụng Mẫu (DEMO)', chung_thu: [{ sha256: fp('orgs/nha-tuyen-dung-mau/request.cert.pem'), muc_dich: 'request' }],
     validFrom: content.verifiers[0]!.validFrom, validUntil: content.verifiers[0]!.validUntil,
   }]);
   // truong-mau: validFrom is the latest notBefore, validUntil the earliest notAfter of its certificates

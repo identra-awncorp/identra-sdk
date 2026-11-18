@@ -12,11 +12,11 @@ import { base64Decode, parseCertificate, validateTrustListContent, VCT } from '@
 
 // name, display name, certificate files and their purpose, scope.
 const ORGANISATIONS = [
-  { name: 'truong-mau', ten: 'Trường Mẫu (DEMO)', certs: { vc: 'vc', status: 'status' }, vct: [VCT.diploma] },
-  { name: 'nha-san-xuat', ten: 'Nhà Sản Xuất (DEMO)', certs: { 'vc-product': 'vc', status: 'status' }, vct: [VCT.productEvent], cong_doan: ['san_xuat'] },
-  { name: 'kiem-dinh', ten: 'Kiểm Định (DEMO)', certs: { 'vc-product': 'vc', status: 'status' }, vct: [VCT.productEvent], cong_doan: ['kiem_dinh'] },
-  { name: 'phan-phoi', ten: 'Phân Phối (DEMO)', certs: { 'vc-product': 'vc', status: 'status' }, vct: [VCT.productEvent], cong_doan: ['phan_phoi'] },
-  { name: 'nha-tuyen-dung-mau', ten: 'Nhà Tuyển Dụng Mẫu (DEMO)', certs: { request: 'request' }, verifier: true },
+  { name: 'truong-mau', ten: 'Trường Đại học Mẫu (DEMO)', certs: { vc: 'vc', status: 'status' }, vct: [VCT.diploma] },
+  { name: 'nha-san-xuat', ten: 'Công ty Sản xuất Mẫu (DEMO)', certs: { 'vc-product': 'vc', status: 'status' }, vct: [VCT.productEvent], cong_doan: ['san_xuat'] },
+  { name: 'kiem-dinh', ten: 'Trung tâm Kiểm định Mẫu (DEMO)', certs: { 'vc-product': 'vc', status: 'status' }, vct: [VCT.productEvent], cong_doan: ['kiem_dinh'] },
+  { name: 'phan-phoi', ten: 'Công ty Phân phối Mẫu (DEMO)', certs: { 'vc-product': 'vc', status: 'status' }, vct: [VCT.productEvent], cong_doan: ['phan_phoi'] },
+  { name: 'nha-tuyen-dung-mau', ten: 'Nhà tuyển dụng Mẫu (DEMO)', certs: { request: 'request' }, verifier: true },
 ];
 
 function usage() {
