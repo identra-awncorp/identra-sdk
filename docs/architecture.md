@@ -602,7 +602,9 @@ createWallet({ keyStore, vault, fetch, random, clock, trustedRoots, trustListUrl
                supportedVcts? /* [diploma] */, seen?, verifier? /* noble */, hasher? /* noble */,
                allowedOrigins? /* exact origins of offers and presentation requests */ })
 wallet.offers.resolve(qrText) → { ok: true, offer: ResolvedOffer /* incl. issuerOrigin */ } | WalletFailure
-wallet.offers.accept(offer, { txCode }) → { ok: true, credentialId, vct, issuerName, status: 'valid' | 'unknown' } | WalletFailure
+wallet.offers.accept(offer, { txCode }) → { ok: true, credentialId, vct, issuerName: string | null, status: 'valid' | 'unknown' }
+                                        | { ok: false, code, checks?, retryable: boolean }
+wallet.offers.discard(offer) → Promise<void>   // forget a held token / pending credential (deletes its key)
 wallet.credentials.list() → CredentialSummary[]            // metadata only, no decryption
 wallet.credentials.get(id) → { ok: true, credential: CredentialDetails } | WalletFailure
 wallet.credentials.refreshStatus(id) → { ok: true, status, checks } | WalletFailure
@@ -652,13 +654,33 @@ already reduced to `<iss>/status/<n>`).
   (`CLAIMS_INCOMPLETE`) → `vault.save` and the status (`STORAGE_ERROR`). Any
   failure after the key was created deletes the key, but only once no row needs
   it: if a saved row cannot be removed, row and key are both kept.
+- Resuming: after the token step succeeded the access token (with its expiry
+  from `expires_in`, 60 s when absent, minus 5 s) and a c_nonce not yet sent stay
+  in the resolved offer's memory. A later `accept` on the SAME offer skips the
+  token request and continues from the c_nonce with a new key attempt; its
+  `txCode` is ignored. The token is dropped when the issuer answered a
+  credential request (a credential or a definitive error; a request with no
+  answer at all keeps it), when it expires, and with the offer object; it is
+  never stored or logged. Once the code was redeemed it is never sent again: an
+  expired token means `OFFER_EXPIRED` without a request. A received, verified
+  credential whose storing failed waits in memory with its key for the next
+  `accept` (no second credential request); `discard` deletes that key when the
+  user gives up. Calls of `accept` on one offer run one after the other.
+  `retryable` says whether the same offer can still complete: the PIN was wrong
+  and the offer exists, a usable token is held, a no-answer token request, or a
+  credential waits to be stored; otherwise a new offer is needed.
 - `remove` deletes the key first, then the row (`vault.removeWithKey`): a row
   without its key is detectable, a key without its row is not; calling it again
   completes an interrupted removal.
-- `refreshStatus` re-runs `verifyStoredCredential`: `valid`, `revoked`,
-  `suspended`, else `unknown` (status or trust list could not be checked, or
-  another check failed; ADR-0013 section 4); cached in the vault row, where the
-  column value is `unavailable` (the wallet API says `unknown` only).
+- `refreshStatus` re-runs `verifyStoredCredential` and returns `{ status,
+  checks, checkedAt, lastValidAt }`: `valid`, `revoked`, `suspended`, `unknown`
+  ONLY when the sole failures are `STATUS_UNAVAILABLE` / `TRUST_LIST_UNAVAILABLE`
+  (try again when online; ADR-0013 section 4), else `invalid` (issuer no longer
+  trusted, certificate expired, …). Cached in the vault row; the column says
+  `unavailable` for `unknown` and needs the `invalid` value in its CHECK
+  constraint (`CREDENTIALS_TABLE_DDL`; an existing table must be recreated).
+  The row keeps one check time, so `lastValidAt` is now when valid, else the
+  previous check time when that one was valid, else null.
 - Key store: a `SecretStorageError` (`KEY_INVALIDATED`, `CANCELLED`, `LOCKED`)
   thrown by the app's storage adapter becomes a `WalletKeyError` of that code and
   then the wallet codes `KEY_INVALIDATED`, `USER_CANCELLED`, `DEVICE_LOCKED`;
@@ -709,8 +731,11 @@ createPresentationVerifier({
 // .clientId, .name (trust-list name, refreshed at most hourly)
 // .createSession({ scenario }) → { ok: true, session: { id, requestId, qr, expiresAt, serverTime } }
 //                              | { ok: false, reason: 'unknown_scenario' (400) | 'verifier_not_listed' (503) }
-// .requestObject(requestId) → HttpResponse   GET  /oid4vp/request/:requestId
-// .handleResponse(requestId, request) → HttpResponse   POST /oid4vp/response/:requestId
+// .requestObject(requestId) → HttpResponse | null                       GET  /oid4vp/request/:requestId
+// .handleResponse(requestId, request) → { response, outcome } | null    POST /oid4vp/response/:requestId
+//    outcome = { sessionId, final, ok?, code? } for the server's log (ids and codes only)
+//    null = this verifier holds no such request (unknown, expired or final): with several
+//    verifiers try the next; with none left answer 404 / 400 invalid_request
 // .session(id) → SessionResource | null      GET  /v1/verification/sessions/:id
 ```
 

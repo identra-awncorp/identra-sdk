@@ -53,7 +53,7 @@ async function world(o: { store?: (s: ProtocolStateStore) => ProtocolStateStore;
   const session = async () => {
     const r = await verifier.createSession({ scenario: 'ung-tuyen' });
     assert.ok(r.ok);
-    const jwt = (await verifier.requestObject(r.session.requestId)).body;
+    const jwt = (await verifier.requestObject(r.session.requestId))!.body;
     return { ...r.session, jwt, payload: JSON.parse(utf8Decode(base64UrlDecode(jwt.split('.')[1]!))) as RequestPayload };
   };
   const present = (p: RequestPayload, o2: { signer?: Signer; nonce?: string; disclose?: string[] } = {}) =>
@@ -62,8 +62,11 @@ async function world(o: { store?: (s: ProtocolStateStore) => ProtocolStateStore;
     const { kty, crv, x, y, kid } = p['client_metadata'].jwks.keys[0]!;
     return new CompactEncrypt(utf8Encode(JSON.stringify(body))).setProtectedHeader({ alg: 'ECDH-ES', enc: 'A256GCM', kid, ...header }).encrypt(await importJWK({ kty, crv, x, y } as JWK, 'ECDH-ES'));
   };
-  const answer = async (s: Awaited<ReturnType<typeof session>>, vpToken: unknown, header?: Record<string, unknown>) =>
-    verifier.handleResponse(s.requestId, form(`response=${await encrypt(s.payload, { vp_token: vpToken, state: s.payload['state'] }, header)}`));
+  /** The HTTP response, with the outcome alongside; an unknown request (null) reads as 400. */
+  const answer = async (s: Awaited<ReturnType<typeof session>>, vpToken: unknown, header?: Record<string, unknown>) => {
+    const handled = await verifier.handleResponse(s.requestId, form(`response=${await encrypt(s.payload, { vp_token: vpToken, state: s.payload['state'] }, header)}`));
+    return { status: handled?.response.status ?? 400, outcome: handled?.outcome ?? null };
+  };
   return { clock, verifier, entries, memory, puts, holder, session, present, encrypt, answer };
 }
 
@@ -121,7 +124,7 @@ describe('which responses finalise a session', () => {
     const vp = await w.present(s.payload);
     assert.equal((await w.answer(s, { credential: [vp] }, { zip: 'DEF' })).status, 400, 'a compressed JWE');
     const plain = await w.verifier.handleResponse(s.requestId, form(`response=${await w.encrypt(s.payload, { vp_token: { credential: [vp] }, state: s.payload['state'] })}`, 'text/plain'));
-    assert.equal(plain.status, 400, 'the content type');
+    assert.deepEqual([plain?.response.status, plain?.outcome], [400, { sessionId: s.id, final: false, code: 'MALFORMED' }], 'the content type');
     assert.equal((await w.answer(s, { credential: [await w.present(s.payload, { nonce: 'n'.repeat(43) })] })).status, 400, 'wrong nonce');
     assert.equal((await w.verifier.session(s.id))?.status, 'request_retrieved');
     assert.equal((await w.answer(s, { credential: [vp] })).status, 200);
@@ -187,7 +190,7 @@ describe('which responses finalise a session', () => {
     assert.equal((await w.answer(s, { credential: [await w.present(s.payload)] })).status, 200);
     const prefix = `vp:${w.verifier.clientId}`;
     for (const kind of ['key', 'request', 'open']) assert.equal(await w.memory.get(`${prefix}:${kind}:${s.requestId}`), null, kind);
-    assert.equal((await w.verifier.requestObject(s.requestId)).status, 404);
+    assert.equal(await w.verifier.requestObject(s.requestId), null);
   });
 });
 
@@ -204,5 +207,33 @@ describe('the hourly trust-list re-check', () => {
     w.entries.set(requestFp, null);
     w.clock.advance(3600);
     assert.deepEqual(await w.verifier.createSession({ scenario: 'ung-tuyen' }), { ok: false, reason: 'verifier_not_listed' });
+  });
+});
+
+describe('outcome for the server log, and "not mine"', () => {
+  test('outcomes: refused with the reason, finalising with ok and the first failing code, the race loser, the flood; null for requests it does not hold', async () => {
+    const w = await world();
+    const s = await w.session();
+    assert.deepEqual((await w.answer(s, { credential: ['garbage'] })).outcome, { sessionId: s.id, final: false, code: 'MALFORMED' });
+    assert.deepEqual((await w.answer(s, { credential: [await w.present(s.payload, { nonce: 'n'.repeat(43) })] })).outcome, { sessionId: s.id, final: false, code: 'NONCE_MISMATCH' });
+    const vp = await w.present(s.payload);
+    assert.deepEqual((await w.answer(s, { credential: [vp] })).outcome, { sessionId: s.id, final: true, ok: true });
+    assert.equal(await w.verifier.handleResponse(s.requestId, form('response=x')), null, 'final: the request is gone');
+    const f = await w.session();
+    assert.deepEqual((await w.answer(f, { credential: [await w.present(f.payload, { disclose: ['ho_ten'] })] })).outcome, { sessionId: f.id, final: true, ok: false, code: 'QUERY_NOT_SATISFIED' });
+    const race = await w.session();
+    const both = await Promise.all([w.answer(race, { credential: [await w.present(race.payload)] }), w.answer(race, { credential: [await w.present(race.payload)] })]);
+    assert.deepEqual(both.map((b) => b.outcome?.final).sort(), [false, true]);
+    assert.deepEqual(both.find((b) => !b.outcome?.final)?.outcome, { sessionId: race.id, final: false });
+    const flood = await w.session();
+    for (let i = 0; i < MAX_RESPONSE_ATTEMPTS - 1; i++) await w.answer(flood, { credential: ['garbage'] });
+    assert.deepEqual((await w.answer(flood, { credential: ['garbage'] })).outcome, { sessionId: flood.id, final: true, ok: false, code: 'TOO_MANY_ATTEMPTS' });
+    for (const unknown of ['AAAAAAAAAAAAAAAAAAAAAA', 'not an id']) {
+      assert.equal(await w.verifier.requestObject(unknown), null);
+      assert.equal(await w.verifier.handleResponse(unknown, form('response=x')), null);
+    }
+    const other = await world();
+    const mine = await other.session();
+    assert.equal(await w.verifier.requestObject(mine.requestId), null, 'another verifier\'s request (separate stores here; one shared Redis keys by client_id)');
   });
 });

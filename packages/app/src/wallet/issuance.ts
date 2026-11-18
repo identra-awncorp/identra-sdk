@@ -36,7 +36,23 @@ export interface ResolvedOffer {
  * could not be read at receipt; refreshStatus settles it later. `issuerName` is then null when the
  * trust list was the one missing.
  */
-export type AcceptResult = { ok: true; credentialId: string; vct: string; issuerName: string | null; status: 'valid' | 'unknown' } | WalletFailure;
+export type AcceptResult =
+  | { ok: true; credentialId: string; vct: string; issuerName: string | null; status: 'valid' | 'unknown' }
+  | AcceptFailure;
+
+/**
+ * `retryable`: true when `accept` on the SAME resolved offer can still complete (the PIN was wrong
+ * and the offer still exists, or the wallet still holds an unexpired, unused access token, or a
+ * received credential waits to be stored); false when a new offer is needed.
+ */
+export type AcceptFailure = WalletFailure & { retryable: boolean };
+
+/** A token without `expires_in` is trusted for this long. */
+const DEFAULT_TOKEN_SECONDS = 60;
+/** A token this close to its expiry is not used any more. */
+const TOKEN_MARGIN_MS = 5_000;
+
+interface Received { compact: string; keyId: string; vct: string; iss: string; issuerName: string | null; listsDown: boolean }
 
 interface OfferState {
   issuerUri: string;
@@ -45,6 +61,16 @@ interface OfferState {
   session: IssuerSession;
   configurationId: string;
   vct: string;
+  /** The pre-authorized code was redeemed: it is never sent again. */
+  codeUsed: boolean;
+  /** The access token, in memory only, until the issuer answered a credential request or it expired. */
+  token: { value: string; expiresAt: number } | null;
+  /** A c_nonce not yet sent in a proof. */
+  nonce: string | null;
+  /** A received and verified credential whose storing failed; its wallet key is kept for it. */
+  received: Received | null;
+  /** Calls of accept on one offer run one after the other. */
+  queue: Promise<unknown>;
 }
 const offers = new WeakMap<ResolvedOffer, OfferState>();
 
@@ -114,7 +140,7 @@ function checkMetadata(session: IssuerSession, origin: string, supportedVcts: re
  * TRUST_LIST_UNAVAILABLE (and status SKIPPED because of it), or status with STATUS_UNAVAILABLE.
  * Chain, signature, validity, type and disclosures must all have passed.
  */
-function onlyListsUnavailable(checks: Check[]): boolean {
+export function onlyListsUnavailable(checks: Check[]): boolean {
   const trustListDown = checks.some((c) => c.id === 'issuer_trust' && c.code === 'TRUST_LIST_UNAVAILABLE');
   return checks.every(
     (c) => c.ok || (c.id === 'issuer_trust' && c.code === 'TRUST_LIST_UNAVAILABLE') || (c.id === 'status' && (c.code === 'STATUS_UNAVAILABLE' || (c.code === 'SKIPPED' && trustListDown))),
@@ -158,13 +184,54 @@ export function createIssuance(ctx: WalletContext) {
   });
 
   /** After invalid_grant: the offer still served means the PIN was wrong; gone means expired, used or destroyed. */
-  async function wrongPinOrExpired(state: OfferState, fetch: HttpFetch): Promise<WalletFailure> {
+  async function wrongPinOrExpired(state: OfferState, fetch: HttpFetch): Promise<AcceptFailure> {
     try {
       const r = await fetch(state.offerUri, { method: 'GET', maxBytes: 65_536 });
-      return { ok: false, code: r.status === 200 ? C.TX_CODE_WRONG : C.OFFER_EXPIRED };
+      return r.status === 200 ? { ok: false, code: C.TX_CODE_WRONG, retryable: true } : { ok: false, code: C.OFFER_EXPIRED, retryable: false };
     } catch (e) {
-      return failure(e);
+      return { ...failure(e), retryable: true };
     }
+  }
+
+  const tokenUsable = (state: OfferState) => state.token !== null && ctx.clock.now().getTime() < state.token.expiresAt - TOKEN_MARGIN_MS;
+  const fails = (e: unknown, retryable: boolean): AcceptFailure => ({ ...failure(e), retryable });
+
+  /** Stores a received credential. A failure keeps it (and its key) in the offer state for the next accept. */
+  async function storeReceived(state: OfferState, r: Received): Promise<AcceptResult> {
+    let savedId: string | undefined;
+    try {
+      savedId = await storage(() => ctx.vault.save({ compact: r.compact, vct: r.vct, issuer: r.iss, keyId: r.keyId }));
+      const id = savedId;
+      await storage(() => ctx.vault.setStatus(id, r.listsDown ? 'unavailable' : 'valid', ctx.clock.now()));
+      state.received = null;
+      return { ok: true, credentialId: id, vct: r.vct, issuerName: r.issuerName, status: r.listsDown ? 'unknown' : 'valid' };
+    } catch (e) {
+      if (savedId !== undefined) {
+        const id = savedId;
+        await ctx.vault.remove(id).catch(() => {});
+        // A row that cannot be removed keeps its key; it is not saved a second time.
+        if (!(await ctx.vault.getMeta(id).then((m) => m === null, () => false))) {
+          state.received = null;
+          return fails(e, false);
+        }
+      }
+      state.received = r;
+      return fails(e, true);
+    }
+  }
+
+  /**
+   * Forgets a resolved offer: a held access token, and a received credential that could not be
+   * stored together with its wallet key. Call it when the user abandons an offer after a failure.
+   */
+  async function discard(offer: ResolvedOffer): Promise<void> {
+    const state = offers.get(offer);
+    if (!state) return;
+    offers.delete(offer);
+    await state.queue.catch(() => {});
+    if (state.received) await ctx.keyStore.delete(state.received.keyId).catch(() => {});
+    state.received = null;
+    state.token = null;
   }
 
   async function resolve(qrText: string): Promise<{ ok: true; offer: ResolvedOffer } | WalletFailure> {
@@ -198,29 +265,49 @@ export function createIssuance(ctx: WalletContext) {
             }
           : null,
       };
-      offers.set(resolved, { issuerUri: resolved.issuerUri, offerUri, origin, session, configurationId, vct });
+      offers.set(resolved, { issuerUri: resolved.issuerUri, offerUri, origin, session, configurationId, vct, codeUsed: false, token: null, nonce: null, received: null, queue: Promise.resolve() });
       return { ok: true, offer: resolved };
     } catch (e) {
       return failure(e);
     }
   }
 
+  /**
+   * Token (PIN) -> c_nonce -> new wallet key -> proof -> credential request -> verify -> store.
+   * Resumable: after the PIN was accepted, the access token (and an unused c_nonce) stay in the
+   * offer's memory, so a later accept on the SAME resolved offer continues from the c_nonce with a
+   * new key attempt and ignores `txCode`. The token is dropped once the issuer answered a credential
+   * request (success or a definitive error) and when it expires; it is never stored or logged.
+   */
   async function accept(offer: ResolvedOffer, input: { txCode?: string } = {}): Promise<AcceptResult> {
     const state = offers.get(offer);
     if (!state) throw new TypeError('offer must come from wallet.offers.resolve');
+    const run = state.queue.then(() => attempt(state, input.txCode));
+    state.queue = run.catch(() => {});
+    return run;
+  }
+
+  async function attempt(state: OfferState, txCode: string | undefined): Promise<AcceptResult> {
+    if (state.received) return storeReceived(state, state.received);
     const deps = depsFor(state.origin);
-    let accessToken: string;
-    let nonce: string;
-    try {
-      accessToken = await requestAccessToken(state.session, input.txCode, deps);
-    } catch (e) {
-      const f = failureOf(e);
-      return f.oauthError === 'invalid_grant' ? wrongPinOrExpired(state, deps.fetch) : { ok: false, code: f.code };
+    if (!tokenUsable(state)) {
+      state.token = null;
+      if (state.codeUsed) return { ok: false, code: C.OFFER_EXPIRED, retryable: false };
+      try {
+        const t = await requestAccessToken(state.session, txCode, deps);
+        state.codeUsed = true;
+        state.token = { value: t.accessToken, expiresAt: ctx.clock.now().getTime() + (t.expiresIn ?? DEFAULT_TOKEN_SECONDS) * 1000 };
+      } catch (e) {
+        const f = failureOf(e);
+        // Unanswered: the code may still be unredeemed. Anything else from the issuer is final.
+        return f.oauthError === 'invalid_grant' ? wrongPinOrExpired(state, deps.fetch) : { ok: false, code: f.code, retryable: f.code === 'NETWORK_ERROR' };
+      }
     }
+    const accessToken = state.token!.value;
     try {
-      nonce = await library(() => requestNonce(state.session, deps));
+      state.nonce ??= await library(() => requestNonce(state.session, deps));
     } catch (e) {
-      return failure(e);
+      return fails(e, tokenUsable(state));
     }
     // One new key per credential (ADR-0009 point 2), created only once the PIN was accepted.
     let keyId: string;
@@ -228,16 +315,24 @@ export function createIssuance(ctx: WalletContext) {
     try {
       ({ keyId, publicJwk } = await keyStoreCall(() => ctx.keyStore.create()));
     } catch (e) {
-      return failure(e);
+      return fails(e, tokenUsable(state));
     }
     let responseSecret: Uint8Array | undefined;
-    let savedId: string | undefined;
     try {
       responseSecret = generateSecretKey(ctx.random);
       const signer = await keyStoreCall(() => ctx.keyStore.signer(keyId));
-      const proof = await library(() => createProof(state.session, { configurationId: state.configurationId, nonce, signer, now: ctx.clock.now() }, deps));
+      const proof = await library(() => createProof(state.session, { configurationId: state.configurationId, nonce: state.nonce!, signer, now: ctx.clock.now() }, deps));
       const responseKey = { secretKey: responseSecret, publicJwk: uncompressedPointToJwk(P256.getPublicKey(responseSecret, false)) };
-      const credentials = await library(() => requestCredential(state.session, { configurationId: state.configurationId, accessToken, proof, responseKey }, deps));
+      state.nonce = null; // spent once it leaves in a proof
+      let credentials: unknown;
+      try {
+        credentials = await requestCredential(state.session, { configurationId: state.configurationId, accessToken, proof, responseKey }, deps);
+        state.token = null;
+      } catch (e) {
+        // No answer at all: the same token may be tried again. Any answer from the issuer is definitive.
+        if (failureOf(e).code !== 'NETWORK_ERROR') state.token = null;
+        throw new Fail(failureOf(e).code);
+      }
       if (!Array.isArray(credentials) || credentials.length !== 1 || !isObject(credentials[0]) || typeof credentials[0]['credential'] !== 'string') throw new Fail(C.ISSUER_ERROR);
       const compact = credentials[0]['credential'];
 
@@ -260,23 +355,14 @@ export function createIssuance(ctx: WalletContext) {
       const disclosedOnce = (n: string) => disclosures.filter((d) => d.name === n && typeof d.value === 'string' && d.value !== '').length === 1;
       if (!required || !required.every((n) => !Object.hasOwn(payload, n) && disclosedOnce(n))) throw new Fail(C.CLAIMS_INCOMPLETE);
 
-      savedId = await storage(() => ctx.vault.save({ compact, vct: credential.vct, issuer: credential.iss, keyId }));
-      const id = savedId;
-      await storage(() => ctx.vault.setStatus(id, listsDown ? 'unavailable' : 'valid', ctx.clock.now()));
-      return { ok: true, credentialId: id, vct: credential.vct, issuerName: credential.issuer?.ten ?? null, status: listsDown ? 'unknown' : 'valid' };
+      return storeReceived(state, { compact, keyId, vct: credential.vct, iss: credential.iss, issuerName: credential.issuer?.ten ?? null, listsDown });
     } catch (e) {
-      // The key goes only once no row needs it: a row whose key is gone is worse than both kept.
-      if (savedId !== undefined) {
-        const id = savedId;
-        await ctx.vault.remove(id).catch(() => {});
-        if (!(await ctx.vault.getMeta(id).then((m) => m === null, () => false))) return failure(e);
-      }
       await ctx.keyStore.delete(keyId).catch(() => {});
-      return failure(e);
+      return fails(e, tokenUsable(state));
     } finally {
       responseSecret?.fill(0);
     }
   }
 
-  return { resolve, accept };
+  return { resolve, accept, discard };
 }

@@ -137,10 +137,12 @@ export async function resolveMetadata(offer: Record<string, unknown>, deps: Libr
   return session;
 }
 
-export async function requestAccessToken(session: IssuerSession, txCode: string | undefined, deps: LibraryDeps): Promise<string> {
+/** The access token and its lifetime in seconds (`expires_in`, null when the issuer did not say). */
+export async function requestAccessToken(session: IssuerSession, txCode: string | undefined, deps: LibraryDeps): Promise<{ accessToken: string; expiresIn: number | null }> {
   const { offer, metadata } = libraryState(session);
   const r = await client(deps).retrievePreAuthorizedCodeAccessTokenFromOffer({ credentialOffer: offer, issuerMetadata: metadata, ...(txCode !== undefined ? { txCode } : {}) });
-  return r.accessTokenResponse.access_token;
+  const expiresIn = r.accessTokenResponse.expires_in;
+  return { accessToken: r.accessTokenResponse.access_token, expiresIn: typeof expiresIn === 'number' && expiresIn > 0 ? expiresIn : null };
 }
 
 export async function requestNonce(session: IssuerSession, deps: LibraryDeps): Promise<string> {

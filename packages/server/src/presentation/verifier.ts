@@ -3,7 +3,7 @@
 // response and never throw for bad input from the network; they throw only when a dependency fails.
 import {
   base64UrlEncode, signJws, utf8Encode, verifyPresentation,
-  type Check, type Clock, type RandomSource, type Signer, type VerifyCredentialOptions,
+  type Check, type Clock, type ErrorCode, type RandomSource, type Signer, type VerifyCredentialOptions,
 } from '@identra/sdk-core';
 import type { JWK } from 'jose';
 import { jsonResponse, oauthError, type HttpRequest, type HttpResponse } from '../issuance/http.js';
@@ -63,13 +63,26 @@ export interface CreatedSession { id: string; requestId: string; qr: string; exp
  */
 export type CreateSessionResult = { ok: true; session: CreatedSession } | { ok: false; reason: 'unknown_scenario' | 'verifier_not_listed' };
 
+/**
+ * What happened, for the server's log (ids and codes only). `final`: this response made the
+ * session final (`ok` and `code` of its result: the first failing check, absent when ok). A refused
+ * response (`final: false`) carries why: `MALFORMED` for transport, encryption, `state` or shape,
+ * the holder-binding code (KB_INVALID, NONCE_MISMATCH, AUD_MISMATCH, …), or the code of the
+ * gating step that failed before holder binding could run (MALFORMED, CERT_*, …); none when another
+ * response finalised the session first. Log `sessionId` as a prefix only: it reads the result.
+ */
+export interface ResponseOutcome { sessionId: string; final: boolean; ok?: boolean; code?: ErrorCode }
+export interface HandledResponse { response: HttpResponse; outcome: ResponseOutcome }
+
 export interface PresentationVerifier {
   readonly clientId: string;
   /** Display name of this verifier in the trust list, refreshed at most hourly. */
   readonly name: string;
   createSession(input: { scenario: string }): Promise<CreateSessionResult>;
-  requestObject(requestId: string): Promise<HttpResponse>;
-  handleResponse(requestId: string, request: HttpRequest): Promise<HttpResponse>;
+  /** Null when this verifier holds no such request (unknown, expired or final): a server with several verifiers tries the next; with none left, 404. */
+  requestObject(requestId: string): Promise<HttpResponse | null>;
+  /** Null when this verifier holds no such request (unknown, expired or final): a server with several verifiers tries the next; with none left, 400 invalid_request. */
+  handleResponse(requestId: string, request: HttpRequest): Promise<HandledResponse | null>;
   /** Null when unknown or deleted (30 minutes after creation or verification). */
   session(id: string): Promise<SessionResource | null>;
 }
@@ -127,17 +140,19 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
   const invalid = () => oauthError(400, 'invalid_request', 'the response is not acceptable');
 
   /**
-   * verifyPresentation, then the query on the verified claims; the result to store, or null when
-   * holder binding did not pass (the sender did not prove possession of the presented credential's
-   * key for this nonce and audience: such a response must not finalise the session).
+   * verifyPresentation, then the query on the verified claims; the result to store, or the
+   * holder-binding code when that check did not pass (the sender did not prove possession of the
+   * presented credential's key for this nonce and audience: such a response must not finalise).
    */
-  async function evaluate(presentation: string, request: RequestRecord, now: Date): Promise<SessionResult | null> {
+  async function evaluate(presentation: string, request: RequestRecord, now: Date): Promise<SessionResult | { refused: ErrorCode }> {
     const verifiedAt = now.toISOString();
     const checks = (cs: Check[]) => cs.map(({ id, ok, code }) => ({ id, ok, code }));
     const r = await verifyPresentation(presentation, {
       ...verification, now, presentation: { nonce: request.payload['nonce'] as string, audience: clientId },
     });
-    if (r.checks.find((c) => c.id === 'holder_binding')?.ok !== true) return null;
+    const binding = r.checks.find((c) => c.id === 'holder_binding');
+    // When holder binding was skipped (an earlier step failed), report that step's code instead.
+    if (binding?.ok !== true) return { refused: (binding?.skipped ? r.checks.find((c) => !c.ok)?.code : binding?.code) ?? 'KB_INVALID' };
     const claims = r.credential?.claims;
     if (!r.ok || !claims) return { ok: false, checks: [...checks(r.checks), { id: 'query', ok: false, code: 'SKIPPED' }], verifiedAt };
     const index = satisfiedClaimSet(queries[request.scenario]!, { vct: r.credential!.vct, claims });
@@ -170,12 +185,13 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
   }
 
   /** A response that did not finalise: 400; the tenth such response finalises the session as TOO_MANY_ATTEMPTS. */
-  async function refused(requestId: string, request: RequestRecord, now: Date): Promise<HttpResponse> {
+  async function refused(requestId: string, request: RequestRecord, now: Date, code: ErrorCode): Promise<HandledResponse> {
     const attempts = await store.increment(key('attempts', requestId), SESSION_SECONDS);
     if (attempts >= MAX_RESPONSE_ATTEMPTS) {
-      await finalise(requestId, request, { ok: false, checks: [{ id: 'holder_binding', ok: false, code: 'TOO_MANY_ATTEMPTS' }], verifiedAt: now.toISOString() });
+      const ended = await finalise(requestId, request, { ok: false, checks: [{ id: 'holder_binding', ok: false, code: 'TOO_MANY_ATTEMPTS' }], verifiedAt: now.toISOString() });
+      if (ended) return { response: invalid(), outcome: { sessionId: request.id, final: true, ok: false, code: 'TOO_MANY_ATTEMPTS' } };
     }
-    return invalid();
+    return { response: invalid(), outcome: { sessionId: request.id, final: false, code } };
   }
 
   return {
@@ -225,7 +241,7 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
     async requestObject(requestId) {
       const request = ID.test(requestId) ? await read<RequestRecord>(key('request', requestId)) : null;
       // Served until the session is final: the open marker is gone once a response was processed.
-      if (!request || request.expiresAt <= clock.now().getTime() || (await store.get(key('open', requestId))) === null) return jsonResponse(404, { error: 'not_found' });
+      if (!request || request.expiresAt <= clock.now().getTime() || (await store.get(key('open', requestId))) === null) return null;
       await store.put(key('retrieved', request.id), '1', SESSION_KEEP_SECONDS);
       return { status: 200, headers: { 'Content-Type': 'application/oauth-authz-req+jwt', 'Cache-Control': 'no-store' }, body: request.jwt };
     },
@@ -233,24 +249,26 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
     async handleResponse(requestId, req) {
       const now = clock.now();
       const request = ID.test(requestId) ? await read<RequestRecord>(key('request', requestId)) : null;
-      if (!request || request.expiresAt <= now.getTime() || (await store.get(key('open', requestId))) === null) return invalid();
+      if (!request || request.expiresAt <= now.getTime() || (await store.get(key('open', requestId))) === null) return null;
       // From here every refusal counts against the request (refused): a flood ends the session.
-      if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/x-www-form-urlencoded') || req.body.length > MAX_RESPONSE_BYTES) return refused(requestId, request, now);
+      if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/x-www-form-urlencoded') || req.body.length > MAX_RESPONSE_BYTES) return refused(requestId, request, now, 'MALFORMED');
       const params = new URLSearchParams(req.body);
       const names = [...params.keys()];
       // direct_post.jwt only: exactly one `response` parameter holding a compact JWE (no downgrade to direct_post).
       const response = params.get('response');
-      if (names.length !== 1 || response === null || response.split('.').length !== 5) return refused(requestId, request, now);
+      if (names.length !== 1 || response === null || response.split('.').length !== 5) return refused(requestId, request, now, 'MALFORMED');
       const privateJwk = await read<JWK>(key('key', requestId));
-      if (!privateJwk) return invalid();
+      if (!privateJwk) return null;
       const presentation = onlyPresentation(await parseResponse({ form: { response }, requestPayload: request.payload, privateJwk, hasher: verification.hasher }));
-      if (presentation === null) return refused(requestId, request, now);
+      if (presentation === null) return refused(requestId, request, now, 'MALFORMED');
       // The request object is public: only a response proving possession of the presented
       // credential's key for this nonce and audience may finalise the session.
       const result = await evaluate(presentation, request, now);
-      if (result === null) return refused(requestId, request, now);
+      if ('refused' in result) return refused(requestId, request, now, result.refused);
       // Exactly once: of concurrent responses only the one that takes the open marker is stored.
-      return (await finalise(requestId, request, result)) ? jsonResponse(200, {}) : invalid();
+      if (!(await finalise(requestId, request, result))) return { response: invalid(), outcome: { sessionId: request.id, final: false } };
+      const code = result.checks.find((c) => !c.ok)?.code ?? undefined;
+      return { response: jsonResponse(200, {}), outcome: { sessionId: request.id, final: true, ok: result.ok, ...(code ? { code } : {}) } };
     },
 
     async session(id) {

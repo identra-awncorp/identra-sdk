@@ -1,11 +1,16 @@
 // The credentials the wallet holds: list (no decryption), display data, status refresh, removal.
-import { base64Decode, base64UrlEncode, decodeCredentialUnverified, verifyStoredCredential } from '@identra/sdk-core';
-import { CredentialVaultError, type CredentialMetadata, type StoredCredentialStatus } from '../credential-vault.js';
+import { base64Decode, base64UrlEncode, decodeCredentialUnverified, verifyStoredCredential, type Check } from '@identra/sdk-core';
+import type { CredentialMetadata, StoredCredentialStatus } from '../credential-vault.js';
 import type { WalletContext } from './context.js';
+import { onlyListsUnavailable } from './issuance.js';
 import { vaultFailureCode, WalletErrorCodes as C, type WalletFailure } from './errors.js';
 
-/** `unknown`: the status, the trust list, or another check could not confirm the credential (ADR-0013 section 4, "chưa kiểm được trạng thái"). */
-export type WalletCredentialStatus = 'valid' | 'revoked' | 'suspended' | 'unknown';
+/**
+ * `unknown`: only the status list or the trust list could not be read (ADR-0013 section 4, "chưa
+ * kiểm được trạng thái": try again when online). `invalid`: another check failed (the issuer is no
+ * longer trusted, a certificate expired, …): trying again will not help.
+ */
+export type WalletCredentialStatus = 'valid' | 'revoked' | 'suspended' | 'unknown' | 'invalid';
 const toWallet = (s: StoredCredentialStatus | null): WalletCredentialStatus | null => (s === 'unavailable' ? 'unknown' : s);
 const summaryOf = (r: CredentialMetadata): CredentialSummary => ({
   id: r.id, vct: r.vct, issuerUri: r.issuer, status: toWallet(r.status_cache), statusCheckedAt: r.status_checked_at, createdAt: r.created_at,
@@ -72,22 +77,33 @@ export function createCredentials(ctx: WalletContext) {
       };
     },
 
-    /** Re-runs verifyStoredCredential and caches the answer; anything but a definite status is `unknown`. */
-    async refreshStatus(id: string): Promise<{ ok: true; status: WalletCredentialStatus; checks: WalletFailure['checks'] & object } | WalletFailure> {
+    /**
+     * Re-runs verifyStoredCredential and caches the answer in the row. The checks come with it so the
+     * app can say why. `lastValidAt` is when the credential was last known valid: now when it is,
+     * else the previous check when that one said valid, else null (the row keeps one check time only).
+     */
+    async refreshStatus(id: string): Promise<
+      { ok: true; status: WalletCredentialStatus; checks: Check[]; checkedAt: string; lastValidAt: string | null } | WalletFailure
+    > {
       const opened = await open(id);
       if (!opened.ok) return opened;
+      const before = await ctx.vault.getMeta(id).catch(() => null);
       const r = await verifyStoredCredential(opened.compact, {
         verifier: ctx.verifier, hasher: ctx.hasher, chainValidator: ctx.chainValidator, trustRegistry: ctx.trustRegistry,
         statusChecker: ctx.statusChecker, supportedVcts: ctx.supportedVcts, now: ctx.clock.now(),
       });
       const statusCode = r.checks.find((c) => c.id === 'status')?.code;
-      const status: StoredCredentialStatus = r.ok ? 'valid' : statusCode === 'REVOKED' ? 'revoked' : statusCode === 'SUSPENDED' ? 'suspended' : 'unavailable';
+      const status: StoredCredentialStatus = r.ok
+        ? 'valid'
+        : statusCode === 'REVOKED' ? 'revoked' : statusCode === 'SUSPENDED' ? 'suspended' : onlyListsUnavailable(r.checks) ? 'unavailable' : 'invalid';
+      const checkedAt = ctx.clock.now();
       try {
-        await ctx.vault.setStatus(id, status, ctx.clock.now());
+        await ctx.vault.setStatus(id, status, checkedAt);
       } catch (e) {
-        return { ok: false, code: e instanceof CredentialVaultError && e.code === 'NOT_FOUND' ? C.CREDENTIAL_NOT_FOUND : C.STORAGE_ERROR };
+        return { ok: false, code: vaultFailureCode(e) };
       }
-      return { ok: true, status: toWallet(status)!, checks: r.checks };
+      const lastValidAt = status === 'valid' ? checkedAt.toISOString() : before?.status_cache === 'valid' ? before.status_checked_at : null;
+      return { ok: true, status: toWallet(status)!, checks: r.checks, checkedAt: checkedAt.toISOString(), lastValidAt };
     },
 
     /** Deletes the row and its wallet key; removing an unknown id succeeds. */

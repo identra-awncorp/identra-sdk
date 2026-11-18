@@ -191,7 +191,7 @@ describe('responses the verifier refuses (400, nothing stored)', () => {
     const statuses = await Promise.all(forms.map((f) => post(other.requestId, f)));
     assert.deepEqual([statuses.filter((x) => x === 200).length, statuses.filter((x) => x === 400).length], [1, 9]);
     assert.deepEqual((await verifier.session(session.id))!.result, result);
-    assert.equal((await verifier.requestObject(session.requestId)).status, 404, 'no request object once final');
+    assert.equal(await verifier.requestObject(session.requestId), null, 'no request object once final');
   });
 
   test('plain direct_post, signed-only, another session key, tampered, wrong state, unknown request, after expiry; the session stays open', async () => {

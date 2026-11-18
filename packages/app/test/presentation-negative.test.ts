@@ -31,7 +31,7 @@ async function setup(o: { untrustedVerifier?: boolean; credentials?: number } = 
 /** Signs `edit(payload of a real session)` with `signer` and serves it at /oid4vp/request/crafted. */
 async function crafted(world: World, verifier: Awaited<ReturnType<World['newVerifier']>>, edit: (p: Record<string, unknown>) => void, o: { signer?: Signer; header?: Record<string, unknown>; tamper?: boolean; clientIdFromSigner?: boolean } = {}) {
   const session = await newSession(verifier);
-  const jwt = (await verifier.requestObject(session.requestId)).body;
+  const jwt = (await verifier.requestObject(session.requestId))!.body;
   const payload = JSON.parse(utf8Decode(base64UrlDecode(jwt.split('.')[1]!))) as Record<string, unknown>;
   edit(payload);
   if (o.clientIdFromSigner) payload['client_id'] = `x509_hash:${await fingerprintOf(o.signer!)}`;

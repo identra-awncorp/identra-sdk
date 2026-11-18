@@ -9,8 +9,12 @@ import type { Clock, RandomSource } from '@identra/sdk-core';
 import type { SecretStorage, WalletKeyStore } from './key-store.js';
 import { drawRandom } from './random.js';
 
-/** The `status_cache` column. `unavailable`: the status could not be checked (the wallet API calls it `unknown`). */
-export type StoredCredentialStatus = 'valid' | 'revoked' | 'suspended' | 'unavailable';
+/**
+ * The `status_cache` column. `unavailable`: only the status list or the trust list could not be
+ * read (the wallet API calls it `unknown`); `invalid`: another check failed (issuer no longer
+ * trusted, certificate expired, …).
+ */
+export type StoredCredentialStatus = 'valid' | 'revoked' | 'suspended' | 'unavailable' | 'invalid';
 
 /** One row of the `credentials` table, columns exactly as in ADR-0009 section 3. */
 export interface CredentialRow {
@@ -34,7 +38,7 @@ export const CREDENTIALS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS credentials (
   issuer TEXT NOT NULL,
   key_id TEXT NOT NULL,
   ciphertext TEXT NOT NULL,
-  status_cache TEXT CHECK (status_cache IN ('valid', 'revoked', 'suspended', 'unavailable')),
+  status_cache TEXT CHECK (status_cache IN ('valid', 'revoked', 'suspended', 'unavailable', 'invalid')),
   status_checked_at TEXT,
   created_at TEXT NOT NULL
 )`;
@@ -363,7 +367,7 @@ export function createCredentialVault(options: { repository: CredentialRepositor
     },
 
     async setStatus(id, status, checkedAt) {
-      if (!['valid', 'revoked', 'suspended', 'unavailable'].includes(status)) throw new TypeError('invalid status');
+      if (!['valid', 'revoked', 'suspended', 'unavailable', 'invalid'].includes(status)) throw new TypeError('invalid status');
       if (!(checkedAt instanceof Date) || Number.isNaN(checkedAt.getTime())) throw new TypeError('checkedAt must be a valid Date');
       if (!(await repository.get(id))) throw new CredentialVaultError('NOT_FOUND');
       await repository.update(id, { status_cache: status, status_checked_at: checkedAt.toISOString() });

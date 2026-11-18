@@ -152,8 +152,12 @@ export async function newSession(verifier: PresentationVerifier) {
 
 /** The verifier routes of vc-api.md section 6. */
 export function mountVerifier(routes: Map<string, Handler>, verifier: PresentationVerifier) {
-  routes.set('GET /oid4vp/request/*', (req) => verifier.requestObject(req.path.split('/').pop()!));
-  routes.set('POST /oid4vp/response/*', (req) => verifier.handleResponse(req.path.split('/').pop()!, req));
+  // One verifier here; a server hosting several would try each and answer 404 / 400 when all say null.
+  routes.set('GET /oid4vp/request/*', async (req) => (await verifier.requestObject(req.path.split('/').pop()!)) ?? { status: 404, headers: {}, body: '' });
+  routes.set('POST /oid4vp/response/*', async (req) => {
+    const handled = await verifier.handleResponse(req.path.split('/').pop()!, req);
+    return handled?.response ?? { status: 400, headers: { 'Content-Type': 'application/json' }, body: '{"error":"invalid_request"}' };
+  });
 }
 export type Listener = Awaited<ReturnType<typeof startListener>>;
 

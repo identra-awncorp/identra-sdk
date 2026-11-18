@@ -21,7 +21,12 @@ wallet used in Node end-to-end tests. Pure JavaScript on `@noble/curves`, `@nobl
   `accept` receive a credential over OpenID4VCI 1.0 (pre-authorized code, PIN, encrypted request
   and response) and store it only after `verifyStoredCredential` passes, the issuer matches the
   offer and `cnf.jwk` is the new key; `wallet.credentials.list` / `get` / `refreshStatus` /
-  `remove` (status `valid` / `revoked` / `suspended` / `unknown`);
+  `remove` (status `valid` / `revoked` / `suspended` / `unknown` / `invalid`; `refreshStatus` also
+  returns the checks, `checkedAt` and `lastValidAt`). `accept` failures say whether the same offer can
+  still complete (`retryable`): after the PIN was accepted, a cancelled biometric prompt, a locked
+  device, a request with no answer or a failing vault write is resumed by calling `accept` again on the
+  same resolved offer (the PIN is not needed again); call `offers.discard(offer)` when the user gives up.
+  The `credentials` table's CHECK constraint gained `invalid`: recreate an existing table;
   `wallet.presentations.resolve` / `submit` / `decline` answer an OpenID4VP 1.0 request
   (section 9). Failures are `{ ok: false, code }` with a code of `WalletErrorCodes`.
 

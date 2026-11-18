@@ -41,7 +41,7 @@ export {
 // The wallet object: OpenID4VCI issuance (GĐ5) and OpenID4VP presentation (GĐ6).
 export { createWallet, type Wallet, type WalletConfig } from './wallet/wallet.js';
 export { WalletErrorCodes, type WalletErrorCode, type WalletFailure } from './wallet/errors.js';
-export { REQUIRED_CLAIMS, type AcceptResult, type DisplayEntry, type ResolvedOffer } from './wallet/issuance.js';
+export { REQUIRED_CLAIMS, type AcceptFailure, type AcceptResult, type DisplayEntry, type ResolvedOffer } from './wallet/issuance.js';
 export type { CredentialDetails, CredentialSummary, WalletCredentialStatus } from './wallet/credentials.js';
 export type { PresentationMatch, ResolvedPresentation, VerifierIdentity } from './wallet/presentation.js';
 export { DEFAULT_MAX_BYTES, PROTOCOL_MAX_BYTES, PROTOCOL_TIMEOUT_MS } from './wallet/fetch.js';
