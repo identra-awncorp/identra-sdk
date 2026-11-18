@@ -17,7 +17,8 @@
     "lint": "eslint .",
     "pretest": "npm run typecheck && sh scripts/pki/ensure-test-pki.sh",
     "test": "node --test \"packages/*/test-dist/**/*.test.js\" && node examples/gd2-e2e.mjs",
-    "example:gd2": "npm run build && sh scripts/pki/ensure-test-pki.sh && node examples/gd2-e2e.mjs"
+    "example:gd2": "npm run build && sh scripts/pki/ensure-test-pki.sh && node examples/gd2-e2e.mjs",
+    "bench": "node bench/run.mjs"
   },
   "devDependencies": {
     "@noble/curves": "2.4.0",
