@@ -12,6 +12,7 @@ import {
   PRODUCT_EVENT_CLAIMS,
   RESERVED_CLAIM_NAMES,
   SD_JWT_LIMITS,
+  parseUtcInstant,
   VCT,
   isStatusListUri,
   type DiplomaClaims,
@@ -197,6 +198,13 @@ export async function issueProductEvent(
   }
   if (!parseProductCode(claims.ma_san_pham)) fail('ma_san_pham must be a GS1 element string (01)<GTIN-14 with a valid check digit>(21)<serial of set 82>');
   if (!CONG_DOAN.includes(claims.cong_doan)) fail(`cong_doan must be one of ${CONG_DOAN.join(', ')}`);
+  // Verifiers refuse a thoi_diem later than iat + 60 s (docs/architecture.md section 10).
+  const time = parseUtcInstant(claims.thoi_diem);
+  if (time === null) fail('thoi_diem must be an ISO 8601 UTC instant YYYY-MM-DDTHH:MM:SS[.sss]Z');
+  const now = input.clock?.now?.();
+  if (now instanceof Date && time > Math.floor(now.getTime() / 1000) * 1000 + SD_JWT_LIMITS.clockSkewSeconds * 1000) {
+    fail('thoi_diem must not be later than the time of issuance');
+  }
   if (claims.prev !== undefined && !SHA256_BASE64URL.test(claims.prev)) fail('prev must be base64url of a SHA-256 digest');
   const { signer, hasher, random, clock, iss, status } = input;
   return issueCredential({ signer, hasher, random, clock, iss, status, vct: VCT.productEvent, claims: { ...claims }, disclosable: [] });

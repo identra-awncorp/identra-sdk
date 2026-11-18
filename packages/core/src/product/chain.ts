@@ -5,7 +5,7 @@ import { base64UrlEncode, utf8Encode } from '../encoding.js';
 import type { Hasher } from '../interfaces.js';
 import { ErrorCodes, type Check, type ErrorCode } from '../results.js';
 import { parseSdJwt } from '../sd-jwt/compact.js';
-import { CONG_DOAN, SD_JWT_LIMITS, VCT } from '../sd-jwt/credential-types.js';
+import { CONG_DOAN, parseUtcInstant, SD_JWT_LIMITS, VCT, type CongDoan } from '../sd-jwt/credential-types.js';
 import { verifyStoredCredential, type VerifyCredentialOptions } from '../sd-jwt/verify.js';
 import { formatProductCode } from './gs1.js';
 
@@ -19,31 +19,41 @@ export const PRODUCT_CHAIN_LIMITS = Object.freeze({
 /** Same dependencies as verifyStoredCredential; the only supported vct is the product event. */
 export type VerifyProductChainOptions = Omit<VerifyCredentialOptions, 'supportedVcts'>;
 
-/** The claims of an event whose steps 1-4 passed; every value a string of at most 500 characters. */
+/** The claims of a shown event; every value a string of 1 to 500 characters. */
 export interface ProductEventView {
   congDoan: string;
   thoiDiem: string;
   diaDiem: string;
   moTa: string;
   maSanPham: string;
-  /** From the trust list; null unless the issuer_trust check passed. */
-  issuer: { maToChuc: string; ten: string } | null;
+  /** From the trust list: who signed it. */
+  issuer: { maToChuc: string; ten: string };
 }
 
 export interface ProductChainEvent {
   index: number;
+  /** Every check ok. */
   ok: boolean;
-  /** The checks of verifyStoredCredential, then `product_chain`. */
+  /** The checks of verifyStoredCredential, then `product_chain`; only `product_chain` at index 3 and later. */
   checks: Check[];
+  /** Only when every check but `status` passed: a revoked, suspended or unverifiable step is shown in red. */
   event?: ProductEventView;
 }
 
+/** The one verdict for the page. */
+export type ProductChainState = 'verified' | 'in_progress' | 'failed';
+
 export interface ProductChainResult {
-  /** Complete (all three stages, in order) and every event ok. */
+  /** verified: three stages, every event ok; in_progress: one or two stages, every event ok; failed: anything else. */
+  state: ProductChainState;
+  /** state === 'verified'. */
   ok: boolean;
-  /** TOO_LARGE / MALFORMED for the list itself (no event verified); CHAIN_BROKEN when an event's product_chain check failed; else null. */
-  code: ErrorCode | null;
+  /** state === 'verified'. */
   complete: boolean;
+  /** null unless failed: TOO_LARGE / MALFORMED for the list itself, else the first failing event's first failing code. */
+  code: ErrorCode | null;
+  /** The stages still to come when in_progress; [] otherwise. */
+  missingStages: CongDoan[];
   events: ProductChainEvent[];
 }
 
@@ -56,24 +66,15 @@ export async function productEventHash(compact: string, hasher: Hasher): Promise
   return base64UrlEncode(await hasher.sha256(utf8Encode(compact)));
 }
 
-const ISO_INSTANT = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{1,3})?Z$/;
-/** Milliseconds of an ISO 8601 UTC instant `YYYY-MM-DDTHH:MM:SS[.sss]Z` that names a real date, else null. */
-export function parseUtcInstant(s: unknown): number | null {
-  const m = typeof s === 'string' ? ISO_INSTANT.exec(s) : null;
-  if (!m) return null;
-  const ms = Date.parse(s as string);
-  // The round trip refuses 2026-02-30 and 24:00:00, which Date.parse would roll over or accept.
-  return Number.isFinite(ms) && new Date(ms).toISOString().startsWith(m[1]!) ? ms : null;
-}
-
 const VIEW_CLAIMS = ['ma_san_pham', 'cong_doan', 'thoi_diem', 'dia_diem', 'mo_ta'] as const;
 const isProductString = (v: unknown): v is string => typeof v === 'string' && v !== '' && v.length <= SD_JWT_LIMITS.maxProductStringLength;
 const broken = (detail: string): Check => ({ id: 'product_chain', ok: false, code: ErrorCodes.CHAIN_BROKEN, detail });
+const SKEW_MS = SD_JWT_LIMITS.clockSkewSeconds * 1000;
 
 /**
- * Step 10 for the event at `index`, whose steps 1-4 passed (its payload is authenticated).
+ * Step 10 for the event at `index` (0-2), whose steps 1-4 passed (its payload is authenticated).
  * `prevHash` is the hash of the event before it in the list as received (any validity);
- * `prevTime` that event's thoi_diem when its own steps 1-4 passed and the value is valid.
+ * `prevTime` that event's thoi_diem when its own product_chain check passed.
  */
 function chainCheck(p: Record<string, unknown>, index: number, code: string, prevHash: string | null, prevTime: number | null): Check {
   if (p['vct'] !== VCT.productEvent) return broken('not a product event');
@@ -85,6 +86,8 @@ function chainCheck(p: Record<string, unknown>, index: number, code: string, pre
   if (prevHash === null ? Object.hasOwn(p, 'prev') : p['prev'] !== prevHash) return broken(prevHash === null ? 'the first event carries prev' : 'prev does not match the event before');
   const time = parseUtcInstant(p['thoi_diem']);
   if (time === null) return broken('thoi_diem is not an ISO 8601 UTC instant');
+  // A stage dated in the future would block every later stage for good (events are never reissued).
+  if (time > (p['iat'] as number) * 1000 + SKEW_MS) return broken('thoi_diem is later than the event was signed');
   if (prevTime !== null && time < prevTime) return broken('thoi_diem is earlier than the event before');
   return { id: 'product_chain', ok: true, code: null };
 }
@@ -97,6 +100,8 @@ function listProblem(events: unknown): ErrorCode | null {
   return total > PRODUCT_CHAIN_LIMITS.maxTotalBytes ? ErrorCodes.TOO_LARGE : null;
 }
 
+const failed = (code: ErrorCode, events: ProductChainEvent[] = []): ProductChainResult => ({ state: 'failed', ok: false, complete: false, code, missingStages: [], events });
+
 /**
  * Verifies the events of one product, in the order received, against the product being viewed.
  * Events are verified one after another, so each status list and the trust list are fetched at
@@ -108,7 +113,7 @@ export async function verifyProductChain(
 ): Promise<ProductChainResult> {
   const code = formatProductCode(input?.gtin, input?.serial);
   const problem = listProblem(input.events);
-  if (problem) return { ok: false, code: problem, complete: false, events: [] };
+  if (problem) return failed(problem);
   const compacts = input.events as string[];
   const verifyOptions: VerifyCredentialOptions = { ...options, supportedVcts: [VCT.productEvent] };
 
@@ -116,6 +121,11 @@ export async function verifyProductChain(
   let prevHash: string | null = null;
   let prevTime: number | null = null;
   for (const [index, compact] of compacts.entries()) {
+    // No stage exists after phan_phoi: not parsed, no crypto, no request.
+    if (index >= CONG_DOAN.length) {
+      events.push({ index, ok: false, checks: [broken('no stage after phan_phoi')] });
+      continue;
+    }
     const r = await verifyStoredCredential(compact, verifyOptions);
     const checks = [...r.checks];
     const out: ProductChainEvent = { index, ok: false, checks };
@@ -124,12 +134,15 @@ export async function verifyProductChain(
     const parsed = r.credential ? parseSdJwt(compact) : null;
     if (parsed?.ok) {
       const p = parsed.sdJwt.payload;
-      checks.push(chainCheck(p, index, code, prevHash, prevTime));
-      // Only well-formed values reach the page: never an over-long or non-string claim.
-      if (VIEW_CLAIMS.every((k) => isProductString(p[k]))) {
+      const link = chainCheck(p, index, code, prevHash, prevTime);
+      checks.push(link);
+      // Only a step whose own link holds dates the next one (a future-dated step cannot block it).
+      if (link.ok) time = parseUtcInstant(p['thoi_diem']);
+      // Shown only for a step whose issuer is trusted and whose link holds (then the claims are
+      // well-formed strings): free text of anyone else never reaches the page.
+      if (checks.every((c) => c.ok || c.id === 'status')) {
         const s = (k: string) => p[k] as string;
-        out.event = { congDoan: s('cong_doan'), thoiDiem: s('thoi_diem'), diaDiem: s('dia_diem'), moTa: s('mo_ta'), maSanPham: s('ma_san_pham'), issuer: r.credential!.issuer };
-        time = parseUtcInstant(p['thoi_diem']);
+        out.event = { congDoan: s('cong_doan'), thoiDiem: s('thoi_diem'), diaDiem: s('dia_diem'), moTa: s('mo_ta'), maSanPham: s('ma_san_pham'), issuer: r.credential!.issuer! };
       }
     } else {
       checks.push({ id: 'product_chain', ok: false, code: ErrorCodes.SKIPPED, skipped: true });
@@ -140,7 +153,8 @@ export async function verifyProductChain(
     prevTime = time;
   }
 
-  const chainFailed = events.some((e) => e.checks.some((c) => c.id === 'product_chain' && !c.ok && !c.skipped));
-  const complete = events.length === CONG_DOAN.length && events.every((e) => e.checks.at(-1)!.ok);
-  return { ok: complete && events.every((e) => e.ok), code: chainFailed ? ErrorCodes.CHAIN_BROKEN : null, complete, events };
+  const firstBad = events.find((e) => !e.ok);
+  if (firstBad) return failed(firstBad.checks.find((c) => !c.ok)!.code!, events);
+  if (events.length === CONG_DOAN.length) return { state: 'verified', ok: true, complete: true, code: null, missingStages: [], events };
+  return { state: 'in_progress', ok: false, complete: false, code: null, missingStages: CONG_DOAN.slice(events.length), events };
 }

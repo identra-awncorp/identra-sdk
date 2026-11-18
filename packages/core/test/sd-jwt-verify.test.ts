@@ -37,7 +37,7 @@ describe('positive paths', () => {
   test('a product event passes without cnf or holder_binding', async () => {
     const compact = await issueProductEvent({
       ...(await issuerContext()), iss: ISS, status: STATUS,
-      claims: { ma_san_pham: '(01)09520123456788(21)A1', cong_doan: 'san_xuat', thoi_diem: '2026-05-30', dia_diem: 'HN', mo_ta: 'lô 1' },
+      claims: { ma_san_pham: '(01)09520123456788(21)A1', cong_doan: 'san_xuat', thoi_diem: '2026-05-30T00:00:00Z', dia_diem: 'HN', mo_ta: 'lô 1' },
     });
     const r = await verify(compact);
     assert.equal(r.ok, true, JSON.stringify(codes(r)));
@@ -174,8 +174,12 @@ describe('step 5 validity_time, step 6 credential_type', () => {
       assert.equal(check(await verify(await withPayload(patch)), 'validity_time').code, null, JSON.stringify(patch));
     }
   });
-  test('VCT_UNSUPPORTED', async () => {
-    await expectCode(await craft({}), 'credential_type', ErrorCodes.VCT_UNSUPPORTED, { supportedVcts: [VCT.productEvent] });
+  test('VCT_UNSUPPORTED; the issuer is trusted for that vct, yet no status request is made for it', async () => {
+    const status = fakeStatus();
+    const r = await expectCode(await craft({}), 'credential_type', ErrorCodes.VCT_UNSUPPORTED, { supportedVcts: [VCT.productEvent], statusChecker: status });
+    assert.equal(check(r, 'issuer_trust').code, null);
+    assert.equal(check(r, 'status').code, ErrorCodes.SKIPPED);
+    assert.equal(status.calls, 0);
   });
 });
 

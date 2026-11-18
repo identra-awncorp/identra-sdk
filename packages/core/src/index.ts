@@ -58,13 +58,14 @@ export { createSignedTrustListRegistry, TRUST_LIST_MAX_FRESH_SECONDS, type Signe
 export { createMappedFetch } from './mapped-fetch.js';
 // Product lifecycle chain (GĐ6b, docs/architecture.md section 10).
 export { formatDigitalLinkPath, formatProductCode, gs1CheckDigit, parseDigitalLinkPath, parseProductCode, type ProductCode } from './product/gs1.js';
+export { parseUtcInstant } from './sd-jwt/credential-types.js';
 export {
-  parseUtcInstant,
   PRODUCT_CHAIN_LIMITS,
   productEventHash,
   verifyProductChain,
   type ProductChainEvent,
   type ProductChainResult,
+  type ProductChainState,
   type ProductEventView,
   type VerifyProductChainOptions,
 } from './product/chain.js';

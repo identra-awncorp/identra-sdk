@@ -31,4 +31,4 @@ export {
 } from './issuance/issuer.js';
 export { ACCESS_TOKEN_SECONDS } from './issuance/access-token.js';
 export { PROOF_TYP } from './issuance/proof.js';
-export { appendProductEvent, checkProductEventForStorage, type AppendProductEventInput, type StorageCheck } from './product-chain.js';
+export { appendProductEvent, checkProductEventForStorage, ProductChainRefusedError, type AppendProductEventInput, type StorageCheck } from './product-chain.js';

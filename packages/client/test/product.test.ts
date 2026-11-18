@@ -10,9 +10,12 @@ const { GTIN, SERIAL, CODE, TIMES } = helpers;
 const server = await serve(47660);
 after(server.close);
 
-function setup(world: World, events: string[]) {
+const SERVER_TIME = '2026-11-18T10:00:00Z';
+const NO_SERVER_TIME = Symbol('absent');
+
+function setup(world: World, events: string[], serverTime: unknown = SERVER_TIME) {
   server.state.world = world;
-  server.state.handlers = { [eventsPath()]: json(200, { gtin: GTIN, serial: SERIAL, events }) };
+  server.state.handlers = { [eventsPath()]: json(200, { gtin: GTIN, serial: SERIAL, events, ...(serverTime === NO_SERVER_TIME ? {} : { serverTime }) }) };
   server.state.requests = [];
   const calls: { url: string; init: RequestInit }[] = [];
   const recording: typeof fetch = (input, init = {}) => {
@@ -28,11 +31,12 @@ test('a complete chain loads and verifies; requests: events, trust list, one sta
   const { verifier, calls, paths } = setup(world, await world.chain(3));
   const view = await verifier.load(GTIN, SERIAL);
   assert.equal(view.state, 'ok');
-  assert.deepEqual({ ok: view.result!.ok, complete: view.result!.complete, code: view.result!.code }, { ok: true, complete: true, code: null });
+  assert.deepEqual({ state: view.result!.state, ok: view.result!.ok, complete: view.result!.complete, code: view.result!.code }, { state: 'verified', ok: true, complete: true, code: null });
   assert.deepEqual(view.result!.events.map((e) => e.event?.thoiDiem), TIMES);
   assert.equal(view.result!.events[0]!.event!.maSanPham, CODE);
   assert.equal(view.verifiedAt, world.now.toISOString());
-  assert.equal(view.serverTime, '2026-11-18T10:00:00.000Z');
+  assert.equal(view.serverTime, SERVER_TIME);
+  assert.equal(view.clockSkewSeconds, Math.round((world.now.getTime() - Date.parse(SERVER_TIME)) / 1000));
   const status = (org: string) => helpers.statusUriOf(org).slice(CANONICAL.length);
   assert.deepEqual(paths(), [eventsPath(), '/trust-list', status('nha-san-xuat'), status('kiem-dinh'), status('phan-phoi')]);
   for (const { init } of calls) {
@@ -113,4 +117,32 @@ test('serials are percent-encoded in the API path; invalid input is a programmer
   await assert.rejects(verifier.load('09520123456789', SERIAL), TypeError);
   await assert.rejects(verifier.load(GTIN, '..'), TypeError);
   assert.throws(() => createProductVerifier({ apiBaseUrl: 'http://127.0.0.1:1/path', rootCertificates: [world.root] }), TypeError);
+});
+
+test('a trusted certificate whose SAN is on another host: its status list is never requested there', async () => {
+  const foreign = await helpers.foreignSanIssuer('https://evil.example/issuers/nha-san-xuat');
+  const world = await helpers.productWorld({ issuers: [foreign.entry, helpers.trustIssuer('kiem-dinh'), helpers.trustIssuer('phan-phoi')] });
+  const { verifier, calls, paths } = setup(world, [foreign.event]);
+  const view = await verifier.load(GTIN, SERIAL);
+  const failed = view.result!.events[0]!.checks.filter((c) => !c.ok).map((c) => `${c.id}:${c.code}`);
+  assert.deepEqual(failed, ['status:STATUS_UNAVAILABLE']); // chain and trust pass: only the pinned fetch stops it
+  assert.ok(calls.every((c) => c.url.startsWith(server.baseUrl)), calls.map((c) => c.url).join(' '));
+  assert.deepEqual(paths(), [eventsPath(), '/trust-list']);
+});
+
+test('serverTime is a hint only: validated strictly, and a lying one changes no check', async () => {
+  const world = await helpers.productWorld();
+  const events = await world.chain(3);
+  const honest = await setup(world, events).verifier.load(GTIN, SERIAL);
+  for (const lie of ['2000-01-01T00:00:00Z', '9999-12-31T23:59:59.999Z']) {
+    const view = await setup(world, events, lie).verifier.load(GTIN, SERIAL);
+    assert.deepEqual(view.result, honest.result, lie);
+    assert.equal(view.serverTime, lie);
+    assert.equal(view.clockSkewSeconds, Math.round((world.now.getTime() - Date.parse(lie)) / 1000));
+  }
+  const absent = await setup(world, events, NO_SERVER_TIME).verifier.load(GTIN, SERIAL);
+  assert.deepEqual([absent.state, absent.serverTime, absent.clockSkewSeconds], ['ok', undefined, undefined]);
+  for (const bad of ['tomorrow', 0, null, '2026-11-18T10:00:00+07:00', '2026-02-30T00:00:00Z', 'Wed, 18 Nov 2026 10:00:00 GMT']) {
+    assert.equal((await setup(world, events, bad).verifier.load(GTIN, SERIAL)).state, 'invalid_response', String(bad));
+  }
 });

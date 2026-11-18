@@ -2,6 +2,7 @@
 // organisations with their vc-product and status certificates, a trust list with their cong_doan
 // scopes, one status list per organisation, all served by a recording in-memory fetch, and the real
 // trust registry and status checker on top. Time is fixed one hour after the newest certificate.
+import { createPrivateKey } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import {
   base64Encode,
@@ -24,6 +25,7 @@ import {
   type VerifyProductChainOptions,
 } from '@identra/sdk-core';
 import { createWebCryptoSigner, webCryptoHasher, webCryptoRandom, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
+import { extRest, forge, withExtension } from './forge.js';
 import { ok, scriptedFetch, TRUST_URL } from './lists.js';
 import { pemCerts, REPO } from './pki.js';
 import { fingerprintOf, rawJws } from './sdjwt.js';
@@ -39,13 +41,13 @@ export const issOf = (org: string) => `https://api-identra.awncorp.vn/issuers/${
 export const statusUriOf = (org: string) => `${issOf(org)}/status/1`;
 export const TIMES = ['2026-01-02T08:00:00Z', '2026-01-03T09:30:00Z', '2026-01-05T15:00:00.250Z'];
 
-const demoCerts = (path: string) => pemCerts(readFileSync(new URL(path, DEMO), 'utf8'));
+export const demoCerts = (path: string) => pemCerts(readFileSync(new URL(path, DEMO), 'utf8'));
 export const demoRoot = (): Uint8Array => demoCerts('root.cert.pem')[0]!;
 const files = [...ORGS.flatMap((o) => [`orgs/${o}/vc-product.cert.pem`, `orgs/${o}/status.cert.pem`]), 'trust-list-signer/trust-list.cert.pem'];
 /** One hour after the newest certificate's notBefore: every demo certificate is valid then. */
 export const PRODUCT_NOW = new Date(Math.max(...files.map((f) => parseCertificate(demoCerts(f)[0]!).notBefore.getTime())) + 3600_000);
 
-export const demoSigner = (org: string, purpose: 'vc-product' | 'status'): Promise<Signer> =>
+export const demoSigner = (org: string, purpose: 'vc' | 'vc-product' | 'status'): Promise<Signer> =>
   createWebCryptoSigner({
     privateKey: readFileSync(new URL(`orgs/${org}/${purpose}.key.pem`, DEMO), 'utf8'),
     x5c: demoCerts(`orgs/${org}/${purpose}.chain.pem`).map(base64Encode),
@@ -125,4 +127,27 @@ export async function productWorld(o: { issuers?: TrustListIssuer[] } = {}) {
     /** URLs fetched so far. */
     urls: () => served.calls.map((c) => c.url),
   };
+}
+
+/**
+ * The nha-san-xuat vc-product leaf re-issued by the demo Issuing CA with the SAN URI `iss` (another
+ * host), its fingerprint added to the organisation's trust list entry, and a first-stage event it
+ * signs with `iss` and a status list under `iss`: a trusted certificate pointing elsewhere.
+ */
+export async function foreignSanIssuer(iss = 'https://evil.example/issuers/nha-san-xuat') {
+  const [leaf, issuing] = demoCerts('orgs/nha-san-xuat/vc-product.chain.pem') as [Uint8Array, Uint8Array];
+  const uri = [...new TextEncoder().encode(iss)];
+  const caKey = createPrivateKey(readFileSync(new URL('ca/issuing/ca.key.pem', DEMO), 'utf8'));
+  const forged = forge(leaf, (tbs) => withExtension(tbs, 'subjectAltName', extRest(false, [0x30, uri.length + 2, 0x86, uri.length, ...uri])), caKey);
+  const entry = trustIssuer('nha-san-xuat');
+  entry.chung_thu.push({ sha256: fingerprintOf(forged), muc_dich: 'vc' });
+  const signer = await createWebCryptoSigner({
+    privateKey: readFileSync(new URL('orgs/nha-san-xuat/vc-product.key.pem', DEMO), 'utf8'),
+    x5c: [base64Encode(forged), base64Encode(issuing)],
+  });
+  const payload = {
+    iss, vct: VCT.productEvent, iat: Math.floor(PRODUCT_NOW.getTime() / 1000) - 600, status: { status_list: { idx: 3, uri: `${iss}/status/1` } },
+    ma_san_pham: CODE, cong_doan: 'san_xuat', thoi_diem: TIMES[0], dia_diem: 'd', mo_ta: 'm',
+  };
+  return { entry, event: `${await rawJws({ alg: 'ES256', typ: 'dc+sd-jwt', x5c: signer.x5c }, payload, signer)}~` };
 }

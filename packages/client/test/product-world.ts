@@ -22,6 +22,7 @@ interface Helpers {
   CODE: string;
   TIMES: string[];
   statusUriOf(org: string): string;
+  foreignSanIssuer(iss?: string): Promise<{ entry: unknown; event: string }>;
 }
 export const helpers = (await import(new URL('../../core/test-dist/helpers/product.js', import.meta.url).href)) as Helpers;
 export const eventsPath = (gtin = helpers.GTIN, serial = helpers.SERIAL) => `/v1/products/${gtin}/${serial}/events`;
@@ -53,4 +54,4 @@ export async function serve(port: number) {
 }
 
 export const json = (status: number, body: unknown) => (_req: IncomingMessage, res: ServerResponse) =>
-  void res.writeHead(status, { 'content-type': 'application/json', date: 'Wed, 18 Nov 2026 10:00:00 GMT' }).end(typeof body === 'string' ? body : JSON.stringify(body));
+  void res.writeHead(status, { 'content-type': 'application/json' }).end(typeof body === 'string' ? body : JSON.stringify(body));

@@ -51,7 +51,8 @@ test('Digital Link path: formats and parses, percent-encoding exactly the non-ra
     const serial = SET82.slice(i, i + 20);
     assert.deepEqual(parseDigitalLinkPath(formatDigitalLinkPath(SAMPLE, serial)), { gtin: SAMPLE, serial }, serial);
   }
-  assert.deepEqual(parseDigitalLinkPath(`/01/${SAMPLE}/21/a%2fb`), { gtin: SAMPLE, serial: 'a/b' }); // lower-case hex
+  assert.deepEqual(parseDigitalLinkPath(`/01/${SAMPLE}/21/a%2Fb`), { gtin: SAMPLE, serial: 'a/b' });
+  assert.equal(parseDigitalLinkPath(`/01/${SAMPLE}/21/a%2fb`), null); // lower-case hex: not the one path Identra prints
   assert.deepEqual(parseDigitalLinkPath(`/01/${SAMPLE}/21/50%25`), { gtin: SAMPLE, serial: '50%' });
   assert.deepEqual(parseDigitalLinkPath(`/01/${SAMPLE}/21/${'%2F'.repeat(20)}`)?.serial, '/'.repeat(20));
 });

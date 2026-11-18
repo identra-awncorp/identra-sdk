@@ -1,7 +1,8 @@
 // GS1 product identifiers (ADR-0012 section 1): GTIN-14 plus serial, AI (01) + AI (21), as the
 // element string `(01)<GTIN>(21)<serial>` (the `ma_san_pham` claim) and as the GS1 Digital Link
-// path `/01/<GTIN>/21/<serial>` (the product QR). Strict on purpose: exactly these two AIs in this
-// order, nothing else is accepted.
+// path `/01/<GTIN>/21/<serial>` (the product QR). Strict on purpose: Identra prints and accepts
+// exactly `/01/<GTIN-14>/21/<serial>`; lot or other key qualifiers, shorter GTINs, trailing slashes,
+// raw sub-delimiters and lower-case percent-escapes are refused, so each product has one path.
 
 /** One parsed product identifier. */
 export interface ProductCode {
@@ -73,21 +74,21 @@ export function formatDigitalLinkPath(gtin: string, serial: string): string {
 
 /** "/01/" + 14 digits + "/21/" + at most 20 characters encoded as 3 each. */
 const MAX_PATH = 4 + 14 + 4 + 20 * 3;
-const PATH = /^\/01\/([0-9]{14})\/21\/((?:[A-Za-z0-9._-]|%[0-9A-Fa-f]{2}){1,20})$/;
+const PATH = /^\/01\/([0-9]{14})\/21\/((?:[A-Za-z0-9._-]|%[0-9A-F]{2}){1,20})$/;
 
 /**
- * Parses a GS1 Digital Link path `/01/<GTIN>/21/<serial>` (e.g. `location.pathname`), or null.
- * Only this exact form: no other AI, no query, fragment, trailing slash or extra segment; a
- * percent-encoded byte must decode to a set-82 character that would not be written raw (`%41` for
- * `A` is refused: one serial has exactly one path); the decoded serial must pass isSerial, which
- * refuses a double-encoded one.
+ * Parses a GS1 Digital Link path `/01/<GTIN-14>/21/<serial>` (e.g. `location.pathname`), or null.
+ * Only the exact form formatDigitalLinkPath writes: no other AI or qualifier, no query, fragment,
+ * trailing slash or extra segment; `A–Z a–z 0–9 - . _` raw, every other set-82 character as an
+ * UPPER-CASE percent-escape, an escape of a raw character (`%41`) refused, so one serial has exactly
+ * one accepted path; the decoded serial must pass isSerial, which refuses a double-encoded one.
  */
 export function parseDigitalLinkPath(path: unknown): ProductCode | null {
   if (typeof path !== 'string' || path.length > MAX_PATH) return null;
   const m = PATH.exec(path);
   if (!m || !isGtin14(m[1])) return null;
   let serial = '';
-  for (const piece of m[2]!.match(/%[0-9A-Fa-f]{2}|[^%]/g)!) {
+  for (const piece of m[2]!.match(/%[0-9A-F]{2}|[^%]/g)!) {
     if (piece.length === 1) {
       serial += piece;
       continue;

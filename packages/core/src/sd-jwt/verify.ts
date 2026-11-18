@@ -222,13 +222,13 @@ async function verify(
     }
   };
   await run('validity_time', () => checkValidityTime(p, options.now));
-  await run('credential_type', () => {
+  const typeOk = await run('credential_type', () => {
     if (!options.supportedVcts.includes(p['vct'] as string)) throw new Failure(ErrorCodes.VCT_UNSUPPORTED, 'vct is not supported');
   });
   let entry: TrustEntry | undefined;
   const trusted = await run('issuer_trust', async () => void (entry = await checkIssuerTrust(options, fingerprint, leaf, p)));
-  // No status request is sent on behalf of an untrusted issuer.
-  if (trusted) await run('status', () => checkStatus(options, p, entry!));
+  // No status request on behalf of an untrusted issuer, nor for a credential of an unsupported type.
+  if (trusted && typeOk) await run('status', () => checkStatus(options, p, entry!));
   else skip(['status']);
   let claims: Record<string, unknown> | undefined = Object.fromEntries(
     Object.entries(p).filter(([k]) => !METADATA_CLAIMS.includes(k) && k !== '_sd' && k !== '_sd_alg'),

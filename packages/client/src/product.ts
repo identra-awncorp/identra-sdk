@@ -8,6 +8,7 @@ import {
   createSignedTrustListRegistry,
   createStatusListChecker,
   formatDigitalLinkPath,
+  parseUtcInstant,
   PRODUCT_CHAIN_LIMITS,
   verifyProductChain,
   type HttpFetch,
@@ -15,12 +16,11 @@ import {
 } from '@identra/sdk-core';
 import { webCryptoHasher, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 
-export type { ProductChainEvent, ProductChainResult, ProductEventView } from '@identra/sdk-core';
+export type { ProductChainEvent, ProductChainResult, ProductChainState, ProductEventView } from '@identra/sdk-core';
 
 /** Cap on any response body: 20 events of 16 KB plus the envelope (also above the 256 KB trust list). */
 export const PRODUCT_RESPONSE_MAX_BYTES = PRODUCT_CHAIN_LIMITS.maxTotalBytes + 4096;
 const EVENTS_TIMEOUT_MS = 5000;
-const MAX_ECHO = 64;
 
 export interface ProductView {
   state: 'ok' | 'not_found' | 'network_error' | 'invalid_response';
@@ -31,11 +31,13 @@ export interface ProductView {
   /** ISO instant of the local clock used for the verification. */
   verifiedAt: string;
   /**
-   * ISO instant from the events response's HTTP `Date` header, when present, for the "giờ máy chưa
-   * đúng" warning (ADR-0012 requirement 5). Cross-origin, the API must expose `Date`
-   * (Access-Control-Expose-Headers).
+   * The store's clock (`serverTime` of the response envelope) and the local clock minus it, in
+   * seconds, when the store sent one. A HINT only, for the "giờ máy chưa đúng" message of ADR-0012
+   * requirement 5 next to certificates that look not yet valid or a trust list that looks expired:
+   * the store is not trusted and no check uses it.
    */
   serverTime?: string;
+  clockSkewSeconds?: number;
 }
 
 export interface ProductVerifier {
@@ -123,10 +125,14 @@ export function createProductVerifier(options: {
   const clock = { now: () => new Date(now()) };
   // Identifiers stay canonical; only the network access goes to apiBaseUrl (validated here).
   const http = createMappedFetch(browserHttpFetch(fetchFn), { [canonical]: options.apiBaseUrl });
+  // Trust list and status lists come only from the canonical API, whatever a trusted certificate's
+  // SAN (and so a credential's iss and status uri) says: nothing else is ever requested.
+  const lists: HttpFetch = (url, init) =>
+    url === `${canonical}/trust-list` || url.startsWith(`${canonical}/issuers/`) ? http(url, init) : Promise.reject(new Error('not a canonical API URL'));
   const verifier = webCryptoVerifier;
   const chainValidator = createCertificateChainValidator({ trustedRoots: options.rootCertificates, verifier, hasher: webCryptoHasher });
-  const trustRegistry = createSignedTrustListRegistry({ url: `${canonical}/trust-list`, fetch: http, verifier, chainValidator, clock });
-  const statusChecker = createStatusListChecker({ fetch: http, verifier, chainValidator, trustRegistry, clock });
+  const trustRegistry = createSignedTrustListRegistry({ url: `${canonical}/trust-list`, fetch: lists, verifier, chainValidator, clock });
+  const statusChecker = createStatusListChecker({ fetch: lists, verifier, chainValidator, trustRegistry, clock });
 
   return {
     async load(gtin, serial) {
@@ -137,11 +143,9 @@ export function createProductVerifier(options: {
       });
       let status: number;
       let text: string;
-      let date: string | null;
       try {
         const res = await http(`${canonical}/v1/products/${gtin}/${encodedSerial}/events`, { method: 'GET', headers: { accept: 'application/json' }, timeoutMs: EVENTS_TIMEOUT_MS });
         status = res.status;
-        date = res.headers.get('date');
         text = await res.text();
       } catch (e) {
         return view(e instanceof ResponseTooLarge ? 'invalid_response' : 'network_error');
@@ -155,12 +159,16 @@ export function createProductVerifier(options: {
         return view('invalid_response');
       }
       if (!isObject(body) || body['gtin'] !== gtin || body['serial'] !== serial || !Array.isArray(body['events'])) return view('invalid_response');
-      const serverMs = date !== null && date.length <= MAX_ECHO ? Date.parse(date) : NaN;
+      const hasServerTime = Object.hasOwn(body, 'serverTime');
+      const serverMs = hasServerTime ? parseUtcInstant(body['serverTime']) : null;
+      if (hasServerTime && serverMs === null) return view('invalid_response');
+      const now = clock.now();
       const result = await verifyProductChain(
         { gtin, serial, events: body['events'] },
-        { verifier, hasher: webCryptoHasher, chainValidator, trustRegistry, statusChecker, now: clock.now() },
+        { verifier, hasher: webCryptoHasher, chainValidator, trustRegistry, statusChecker, now },
       );
-      return view('ok', { result, ...(Number.isFinite(serverMs) ? { serverTime: new Date(serverMs).toISOString() } : {}) });
+      const hint = serverMs === null ? {} : { serverTime: body['serverTime'] as string, clockSkewSeconds: Math.round((now.getTime() - serverMs) / 1000) };
+      return view('ok', { result, ...hint });
     },
   };
 }

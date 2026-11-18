@@ -64,3 +64,16 @@ export function isStatusListUri(uri: unknown, iss: string): boolean {
   const prefix = `${iss}/status/`;
   return typeof uri === 'string' && uri.startsWith(prefix) && STATUS_LIST_NUMBER.test(uri.slice(prefix.length));
 }
+
+const ISO_INSTANT = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{1,3})?Z$/;
+/**
+ * Milliseconds of an ISO 8601 UTC instant `YYYY-MM-DDTHH:MM:SS[.sss]Z` that names a real date
+ * (years 0000-9999), else null. The form of a product event's `thoi_diem`.
+ */
+export function parseUtcInstant(s: unknown): number | null {
+  const m = typeof s === 'string' ? ISO_INSTANT.exec(s) : null;
+  if (!m) return null;
+  const ms = Date.parse(s as string);
+  // The round trip refuses 2026-02-30 and 24:00:00, which Date.parse would roll over or accept.
+  return Number.isFinite(ms) && new Date(ms).toISOString().startsWith(m[1]!) ? ms : null;
+}
