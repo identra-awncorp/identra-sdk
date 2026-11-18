@@ -3,7 +3,7 @@
 // and dcql builds and evaluates the query; every decision is taken by the caller.
 import { Openid4vpVerifier } from '@openid4vc/openid4vp';
 import { DcqlPresentationResult, DcqlQuery } from 'dcql';
-import { compactDecrypt, importJWK, type JWK } from 'jose';
+import { compactDecrypt, decodeProtectedHeader, importJWK, type JWK } from 'jose';
 import { normalizeEcPublicJwk, utf8Decode, utf8Encode, type EcPublicJwk, type Hasher } from '@identra/sdk-core';
 
 export const CREDENTIAL_QUERY_ID = 'credential';
@@ -46,12 +46,24 @@ const notUsed = () => {
   throw new Error('the verifier never asks the OpenID4VP library to sign or verify');
 };
 
+/** Decrypts a compact JWE with ECDH-ES and A128GCM / A256GCM only; a compressed (`zip`) JWE is refused before any work. Null on failure. */
+export async function decryptCompact(jwe: string, privateJwk: JWK): Promise<string | null> {
+  try {
+    if ('zip' in decodeProtectedHeader(jwe)) return null;
+    const { plaintext } = await compactDecrypt(jwe, await importJWK(privateJwk, 'ECDH-ES'), { keyManagementAlgorithms: ['ECDH-ES'], contentEncryptionAlgorithms: RESPONSE_ENC_VALUES });
+    return utf8Decode(plaintext);
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Decrypts (ECDH-ES, A128GCM / A256GCM, the session key only) and parses a direct_post.jwt response
- * form; the library checks `state` against the request and the vp_token shape. Returns the
- * presentations per DCQL credential id, or null for anything it refuses. Never throws for bad input.
+ * Decrypts (decryptCompact, the session key only) and parses a direct_post.jwt response form; the
+ * library checks `state` against the request. Returns the `vp_token` exactly as decrypted (not as
+ * the library normalises it), or null for anything refused. Never throws for bad input.
  */
-export async function parseResponse(o: { form: Record<string, string>; requestPayload: Record<string, unknown>; privateJwk: JWK; hasher: Hasher }): Promise<Record<string, unknown[]> | null> {
+export async function parseResponse(o: { form: Record<string, string>; requestPayload: Record<string, unknown>; privateJwk: JWK; hasher: Hasher }): Promise<unknown> {
+  let decrypted: string | null = null;
   const callbacks = {
     hash: (data: string | ArrayBuffer) => o.hasher.sha256(typeof data === 'string' ? utf8Encode(data) : new Uint8Array(data)),
     generateRandom: notUsed,
@@ -60,19 +72,14 @@ export async function parseResponse(o: { form: Record<string, string>; requestPa
     encryptJwe: notUsed,
     clientAuthentication: () => {},
     decryptJwe: async (jwe: string, options?: { jwk?: unknown }) => {
-      try {
-        const key = await importJWK(o.privateJwk, 'ECDH-ES');
-        const { plaintext } = await compactDecrypt(jwe, key, { keyManagementAlgorithms: ['ECDH-ES'], contentEncryptionAlgorithms: RESPONSE_ENC_VALUES });
-        return { decrypted: true, decryptionJwk: (options?.jwk ?? {}) as never, payload: utf8Decode(plaintext) };
-      } catch {
-        return { decrypted: false };
-      }
+      decrypted = await decryptCompact(jwe, o.privateJwk);
+      return decrypted === null ? { decrypted: false } : { decrypted: true, decryptionJwk: (options?.jwk ?? {}) as never, payload: decrypted };
     },
   } as never;
   try {
     const parsed = await new Openid4vpVerifier({ callbacks }).parseOpenid4vpAuthorizationResponse({ authorizationResponse: o.form, authorizationRequestPayload: o.requestPayload as never, callbacks });
-    if (parsed.type !== 'dcql' || parsed.jarm?.type !== 'Encrypted') return null;
-    return parsed.dcql.presentations as Record<string, unknown[]>;
+    if (parsed.type !== 'dcql' || parsed.jarm?.type !== 'Encrypted' || decrypted === null) return null;
+    return (JSON.parse(decrypted) as { vp_token?: unknown }).vp_token ?? null;
   } catch {
     return null;
   }

@@ -11,13 +11,16 @@ import {
 import { encryptJwe, type JweEnc } from '../jwe.js';
 import type { WalletContext } from './context.js';
 import { issuerNameOf } from './credentials.js';
-import { Fail, keyFailureCode, WalletErrorCodes as C, type WalletErrorCode, type WalletFailure } from './errors.js';
+import { CredentialVaultError } from '../credential-vault.js';
+import { Fail, keyFailureCode, vaultFailureCode, WalletErrorCodes as C, type WalletErrorCode, type WalletFailure } from './errors.js';
 import { guardFetch, httpsOrigin, PROTOCOL_MAX_BYTES, PROTOCOL_TIMEOUT_MS, WalletFetchError } from './fetch.js';
 import { failureOf, matchDcql, resolvePresentationRequest, type JarToCheck } from './library.js';
 
 const QR_PREFIX = 'openid4vp://?';
 const CLIENT_ID = /^x509_hash:[A-Za-z0-9_-]{43}$/;
 const SKEW_SECONDS = 60;
+const MAX_REQUEST_SECONDS = 600;
+const SIOP_AUDIENCE = 'https://self-issued.me/v2';
 
 export type VerifierIdentity = { trusted: true; ten: string; maToChuc: string } | { trusted: false };
 
@@ -34,8 +37,8 @@ export interface ResolvedPresentation {
   verifier: VerifierIdentity;
   /** VERIFIER_NOT_TRUSTED when the verifier is not in the trust list: show a red warning (ADR-0011 point 3). */
   warning?: typeof C.VERIFIER_NOT_TRUSTED;
-  /** The verifier's stated purpose (DCQL credential set `purpose`), as sent; unverified text. */
-  purpose?: unknown;
+  /** The trusted verifier's stated purpose (DCQL credential set `purpose`), sanitised; never for an untrusted verifier. */
+  purpose?: string | { vi?: string; en?: string };
   matches: PresentationMatch[];
   expiresAt: string;
 }
@@ -74,8 +77,34 @@ function parseQr(qrText: unknown): { clientId: string; requestUri: string; origi
   return { clientId, requestUri, origin };
 }
 
-/** The `credential_sets[0].purpose` of a query, if any. */
-const purposeOf = (q: Record<string, unknown>): unknown => (Array.isArray(q['credential_sets']) && isObject(q['credential_sets'][0]) ? q['credential_sets'][0]['purpose'] : undefined);
+const MAX_PURPOSE_LENGTH = 300;
+// C0 and C1 controls, and the bidirectional marks and overrides that can reorder displayed text.
+const UNSAFE_TEXT = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+const safeText = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_PURPOSE_LENGTH && !UNSAFE_TEXT.test(v);
+
+/**
+ * The verifier's stated purpose (`credential_sets[0].purpose`) when it is a safe string or
+ * `{ vi?, en? }` of safe strings (at most 300 characters, no control or bidi characters); anything
+ * else is dropped, not an error.
+ */
+function purposeOf(q: Record<string, unknown>): string | { vi?: string; en?: string } | undefined {
+  const raw = Array.isArray(q['credential_sets']) && isObject(q['credential_sets'][0]) ? q['credential_sets'][0]['purpose'] : undefined;
+  if (safeText(raw)) return raw;
+  if (!isObject(raw) || Object.keys(raw).some((k) => k !== 'vi' && k !== 'en') || Object.keys(raw).length === 0) return undefined;
+  if (!Object.values(raw).every(safeText)) return undefined;
+  return { ...(raw['vi'] !== undefined ? { vi: raw['vi'] as string } : {}), ...(raw['en'] !== undefined ? { en: raw['en'] as string } : {}) };
+}
+
+/** The one `credential_sets` form accepted: absent, or exactly one set with exactly one option naming `id` (it carries the purpose). */
+function plainCredentialSets(q: Record<string, unknown>, id: string): boolean {
+  const sets = q['credential_sets'];
+  if (sets === undefined) return true;
+  if (!Array.isArray(sets) || sets.length !== 1 || !isObject(sets[0])) return false;
+  const { options, required, purpose, ...rest } = sets[0];
+  void purpose;
+  return Object.keys(rest).length === 0 && (required === undefined || required === true) && Array.isArray(options) && options.length === 1 &&
+    Array.isArray(options[0]) && options[0].length === 1 && options[0][0] === id;
+}
 
 export function createPresentations(ctx: WalletContext) {
   const depsFor = (origin: string) => ({
@@ -105,12 +134,15 @@ export function createPresentations(ctx: WalletContext) {
       throw new Fail(C.REQUEST_INVALID);
     }
     if (`x509_hash:${chain.fingerprint}` !== qr.clientId || p['client_id'] !== qr.clientId) throw new Fail(C.CLIENT_ID_MISMATCH);
-    if (p['response_mode'] !== 'direct_post.jwt') throw new Fail(C.REQUEST_INVALID);
+    if (p['response_mode'] !== 'direct_post.jwt' || p['response_type'] !== 'vp_token' || p['aud'] !== SIOP_AUDIENCE) throw new Fail(C.REQUEST_INVALID);
     if (httpsOrigin(p['response_uri']) !== qr.origin) throw new Fail(C.URL_NOT_ALLOWED);
     if (typeof p['nonce'] !== 'string' || p['nonce'].length < 16 || (p['state'] !== undefined && typeof p['state'] !== 'string')) throw new Fail(C.REQUEST_INVALID);
     const t = now.getTime() / 1000;
-    if (typeof p['exp'] !== 'number' || p['exp'] <= t - SKEW_SECONDS) throw new Fail(C.REQUEST_EXPIRED);
+    if (typeof p['exp'] !== 'number' || !Number.isFinite(p['exp'])) throw new Fail(C.REQUEST_INVALID);
     if (p['iat'] !== undefined && (typeof p['iat'] !== 'number' || p['iat'] > t + SKEW_SECONDS)) throw new Fail(C.REQUEST_INVALID);
+    // A request lives minutes, not years: exp at most 600 s after min(iat, now).
+    if (p['exp'] > Math.min((p['iat'] as number | undefined) ?? t, t) + MAX_REQUEST_SECONDS) throw new Fail(C.REQUEST_INVALID);
+    if (p['exp'] <= t - SKEW_SECONDS) throw new Fail(C.REQUEST_EXPIRED);
     const meta = isObject(p['client_metadata']) ? p['client_metadata'] : {};
     const keys = isObject(meta['jwks']) && Array.isArray(meta['jwks']['keys']) ? (meta['jwks']['keys'] as unknown[]).filter((k) => isObject(k) && k['alg'] === 'ECDH-ES' && (k['use'] ?? 'enc') === 'enc') : [];
     const key = keys.length === 1 ? (keys[0] as Record<string, unknown>) : null;
@@ -122,11 +154,13 @@ export function createPresentations(ctx: WalletContext) {
     const credentialQueries = query && Array.isArray(query['credentials']) ? query['credentials'] : [];
     const cq = credentialQueries.length === 1 && isObject(credentialQueries[0]) ? credentialQueries[0] : null;
     if (!enc || !query || !cq || cq['format'] !== 'dc+sd-jwt' || typeof cq['id'] !== 'string') throw new Fail(C.REQUEST_INVALID);
+    // One credential, no `multiple`, no value matching, credential_sets only in the form that carries the purpose.
+    if (cq['multiple'] === true || !plainCredentialSets(query, cq['id'])) throw new Fail(C.REQUEST_INVALID);
     // Claim set entries are claim ids; each claim must be one top-level name, which is what gets disclosed.
     const claimNames = new Map<string, string>();
     for (const c of Array.isArray(cq['claims']) ? cq['claims'] : []) {
       const path = isObject(c) ? c['path'] : undefined;
-      if (!isObject(c) || typeof c['id'] !== 'string' || !Array.isArray(path) || path.length !== 1 || typeof path[0] !== 'string') throw new Fail(C.REQUEST_INVALID);
+      if (!isObject(c) || typeof c['id'] !== 'string' || !Array.isArray(path) || path.length !== 1 || typeof path[0] !== 'string' || 'values' in c) throw new Fail(C.REQUEST_INVALID);
       claimNames.set(c['id'], path[0]);
     }
     const sets = Array.isArray(cq['claim_sets']) ? (cq['claim_sets'] as unknown[]) : [[...claimNames.keys()]];
@@ -145,14 +179,28 @@ export function createPresentations(ctx: WalletContext) {
   /** The vault's credentials the query can use, with the claim sets each satisfies. */
   async function match(query: Record<string, unknown>, queryId: string, claimSets: string[][]): Promise<PresentationMatch[]> {
     const vcts = (((query['credentials'] as Record<string, unknown>[])[0]!['meta'] as Record<string, unknown> | undefined)?.['vct_values'] as unknown[] | undefined) ?? [];
-    const rows = (await ctx.vault.list()).filter((r) => vcts.includes(r.vct));
+    let rows;
+    try {
+      rows = (await ctx.vault.list()).filter((r) => vcts.includes(r.vct));
+    } catch (e) {
+      throw new Fail(vaultFailureCode(e));
+    }
     const held: { id: string; vct: string; x5c: unknown; claims: Record<string, unknown> }[] = [];
     for (const row of rows) {
+      let compact: string;
       try {
-        const d = decodeCredentialUnverified(await ctx.vault.open(row.id));
+        compact = await ctx.vault.open(row.id);
+      } catch (e) {
+        // A row that does not decrypt is not offered (purgeUndecryptable reports it); a data key that
+        // cannot be read (cancelled, locked, invalidated) or a failing vault ends the resolve.
+        if (e instanceof CredentialVaultError && e.code === 'UNDECRYPTABLE') continue;
+        throw new Fail(vaultFailureCode(e));
+      }
+      try {
+        const d = decodeCredentialUnverified(compact);
         held.push({ id: row.id, vct: d.payload['vct'] as string, x5c: d.header['x5c'], claims: Object.fromEntries(d.disclosures.map((x) => [x.name, x.value])) });
       } catch {
-        // A row that does not open is not offered (the vault reports it elsewhere).
+        // not a compact this wallet stored: skipped
       }
     }
     const satisfied = matchDcql(query, queryId, held);
@@ -211,7 +259,8 @@ export function createPresentations(ctx: WalletContext) {
         clientId: qr.clientId,
         verifier: trusted ? { trusted: true, ten: entry!.ten, maToChuc: entry!.maToChuc } : { trusted: false },
         ...(trusted ? {} : { warning: C.VERIFIER_NOT_TRUSTED }),
-        ...(s.purpose !== undefined ? { purpose: s.purpose } : {}),
+        // Free text from an unverified party under a warning would be an impersonation tool.
+        ...(trusted && s.purpose !== undefined ? { purpose: s.purpose } : {}),
         matches,
         expiresAt: new Date(s.expiresAt).toISOString(),
       };
@@ -226,20 +275,25 @@ export function createPresentations(ctx: WalletContext) {
     }
   }
 
+  /**
+   * A resolved request is answered at most once: it is forgotten right before the response is sent,
+   * so a second submit (or a decline afterwards) is REQUEST_INVALID. A failure before sending
+   * (biometric prompt cancelled, untrusted verifier refused, storage) leaves it usable.
+   */
   async function submit(resolved: ResolvedPresentation, choice: { credentialId: string; claimSetIndex: number; allowUntrusted?: boolean }): Promise<{ ok: true } | WalletFailure> {
     const s = requests.get(resolved);
-    if (!s) throw new TypeError('the request must come from wallet.presentations.resolve');
+    if (!s) return fail(C.REQUEST_INVALID);
     if (!s.offered.get(choice.credentialId)?.includes(choice.claimSetIndex)) throw new TypeError('credentialId and claimSetIndex must be one of the offered matches');
     if (!s.trusted && choice.allowUntrusted !== true) return fail(C.VERIFIER_NOT_TRUSTED);
     if (ctx.clock.now().getTime() >= s.expiresAt) return fail(C.REQUEST_EXPIRED);
-    const row = await ctx.vault.getMeta(choice.credentialId).catch(() => undefined);
-    if (row === undefined) return fail(C.STORAGE_ERROR);
-    if (row === null) return fail(C.CREDENTIAL_NOT_FOUND);
+    let row;
     let compact: string;
     try {
+      row = await ctx.vault.getMeta(choice.credentialId);
+      if (row === null) return fail(C.CREDENTIAL_NOT_FOUND);
       compact = await ctx.vault.open(row.id);
-    } catch {
-      return fail(C.STORAGE_ERROR);
+    } catch (e) {
+      return fail(vaultFailureCode(e));
     }
     // The platform asks for biometrics when the key is read (software store) or used (hardware store,
     // ADR-0009 point 4): both rejections are kept to report their code.
@@ -257,6 +311,7 @@ export function createPresentations(ctx: WalletContext) {
     const payload = { vp_token: { [s.queryId]: [presentation] }, ...(s.state !== undefined ? { state: s.state } : {}) };
     const header = s.encryptionJwk.kid !== undefined ? { kid: s.encryptionJwk.kid } : {};
     const jwe = encryptJwe({ recipientPublicJwk: s.encryptionJwk, enc: s.enc, plaintext: utf8Encode(JSON.stringify(payload)), random: ctx.random, header });
+    if (!requests.delete(resolved)) return fail(C.REQUEST_INVALID); // a concurrent submit got here first
     try {
       const r = await depsFor(s.origin).fetch(s.responseUri, {
         method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `response=${encodeURIComponent(jwe)}`, maxBytes: 16_384,
@@ -268,10 +323,9 @@ export function createPresentations(ctx: WalletContext) {
     }
   }
 
-  /** Forgets the request. No network call: an OpenID4VP error response is optional and not sent. */
-  function decline(resolved: ResolvedPresentation): { ok: true } {
-    requests.delete(resolved);
-    return { ok: true };
+  /** Forgets the request; REQUEST_INVALID when it was already answered or declined. No network call: an OpenID4VP error response is optional and not sent. */
+  function decline(resolved: ResolvedPresentation): { ok: true } | WalletFailure {
+    return requests.delete(resolved) ? { ok: true } : fail(C.REQUEST_INVALID);
   }
 
   return { resolve, submit, decline };

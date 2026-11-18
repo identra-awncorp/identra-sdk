@@ -1,6 +1,7 @@
 // The closed list of codes a wallet operation fails with (docs/architecture.md section 8). They are
 // entries of the SDK catalogue ErrorCodes; ISSUER_MISMATCH is the existing verification code.
 import { ErrorCodes, type Check } from '@identra/sdk-core';
+import { CredentialVaultError } from '../credential-vault.js';
 import { isSecretStorageError, WalletKeyError } from '../key-store.js';
 
 export const WalletErrorCodes = Object.freeze({
@@ -72,6 +73,15 @@ export function keyFailureCode(e: unknown): WalletErrorCode {
   if (code === 'CANCELLED') return WalletErrorCodes.USER_CANCELLED;
   if (code === 'LOCKED') return WalletErrorCodes.DEVICE_LOCKED;
   return WalletErrorCodes.STORAGE_ERROR;
+}
+
+/**
+ * The wallet code of a vault failure: CREDENTIAL_NOT_FOUND, the key code of a data-key read the
+ * platform refused (SecretStorageError: cancelled, locked, invalidated), else STORAGE_ERROR.
+ */
+export function vaultFailureCode(e: unknown): WalletErrorCode {
+  if (e instanceof CredentialVaultError && e.code === 'NOT_FOUND') return WalletErrorCodes.CREDENTIAL_NOT_FOUND;
+  return isSecretStorageError(e) ? keyFailureCode(e) : WalletErrorCodes.STORAGE_ERROR;
 }
 
 /** Thrown inside an operation to end it with a code; never leaves the wallet. */

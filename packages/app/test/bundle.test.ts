@@ -14,7 +14,7 @@ import { CompactEncrypt, compactDecrypt, importJWK } from 'jose';
 import { createNobleSigner, generateSecretKey } from '@identra/sdk-app';
 import { base64Encode } from '@identra/sdk-core';
 import { countingRandom } from './helpers/random.js';
-import { createWorld, inProcessFetch, inProcessListener, NOW, rootDer, TRUST_URL } from './helpers/world.js';
+import { createWorld, inProcessFetch, inProcessListener, newSession, NOW, rootDer, TRUST_URL } from './helpers/world.js';
 
 const testDist = new URL('.', import.meta.url).pathname;
 const options: esbuild.BuildOptions = { bundle: true, platform: 'neutral', mainFields: ['module', 'main'], write: false, logLevel: 'silent' };
@@ -120,7 +120,7 @@ async function issuanceInput(seed: number) {
   const listener = inProcessListener();
   const world = await createWorld(listener);
   const verifier = await world.newVerifier();
-  const session = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+  const session = (await newSession(verifier));
   const { offerUri, txCode } = await world.offer();
   const input = JSON.stringify({ seed, now: NOW.toISOString(), root: base64Encode(rootDer()), trustListUrl: TRUST_URL, offerUri, txCode, verifierQr: session.qr });
   return { input, hostFetch: inProcessFetch(listener), world, verifier, session };

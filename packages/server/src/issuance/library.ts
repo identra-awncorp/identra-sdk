@@ -5,7 +5,7 @@
 // checked by our own code (access-token.ts, proof.ts).
 import { Oauth2AuthorizationServer, Oauth2ServerErrorResponseError, preAuthorizedCodeGrantIdentifier } from '@openid4vc/oauth2';
 import { Openid4vciIssuer, Openid4vciVersion, type CredentialOfferObject, type IssuerMetadataResult } from '@openid4vc/openid4vci';
-import { CompactEncrypt, compactDecrypt, importJWK } from 'jose';
+import { CompactEncrypt, compactDecrypt, decodeProtectedHeader, importJWK } from 'jose';
 import { utf8Decode, utf8Encode, type EcPublicJwk, type Hasher, type RandomSource } from '@identra/sdk-core';
 
 export const PRE_AUTHORIZED_GRANT = preAuthorizedCodeGrantIdentifier;
@@ -46,6 +46,7 @@ function libraryIssuer(o: { hasher: Hasher; random: RandomSource; decryptionKey:
       // Expected failures (wrong key, tampered JWE, unsupported header) are { decrypted: false }.
       decryptJwe: async (jwe, options) => {
         try {
+          if ('zip' in decodeProtectedHeader(jwe)) return { decrypted: false };
           const { plaintext } = await compactDecrypt(jwe, o.decryptionKey, { keyManagementAlgorithms: ['ECDH-ES'], contentEncryptionAlgorithms: ENC_VALUES });
           return { decrypted: true, decryptionJwk: options!.jwk!, payload: utf8Decode(plaintext) };
         } catch {

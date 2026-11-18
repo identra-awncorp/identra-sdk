@@ -2,7 +2,7 @@
 import { base64Decode, base64UrlEncode, decodeCredentialUnverified, verifyStoredCredential } from '@identra/sdk-core';
 import { CredentialVaultError, type CredentialMetadata, type StoredCredentialStatus } from '../credential-vault.js';
 import type { WalletContext } from './context.js';
-import { WalletErrorCodes as C, type WalletFailure } from './errors.js';
+import { vaultFailureCode, WalletErrorCodes as C, type WalletFailure } from './errors.js';
 
 /** `unknown`: the status, the trust list, or another check could not confirm the credential (ADR-0013 section 4, "chưa kiểm được trạng thái"). */
 export type WalletCredentialStatus = 'valid' | 'revoked' | 'suspended' | 'unknown';
@@ -46,7 +46,7 @@ export function createCredentials(ctx: WalletContext) {
     try {
       return { ok: true, compact: await ctx.vault.open(id) };
     } catch (e) {
-      return { ok: false, code: e instanceof CredentialVaultError && e.code === 'NOT_FOUND' ? C.CREDENTIAL_NOT_FOUND : C.STORAGE_ERROR };
+      return { ok: false, code: vaultFailureCode(e) };
     }
   }
 

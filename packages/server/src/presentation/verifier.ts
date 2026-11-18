@@ -12,6 +12,10 @@ import { CREDENTIAL_QUERY_ID, dcqlQueryOf, generateSessionKey, parseResponse, RE
 
 export const SESSION_SECONDS = 300;
 export const SESSION_KEEP_SECONDS = 1800;
+/** Responses that do not finalise a session (refused before or at holder binding) allowed per request. */
+export const MAX_RESPONSE_ATTEMPTS = 10;
+/** How often createSession re-checks that this verifier is still in the trust list. */
+export const TRUST_RECHECK_SECONDS = 3600;
 const ID = /^[A-Za-z0-9_-]{22}$/;
 const MAX_RESPONSE_BYTES = 65536;
 
@@ -50,12 +54,20 @@ export interface PresentationVerifierConfig {
   scenarios: Record<string, Scenario>;
 }
 
+export interface CreatedSession { id: string; requestId: string; qr: string; expiresAt: string; serverTime: string }
+
+/**
+ * `unknown_scenario`: the caller named a scenario that is not configured (HTTP 400/404).
+ * `verifier_not_listed`: this verifier's request certificate is no longer in the trust list with
+ * purpose `request` (HTTP 503 until the list is fixed).
+ */
+export type CreateSessionResult = { ok: true; session: CreatedSession } | { ok: false; reason: 'unknown_scenario' | 'verifier_not_listed' };
+
 export interface PresentationVerifier {
-  clientId: string;
-  /** Display name of this verifier in the trust list. */
-  name: string;
-  /** Null for an unknown scenario. */
-  createSession(input: { scenario: string }): Promise<{ id: string; requestId: string; qr: string; expiresAt: string; serverTime: string } | null>;
+  readonly clientId: string;
+  /** Display name of this verifier in the trust list, refreshed at most hourly. */
+  readonly name: string;
+  createSession(input: { scenario: string }): Promise<CreateSessionResult>;
   requestObject(requestId: string): Promise<HttpResponse>;
   handleResponse(requestId: string, request: HttpRequest): Promise<HttpResponse>;
   /** Null when unknown or deleted (30 minutes after creation or verification). */
@@ -65,9 +77,17 @@ export interface PresentationVerifier {
 interface SessionRecord { requestId: string; createdAt: number; expiresAt: number }
 interface RequestRecord { id: string; scenario: string; jwt: string; payload: Record<string, unknown>; expiresAt: number }
 
+/** The one presentation of a vp_token of exactly `{ "credential": ["<presentation>"] }`, or null. */
+function onlyPresentation(vpToken: unknown): string | null {
+  if (typeof vpToken !== 'object' || vpToken === null || Array.isArray(vpToken) || Object.keys(vpToken).length !== 1) return null;
+  const list = (vpToken as Record<string, unknown>)[CREDENTIAL_QUERY_ID];
+  return Array.isArray(list) && list.length === 1 && typeof list[0] === 'string' ? list[0] : null;
+}
+
 /**
- * Validates the request certificate (profile `request`) and looks it up in the trust list once:
- * it must be there with purpose `request` and the organisation of the certificate, or this throws.
+ * Validates the request certificate (profile `request`) and looks it up in the trust list: it must
+ * be there with purpose `request` and the organisation of the certificate, or this throws.
+ * createSession repeats the lookup at most once an hour.
  */
 export async function createPresentationVerifier(config: PresentationVerifierConfig): Promise<PresentationVerifier> {
   const { apiOrigin, signer, verification, random, clock, store } = config;
@@ -75,13 +95,29 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
   if (signer?.alg !== 'ES256' || !Array.isArray(signer.x5c) || signer.x5c.length !== 2) throw new TypeError('signer must be an ES256 signer with x5c [leaf, issuing CA]');
   const chain = await verification.chainValidator.validate({ x5c: signer.x5c, profile: 'request', now: clock.now() });
   if (!chain.ok || !chain.fingerprint || !chain.leaf) throw new Error(`the request certificate does not validate: ${chain.code}`);
-  const entry = await verification.trustRegistry.lookup(chain.fingerprint, clock.now());
-  if (!entry || entry.mucDich !== 'request' || entry.maToChuc !== chain.leaf.subject.organizationIdentifier) {
-    throw new Error('the request certificate is not in the trust list with purpose request');
+  const fingerprint = chain.fingerprint;
+  const organisation = chain.leaf.subject.organizationIdentifier;
+  /** The trust-list name of this verifier, or null when it is not listed with purpose `request`. */
+  const listedName = async (): Promise<string | null> => {
+    const entry = await verification.trustRegistry.lookup(fingerprint, clock.now());
+    return entry && entry.mucDich === 'request' && entry.maToChuc === organisation ? entry.ten : null;
+  };
+  const first = await listedName();
+  if (first === null) throw new Error('the request certificate is not in the trust list with purpose request');
+  let listing = { name: first, listed: true, checkedAt: clock.now().getTime() };
+  /** Re-checked at most once per TRUST_RECHECK_SECONDS; an unreadable trust list keeps the last answer and is tried again next time. */
+  async function currentListing() {
+    if (clock.now().getTime() - listing.checkedAt < TRUST_RECHECK_SECONDS * 1000 && clock.now().getTime() >= listing.checkedAt) return listing;
+    try {
+      const n = await listedName();
+      listing = { name: n ?? listing.name, listed: n !== null, checkedAt: clock.now().getTime() };
+    } catch {
+      // keep the last answer
+    }
+    return listing;
   }
   const queries = Object.fromEntries(Object.entries(config.scenarios).map(([name, s]) => [name, dcqlQueryOf(s)]));
-  const clientId = `x509_hash:${chain.fingerprint}`;
-  const name = entry.ten;
+  const clientId = `x509_hash:${fingerprint}`;
   const key = (kind: string, id: string) => `vp:${clientId}:${kind}:${id}`;
   const newId = () => base64UrlEncode(random.bytes(16));
   const read = async <T>(k: string): Promise<T | null> => {
@@ -90,14 +126,18 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
   };
   const invalid = () => oauthError(400, 'invalid_request', 'the response is not acceptable');
 
-  /** verifyPresentation, then the query on the verified claims; the result to store. */
-  async function evaluate(presentation: unknown, request: RequestRecord, now: Date): Promise<SessionResult> {
+  /**
+   * verifyPresentation, then the query on the verified claims; the result to store, or null when
+   * holder binding did not pass (the sender did not prove possession of the presented credential's
+   * key for this nonce and audience: such a response must not finalise the session).
+   */
+  async function evaluate(presentation: string, request: RequestRecord, now: Date): Promise<SessionResult | null> {
     const verifiedAt = now.toISOString();
     const checks = (cs: Check[]) => cs.map(({ id, ok, code }) => ({ id, ok, code }));
-    if (typeof presentation !== 'string') return { ok: false, checks: [{ id: 'structure', ok: false, code: 'MALFORMED' }], verifiedAt };
     const r = await verifyPresentation(presentation, {
       ...verification, now, presentation: { nonce: request.payload['nonce'] as string, audience: clientId },
     });
+    if (r.checks.find((c) => c.id === 'holder_binding')?.ok !== true) return null;
     const claims = r.credential?.claims;
     if (!r.ok || !claims) return { ok: false, checks: [...checks(r.checks), { id: 'query', ok: false, code: 'SKIPPED' }], verifiedAt };
     const index = satisfiedClaimSet(queries[request.scenario]!, { vct: r.credential!.vct, claims });
@@ -107,12 +147,46 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
     return { ok: true, checks: [...checks(r.checks), { id: 'query', ok: true, code: null }], claims: kept, issuer: { ...r.credential!.issuer! }, verifiedAt };
   }
 
+  /**
+   * Makes `result` the session's final result: the open marker is taken (exactly once under
+   * concurrency) and the result written; if the write fails the marker is put back, so the session
+   * can still complete. Then the session key and the request record are deleted. False when another
+   * response finalised it first.
+   */
+  async function finalise(requestId: string, request: RequestRecord, result: SessionResult): Promise<boolean> {
+    if ((await store.take(key('open', requestId))) === null) return false;
+    try {
+      await store.put(key('result', request.id), JSON.stringify(result), SESSION_KEEP_SECONDS);
+    } catch (e) {
+      const left = Math.ceil((request.expiresAt - clock.now().getTime()) / 1000);
+      if (left > 0) await store.put(key('open', requestId), '1', left).catch(() => {});
+      throw e;
+    }
+    const session = await read<SessionRecord>(key('session', request.id));
+    if (session) await store.put(key('session', request.id), JSON.stringify(session), SESSION_KEEP_SECONDS);
+    await store.take(key('key', requestId));
+    await store.take(key('request', requestId));
+    return true;
+  }
+
+  /** A response that did not finalise: 400; the tenth such response finalises the session as TOO_MANY_ATTEMPTS. */
+  async function refused(requestId: string, request: RequestRecord, now: Date): Promise<HttpResponse> {
+    const attempts = await store.increment(key('attempts', requestId), SESSION_SECONDS);
+    if (attempts >= MAX_RESPONSE_ATTEMPTS) {
+      await finalise(requestId, request, { ok: false, checks: [{ id: 'holder_binding', ok: false, code: 'TOO_MANY_ATTEMPTS' }], verifiedAt: now.toISOString() });
+    }
+    return invalid();
+  }
+
   return {
     clientId,
-    name,
+    get name() {
+      return listing.name;
+    },
 
     async createSession({ scenario }) {
-      if (typeof scenario !== 'string' || !Object.hasOwn(queries, scenario)) return null;
+      if (typeof scenario !== 'string' || !Object.hasOwn(queries, scenario)) return { ok: false, reason: 'unknown_scenario' };
+      if (!(await currentListing()).listed) return { ok: false, reason: 'verifier_not_listed' };
       const id = newId();
       const requestId = newId();
       const now = clock.now();
@@ -145,7 +219,7 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
       await store.put(key('request', requestId), JSON.stringify(request), SESSION_SECONDS);
       await store.put(key('open', requestId), '1', SESSION_SECONDS);
       const qr = `openid4vp://?client_id=${encodeURIComponent(clientId)}&request_uri=${encodeURIComponent(requestUri)}`;
-      return { id, requestId, qr, expiresAt: new Date(expiresAt).toISOString(), serverTime: now.toISOString() };
+      return { ok: true, session: { id, requestId, qr, expiresAt: new Date(expiresAt).toISOString(), serverTime: now.toISOString() } };
     },
 
     async requestObject(requestId) {
@@ -159,29 +233,24 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
     async handleResponse(requestId, req) {
       const now = clock.now();
       const request = ID.test(requestId) ? await read<RequestRecord>(key('request', requestId)) : null;
-      if (!request || request.expiresAt <= now.getTime()) return invalid();
-      if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/x-www-form-urlencoded') || req.body.length > MAX_RESPONSE_BYTES) return invalid();
+      if (!request || request.expiresAt <= now.getTime() || (await store.get(key('open', requestId))) === null) return invalid();
+      // From here every refusal counts against the request (refused): a flood ends the session.
+      if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/x-www-form-urlencoded') || req.body.length > MAX_RESPONSE_BYTES) return refused(requestId, request, now);
       const params = new URLSearchParams(req.body);
       const names = [...params.keys()];
       // direct_post.jwt only: exactly one `response` parameter holding a compact JWE (no downgrade to direct_post).
       const response = params.get('response');
-      if (names.length !== 1 || response === null || response.split('.').length !== 5) return invalid();
+      if (names.length !== 1 || response === null || response.split('.').length !== 5) return refused(requestId, request, now);
       const privateJwk = await read<JWK>(key('key', requestId));
       if (!privateJwk) return invalid();
-      const presentations = await parseResponse({ form: { response }, requestPayload: request.payload, privateJwk, hasher: verification.hasher });
-      if (!presentations) return invalid();
-      // Exactly once: of concurrent responses only the one that takes the open marker is processed.
-      if ((await store.take(key('open', requestId))) === null) return invalid();
-
-      const ids = Object.keys(presentations);
-      const list = presentations[CREDENTIAL_QUERY_ID];
-      const presentation = ids.length === 1 && Array.isArray(list) && list.length === 1 ? list[0] : undefined;
+      const presentation = onlyPresentation(await parseResponse({ form: { response }, requestPayload: request.payload, privateJwk, hasher: verification.hasher }));
+      if (presentation === null) return refused(requestId, request, now);
+      // The request object is public: only a response proving possession of the presented
+      // credential's key for this nonce and audience may finalise the session.
       const result = await evaluate(presentation, request, now);
-      const session = await read<SessionRecord>(key('session', request.id));
-      await store.put(key('result', request.id), JSON.stringify(result), SESSION_KEEP_SECONDS);
-      if (session) await store.put(key('session', request.id), JSON.stringify(session), SESSION_KEEP_SECONDS);
-      await store.take(key('key', requestId));
-      return jsonResponse(200, {});
+      if (result === null) return refused(requestId, request, now);
+      // Exactly once: of concurrent responses only the one that takes the open marker is stored.
+      return (await finalise(requestId, request, result)) ? jsonResponse(200, {}) : invalid();
     },
 
     async session(id) {
@@ -192,7 +261,7 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
       const status: SessionStatus = result
         ? result.ok ? 'verified' : 'failed'
         : s.expiresAt <= now.getTime() ? 'expired' : (await store.get(key('retrieved', id))) !== null ? 'request_retrieved' : 'pending';
-      return { id, status, verifier: { name }, expiresAt: new Date(s.expiresAt).toISOString(), serverTime: now.toISOString(), ...(result ? { result } : {}) };
+      return { id, status, verifier: { name: listing.name }, expiresAt: new Date(s.expiresAt).toISOString(), serverTime: now.toISOString(), ...(result ? { result } : {}) };
     },
   };
 }

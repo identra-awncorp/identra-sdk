@@ -6,7 +6,7 @@ import { after, before, describe, test } from 'node:test';
 import { CompactEncrypt, importJWK, type JWK } from 'jose';
 import { base64UrlDecode, base64UrlEncode, createMappedFetch, createPresentation, utf8Decode, utf8Encode, VCT } from '@identra/sdk-core';
 import { createWebCryptoSigner, generateWebCryptoKeyPair, webCryptoHasher } from '@identra/sdk-core/webcrypto';
-import { createWorld, DIPLOMA, nodeHttpFetch, ORIGIN, startListener, UNG_TUYEN, type Listener, type World } from './helpers/world.js';
+import { createWorld, DIPLOMA, newSession, nodeHttpFetch, ORIGIN, startListener, UNG_TUYEN, type Listener, type World } from './helpers/world.js';
 
 let listener: Listener;
 before(async () => (listener = await startListener(47642)));
@@ -18,7 +18,7 @@ async function setup(o: { world?: World } = {}) {
   const verifier = await world.newVerifier();
   const w = world.newWallet();
   const credentialId = await world.issueTo(w);
-  const session = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+  const session = (await newSession(verifier));
   return { world, verifier, w, credentialId, session };
 }
 const resolveOk = async (w: ReturnType<World['newWallet']>, qr: string) => {
@@ -58,7 +58,7 @@ describe('presentation over HTTP', () => {
 
     // Claim set 2 in a new session.
     listener.log.length = 0;
-    const second = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+    const second = (await newSession(verifier));
     const request2 = await resolveOk(w, second.qr);
     assert.deepEqual(await w.wallet.presentations.submit(request2, { credentialId, claimSetIndex: 1 }), { ok: true });
     const done2 = (await verifier.session(second.id))!;
@@ -119,7 +119,7 @@ describe('what the verifier concludes', () => {
     });
   }
 
-  test('a wallet clock 3 minutes ahead: the KB-JWT iat is refused (KB_INVALID)', async () => {
+  test('a wallet clock 3 minutes ahead: the KB-JWT iat is refused (400, session open); with the clock fixed the same session verifies', async () => {
     const world = await createWorld(listener);
     const verifier = await world.newVerifier();
     let skew = 0;
@@ -127,32 +127,32 @@ describe('what the verifier concludes', () => {
     const w = world.newWallet('noble', undefined, ahead);
     const credentialId = await world.issueTo(w);
     skew = 180_000;
-    const session = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+    const session = await newSession(verifier);
+    assert.deepEqual(await w.wallet.presentations.submit(await resolveOk(w, session.qr), { credentialId, claimSetIndex: 1 }), { ok: false, code: 'VERIFIER_ERROR' });
+    assert.equal((await verifier.session(session.id))?.status, 'request_retrieved');
+    skew = 0;
     assert.deepEqual(await w.wallet.presentations.submit(await resolveOk(w, session.qr), { credentialId, claimSetIndex: 1 }), { ok: true });
-    assert.equal(codeAt((await verifier.session(session.id))?.result?.checks, 'holder_binding'), 'KB_INVALID');
+    assert.equal((await verifier.session(session.id))?.status, 'verified');
   });
 
-  test('KB-JWT replay: to a second session NONCE_MISMATCH, to another verifier AUD_MISMATCH; another holder key KB_INVALID', async () => {
+  test('holder binding failures do not finalise: KB-JWT for another session (nonce), another verifier (aud), another key; then the genuine response verifies', async () => {
     const { world, verifier, w, credentialId, session } = await setup();
     const first = await requestPayloadOf(session.requestId);
-    const vp = await presentationOf(w, credentialId, verifier.clientId, first.nonce, world.clock.now());
-    const second = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
-    assert.equal(await answer(second.requestId, vp), 200);
-    assert.equal(codeAt((await verifier.session(second.id))?.result?.checks, 'holder_binding'), 'NONCE_MISMATCH');
-    const third = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
-    const p3 = await requestPayloadOf(third.requestId);
-    assert.equal(await answer(third.requestId, await presentationOf(w, credentialId, 'x509_hash:another-verifier', p3.nonce, world.clock.now()), p3), 200);
-    assert.equal(codeAt((await verifier.session(third.id))?.result?.checks, 'holder_binding'), 'AUD_MISMATCH');
-    // Same credential and disclosures, KB-JWT signed by a key that is not cnf.jwk.
-    const fourth = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
-    const p4 = await requestPayloadOf(fourth.requestId);
-    const good = await presentationOf(w, credentialId, verifier.clientId, p4.nonce, world.clock.now());
+    const replayed = await presentationOf(w, credentialId, verifier.clientId, first.nonce, world.clock.now());
+    const second = await newSession(verifier);
+    const p2 = await requestPayloadOf(second.requestId);
+    const good = await presentationOf(w, credentialId, verifier.clientId, p2.nonce, world.clock.now());
     const other = await createWebCryptoSigner(await generateWebCryptoKeyPair());
     const kb = good.split('~').pop()!;
     const input = kb.split('.').slice(0, 2).join('.');
     const forged = `${good.slice(0, good.length - kb.length)}${input}.${base64UrlEncode(await other.sign(utf8Encode(input)))}`;
-    assert.equal(await answer(fourth.requestId, forged, p4), 200);
-    assert.equal(codeAt((await verifier.session(fourth.id))?.result?.checks, 'holder_binding'), 'KB_INVALID');
+    const wrongAud = await presentationOf(w, credentialId, 'x509_hash:another-verifier', p2.nonce, world.clock.now());
+    for (const [name, vp] of [['nonce of another session', replayed], ['audience of another verifier', wrongAud], ['KB-JWT by another key', forged]] as const) {
+      assert.equal(await answer(second.requestId, vp, p2), 400, name);
+      assert.equal((await verifier.session(second.id))?.status, 'request_retrieved', name);
+    }
+    assert.equal(await answer(second.requestId, good, p2), 200);
+    assert.equal((await verifier.session(second.id))?.status, 'verified');
   });
 
   test('a presentation disclosing more than the satisfied claim set: the extra claims are dropped', async () => {
@@ -184,7 +184,7 @@ describe('responses the verifier refuses (400, nothing stored)', () => {
     assert.equal(await post(session.requestId, form), 200);
     const result = (await verifier.session(session.id))!.result;
     assert.equal(await post(session.requestId, form), 400);
-    const other = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+    const other = (await newSession(verifier));
     const po = await requestPayloadOf(other.requestId);
     const vpo = await presentationOf(w, credentialId, verifier.clientId, po.nonce, world.clock.now());
     const forms = await Promise.all(Array.from({ length: 10 }, async () => `response=${await encryptFor(po, { vp_token: { credential: [vpo] }, state: po.state })}`));
@@ -198,7 +198,7 @@ describe('responses the verifier refuses (400, nothing stored)', () => {
     const { world, verifier, w, credentialId, session } = await setup();
     const p = await requestPayloadOf(session.requestId);
     const vp = await presentationOf(w, credentialId, verifier.clientId, p.nonce, world.clock.now());
-    const other = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+    const other = (await newSession(verifier));
     const po = await requestPayloadOf(other.requestId);
     const good = await encryptFor(p, { vp_token: { credential: [vp] }, state: p.state });
     const [h, k, iv, ct, tag] = good.split('.') as [string, string, string, string, string];
@@ -215,7 +215,7 @@ describe('responses the verifier refuses (400, nothing stored)', () => {
     for (const [name, form, requestId] of refused) assert.equal(await post(requestId ?? session.requestId, form), 400, name);
     assert.equal((await verifier.session(session.id))?.status, 'request_retrieved');
     assert.equal(await post(session.requestId, `response=${good}`), 200, 'the session was still open');
-    const late = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+    const late = (await newSession(verifier));
     world.clock.advance(250);
     const pl = await requestPayloadOf(late.requestId);
     assert.equal(await answer(late.requestId, await presentationOf(w, credentialId, verifier.clientId, pl.nonce, world.clock.now()), pl), 200);
@@ -226,6 +226,6 @@ describe('responses the verifier refuses (400, nothing stored)', () => {
     world.clock.advance(1500);
     assert.equal(await verifier.session(other.id), null, 'deleted 30 minutes after creation');
     assert.equal((await verifier.session(late.id))?.status, 'verified', 'kept 30 minutes after verification');
-    assert.equal(await verifier.createSession({ scenario: 'other' }), null);
+    assert.deepEqual(await verifier.createSession({ scenario: 'other' }), { ok: false, reason: 'unknown_scenario' });
   });
 });

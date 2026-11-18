@@ -6,7 +6,7 @@ import http from 'node:http';
 import { after, before, describe, test } from 'node:test';
 import { createMappedFetch, type HttpFetch } from '@identra/sdk-core';
 import { guardFetch } from '../dist/wallet/fetch.js';
-import { createWorld, fetchStats, nodeHttpFetch, ORIGIN, startListener, type Listener } from './helpers/world.js';
+import { createWorld, fetchStats, newSession, nodeHttpFetch, ORIGIN, startListener, type Listener } from './helpers/world.js';
 
 let listener: Listener;
 let raw: http.Server;
@@ -51,7 +51,7 @@ describe('response size and time', () => {
     const recording: HttpFetch = (url, init) => (seen.push([`${init?.method ?? 'GET'} ${url.slice(listener.localOrigin.length).replace(/\/[A-Za-z0-9_-]{22}$/, '/:id')}`, init?.maxBytes]), nodeHttpFetch(url, init));
     const w = world.newWallet('noble', createMappedFetch(recording, { [ORIGIN]: listener.localOrigin }));
     const credentialId = await world.issueTo(w);
-    const request = await w.wallet.presentations.resolve((await verifier.createSession({ scenario: 'ung-tuyen' }))!.qr);
+    const request = await w.wallet.presentations.resolve((await newSession(verifier)).qr);
     assert.ok(request.ok);
     assert.deepEqual(await w.wallet.presentations.submit(request.request, { credentialId, claimSetIndex: 1 }), { ok: true });
     assert.deepEqual(Object.fromEntries(seen), {

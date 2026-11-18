@@ -34,8 +34,12 @@ export { ACCESS_TOKEN_SECONDS } from './issuance/access-token.js';
 export { PROOF_TYP } from './issuance/proof.js';
 export {
   createPresentationVerifier,
+  MAX_RESPONSE_ATTEMPTS,
   SESSION_KEEP_SECONDS,
   SESSION_SECONDS,
+  TRUST_RECHECK_SECONDS,
+  type CreatedSession,
+  type CreateSessionResult,
   type PresentationVerifier,
   type PresentationVerifierConfig,
   type SessionResource,

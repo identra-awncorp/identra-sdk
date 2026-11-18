@@ -143,6 +143,13 @@ export function inProcessFetch(listener: Listener) {
   };
 }
 
+/** A session of scenario `ung-tuyen`; throws on a refusal. */
+export async function newSession(verifier: PresentationVerifier) {
+  const r = await verifier.createSession({ scenario: 'ung-tuyen' });
+  if (!r.ok) throw new Error(`createSession refused: ${r.reason}`);
+  return r.session;
+}
+
 /** The verifier routes of vc-api.md section 6. */
 export function mountVerifier(routes: Map<string, Handler>, verifier: PresentationVerifier) {
   routes.set('GET /oid4vp/request/*', (req) => verifier.requestObject(req.path.split('/').pop()!));

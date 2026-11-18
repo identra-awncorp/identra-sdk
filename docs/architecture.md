@@ -160,7 +160,9 @@ helper only; the credential path no longer resolves DIDs, ADR-0015), `SKIPPED`,
 and the wallet operation codes of section 8 (`OFFER_INVALID`, `URL_NOT_ALLOWED`,
 `TX_CODE_WRONG`, `OFFER_EXPIRED`, `NETWORK_ERROR`, `ISSUER_ERROR`,
 `CREDENTIAL_INVALID`, `CNF_MISMATCH`, `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`,
-`CREDENTIAL_NOT_FOUND`).
+`CREDENTIAL_NOT_FOUND`) and of section 9 (`QUERY_NOT_SATISFIED`, `TOO_MANY_ATTEMPTS`,
+`REQUEST_INVALID`, `REQUEST_EXPIRED`, `VERIFIER_ERROR`, `KEY_INVALIDATED`,
+`USER_CANCELLED`, `DEVICE_LOCKED`; the check id `query`).
 
 All codes are exported as one `ErrorCodes` constant object; UI and logs branch
 on codes, never on messages. Library error messages are never inspected:
@@ -704,16 +706,19 @@ createPresentationVerifier({
   random, clock, store,
   scenarios: { 'ung-tuyen': { vct, claimSets: [[...], [...]], purpose: { vi, en } } },
 }): Promise<PresentationVerifier>
-// .clientId, .name
-// .createSession({ scenario }) → { id, requestId, qr, expiresAt, serverTime } | null (unknown scenario)
+// .clientId, .name (trust-list name, refreshed at most hourly)
+// .createSession({ scenario }) → { ok: true, session: { id, requestId, qr, expiresAt, serverTime } }
+//                              | { ok: false, reason: 'unknown_scenario' (400) | 'verifier_not_listed' (503) }
 // .requestObject(requestId) → HttpResponse   GET  /oid4vp/request/:requestId
 // .handleResponse(requestId, request) → HttpResponse   POST /oid4vp/response/:requestId
 // .session(id) → SessionResource | null      GET  /v1/verification/sessions/:id
 ```
 
 - Construction validates the request chain (profile `request`) and looks its
-  fingerprint up in the trust list once: purpose `request` and the certificate's
-  organisation, or it throws. `client_id` = `x509_hash:<fingerprint>`; `name` =
+  fingerprint up in the trust list: purpose `request` and the certificate's
+  organisation, or it throws. `createSession` repeats the lookup at most once an
+  hour: no longer listed → `verifier_not_listed`; the name follows the list; an
+  unreadable trust list keeps the last answer and is tried again on the next call. `client_id` = `x509_hash:<fingerprint>`; `name` =
   the trust-list `ten`. The query of each scenario is built once (one `dc+sd-jwt`
   credential query `credential` of `vct`, one claim per name, `claim_sets` in
   order of preference, `credential_sets[0].purpose`) and validated by `dcql`; no
@@ -730,28 +735,40 @@ createPresentationVerifier({
   `openid4vp://?client_id=<client_id>&request_uri=<apiOrigin>/oid4vp/request/<requestId>`.
 - `requestObject` serves the JWT until the session is final (then 404) and
   marks the session `request_retrieved`.
-- `handleResponse`, in this order, anything wrong → `400 invalid_request` with a
-  fixed description and nothing changes: request known and unexpired; form-encoded
-  body ≤ 64 KB with exactly one parameter, `response`, holding a compact JWE (no
-  `vp_token`/`state` in the clear, no signed-only JWT: no downgrade); the session
-  key still there; the library decrypts (jose, ECDH-ES, A128GCM/A256GCM, that key
-  only), checks `state` and parses `vp_token`; then the open marker is `take`n:
-  exactly one response per session is processed, a concurrent or later one is
-  400 and cannot touch the result. Processing: exactly one presentation for the
-  one credential id (else a `structure` / `MALFORMED` result); `verifyPresentation`
-  with `audience` = client_id and the session `nonce`; then `query`: `dcql`
-  evaluates the VERIFIED claims against the query, the first satisfied claim set
-  wins (`QUERY_NOT_SATISFIED` otherwise). The stored result is `{ ok, checks:
-  [{ id, ok, code }], claims?, issuer?, verifiedAt }`: claims and issuer only when
-  ok, claims = the string claims of the satisfied claim set only; any other
-  disclosed claim is dropped, not stored and not a failure. Answer `200 {}`.
+- `handleResponse`. The request object is public, so whoever holds the QR can
+  send a well-formed response: only a response whose sender PROVED POSSESSION of
+  the presented credential's key for this nonce and audience may finalise the
+  session. In this order: request known, unexpired and still open (else `400`,
+  not counted); form-encoded body ≤ 64 KB with exactly one parameter, `response`,
+  holding a compact JWE (no `vp_token`/`state` in the clear, no signed-only JWT:
+  no downgrade); the library decrypts (jose, ECDH-ES, A128GCM/A256GCM, that key
+  only; a `zip` header is refused before any work) and checks `state`; the
+  `vp_token` as decrypted is exactly `{ "credential": ["<presentation>"] }`;
+  `verifyPresentation` with `audience` = client_id and the session `nonce`. A
+  response refused at any of these steps, or whose `holder_binding` check did not
+  pass, gets `400 invalid_request` (fixed description) and leaves the session
+  open; the 10th such response ends it as `failed` with the single check
+  `holder_binding` / `TOO_MANY_ATTEMPTS`, so a flood cannot burn CPU
+  indefinitely (it can deny that one session, as answering first already could).
+  Otherwise `query` runs: `dcql` evaluates the VERIFIED claims, the first
+  satisfied claim set wins (`QUERY_NOT_SATISFIED` otherwise); a proven holder
+  whose credential fails a later check (revoked, untrusted issuer, query)
+  finalises the session as `failed` with its checks. Finalising: the open marker
+  is `take`n (exactly once: of concurrent responses one result is stored, the
+  others get 400), the result is written — if that write fails the marker is put
+  back, so the session can still complete — then the session key and the request
+  record are deleted. The stored result is `{ ok, checks: [{ id, ok, code }],
+  claims?, issuer?, verifiedAt }`: claims and issuer only when ok, claims = the
+  string claims of the satisfied claim set only; any other disclosed claim is
+  dropped, not stored and not a failure. Answer `200 {}`.
 - `session(id)`: `status` = `verified` / `failed` from the result, else `expired`
   after 5 minutes, else `request_retrieved` / `pending`; `result` absent until
   final; `verifier.name`; `expiresAt` with `serverTime`. Deleted 30 minutes after
   creation, or after verification when that is later.
 
 State: `vp:<client_id>:session:<id>` (1800 s, rewritten at verification),
-`request:<requestId>`, `key:<requestId>`, `open:<requestId>` (300 s each),
+`request:<requestId>`, `key:<requestId>`, `open:<requestId>` (300 s each, the
+first two deleted when the session is final), `attempts:<requestId>` (300 s),
 `retrieved:<id>` and `result:<id>` (1800 s).
 
 ### Wallet (`sdk-app`)
@@ -762,7 +779,7 @@ wallet.presentations.resolve(qrText) → { ok: true, request: ResolvedPresentati
 //   warning?: 'VERIFIER_NOT_TRUSTED', purpose?, expiresAt,
 //   matches: [{ credentialId, vct, issuerName, claimSets: [{ index, claims: string[] }] }] }
 wallet.presentations.submit(request, { credentialId, claimSetIndex, allowUntrusted? }) → { ok: true } | WalletFailure
-wallet.presentations.decline(request) → { ok: true }      // local only, no network call
+wallet.presentations.decline(request) → { ok: true } | WalletFailure   // local only, no network call
 ```
 
 - QR: exactly `openid4vp://?client_id=x509_hash:<43 base64url>&request_uri=<https URL>`
@@ -774,23 +791,39 @@ wallet.presentations.decline(request) → { ok: true }      // local only, no ne
   (`ALG_NOT_ALLOWED`); `typ` `oauth-authz-req+jwt`; `x5c` chain with profile
   `request` to the pinned root (`CERT_*`); signature (`SIGNATURE_INVALID`);
   `x509_hash:<fingerprint>` = QR `client_id` = JWT `client_id`
-  (`CLIENT_ID_MISMATCH`); `response_mode` `direct_post.jwt`; `response_uri` https
-  on the QR's origin (`URL_NOT_ALLOWED`); `nonce` ≥ 16 characters; `exp` >
-  now − 60 s (`REQUEST_EXPIRED`), `iat` ≤ now + 60 s; exactly one ECDH-ES
-  encryption key, a valid on-curve P-256 public JWK; `A256GCM` (preferred) or
-  `A128GCM`; one `dc+sd-jwt` credential query whose claims are single top-level
-  names. Anything else is `REQUEST_INVALID`. The library then checks the
+  (`CLIENT_ID_MISMATCH`); `response_mode` `direct_post.jwt`, `response_type`
+  `vp_token`, `aud` `https://self-issued.me/v2`; `response_uri` https on the
+  QR's origin (`URL_NOT_ALLOWED`); `nonce` ≥ 16 characters; `exp` present and at
+  most 600 s after min(`iat`, now), `iat` ≤ now + 60 s; `exp` > now − 60 s
+  (`REQUEST_EXPIRED`); exactly one ECDH-ES encryption key, a valid on-curve P-256
+  public JWK; `A256GCM` (preferred) or `A128GCM`; exactly one `dc+sd-jwt`
+  credential query, without `multiple`, whose claims are single top-level names
+  without `values`; `credential_sets` absent or exactly one set with exactly one
+  option naming that query (the form that carries the purpose). Anything else is
+  `REQUEST_INVALID`. The library then checks the
   `x509_hash` itself (it demands a `getX509CertificateMetadata` callback that it
   does not use for that prefix: a stub, pinned by a test). Time checks use the
   injected clock.
 - Trust: the fingerprint in the trust list with purpose `request` and the
   certificate's organisation → `verifier: { trusted: true, ten, maToChuc }`;
-  absent → `{ trusted: false }` and `warning: VERIFIER_NOT_TRUSTED` (red warning,
+  absent, or listed for another purpose (an issuer's `vc` certificate) →
+  `{ trusted: false }` and `warning: VERIFIER_NOT_TRUSTED` (red warning,
   ADR-0011 point 3); no trust list → `TRUST_LIST_UNAVAILABLE` (fail closed).
+- Purpose: returned only for a trusted verifier, and only when it is a string or
+  `{ vi?, en? }` of strings of at most 300 characters without control or
+  bidirectional characters; otherwise dropped (a purpose DCQL itself refuses
+  makes the request `REQUEST_INVALID`).
 - Matching: `dcql` over the vault's credentials of the query's `vct` values (the
   claims are the stored disclosures); per credential the satisfiable claim sets
-  in the verifier's order. No matching credential → `matches: []`. Nothing is
-  signed and no key is read in `resolve`.
+  in the verifier's order. No matching credential → `matches: []`. A row that
+  does not decrypt is not offered; a data-key read the platform refuses
+  (`USER_CANCELLED`, `DEVICE_LOCKED`, `KEY_INVALIDATED`) or any other vault
+  failure (`STORAGE_ERROR`) ends the resolve. Nothing is signed and no wallet key
+  is read in `resolve`.
+- A resolved request is answered at most once: `submit` forgets it right before
+  the response is sent, so a second `submit` (even with another claim set) or a
+  later `decline` is `REQUEST_INVALID`; a failure before sending (cancelled
+  prompt, untrusted verifier refused, storage) leaves it usable.
 - `submit`: `allowUntrusted: true` required for an untrusted verifier
   (`VERIFIER_NOT_TRUSTED`); request not expired on the wallet clock
   (`REQUEST_EXPIRED`); `createPresentation` with exactly the chosen claim set's
@@ -805,10 +838,19 @@ wallet.presentations.decline(request) → { ok: true }      // local only, no ne
 
 Known limitations:
 
-- DCQL `claims` with nested paths, `values`, several credential queries or
-  `credential_sets` options are refused by the wallet (`REQUEST_INVALID`); the
-  Identra scenarios use none.
-- `purpose` is the verifier's own text, shown as sent.
+- QR relay: an attacker can show a real verifier's QR code on a phishing page.
+  The wallet correctly names the real verifier, but the attacker's browser
+  session receives the result. Only the user noticing where they are can stop
+  it; the UI must show the verifier's name prominently before consent.
+- Session injection: anyone holding the QR can present their own credential into
+  that session. A website must not treat `verified` as "the person at this
+  browser holds this credential" without a binding of its own.
+- The leg between Cloudflare and the origin sees session results (claims) in
+  clear (ADR-0016, accepted for 12/12).
+- DCQL nested paths, `values`, `multiple`, several credential queries and any
+  `credential_sets` other than the single-option purpose carrier are refused by
+  the wallet (`REQUEST_INVALID`); the Identra scenarios use none.
+- `purpose` is the verifier's own text (sanitised, trusted verifiers only).
 
 ## 10. Product chain (GĐ6b, ADR-0012)
 

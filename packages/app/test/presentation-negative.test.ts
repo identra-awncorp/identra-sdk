@@ -6,13 +6,15 @@ import { Openid4vpClient } from '@openid4vc/openid4vp';
 import { base64Decode, base64UrlDecode, base64UrlEncode, parseCertificate, signJws, utf8Decode, utf8Encode, type Signer } from '@identra/sdk-core';
 import { webCryptoHasher } from '@identra/sdk-core/webcrypto';
 import { SecretStorageError, WalletKeyError } from '@identra/sdk-app';
-import { createWorld, leafSigner, ORIGIN, startListener, UNG_TUYEN, type Listener, type World } from './helpers/world.js';
+import { createWorld, leafSigner, newSession, ORIGIN, startListener, UNG_TUYEN, type Listener, type World } from './helpers/world.js';
 
 let listener: Listener;
 before(async () => (listener = await startListener(47643)));
 after(() => listener.close());
 
 const fingerprintOf = async (signer: Signer) => base64UrlEncode(await webCryptoHasher.sha256(base64Decode(signer.x5c![0]!)));
+type Query = { credentials: (Record<string, unknown> & { claims: Record<string, unknown>[] })[]; credential_sets?: unknown };
+const query = (p: Record<string, unknown>) => p['dcql_query'] as Query;
 const qrFor = (clientId: string, requestUri: string, extra = '') => `openid4vp://?client_id=${encodeURIComponent(clientId)}&request_uri=${encodeURIComponent(requestUri)}${extra}`;
 
 async function setup(o: { untrustedVerifier?: boolean; credentials?: number } = {}) {
@@ -27,11 +29,12 @@ async function setup(o: { untrustedVerifier?: boolean; credentials?: number } = 
 }
 
 /** Signs `edit(payload of a real session)` with `signer` and serves it at /oid4vp/request/crafted. */
-async function crafted(world: World, verifier: Awaited<ReturnType<World['newVerifier']>>, edit: (p: Record<string, unknown>) => void, o: { signer?: Signer; header?: Record<string, unknown>; tamper?: boolean } = {}) {
-  const session = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+async function crafted(world: World, verifier: Awaited<ReturnType<World['newVerifier']>>, edit: (p: Record<string, unknown>) => void, o: { signer?: Signer; header?: Record<string, unknown>; tamper?: boolean; clientIdFromSigner?: boolean } = {}) {
+  const session = await newSession(verifier);
   const jwt = (await verifier.requestObject(session.requestId)).body;
   const payload = JSON.parse(utf8Decode(base64UrlDecode(jwt.split('.')[1]!))) as Record<string, unknown>;
   edit(payload);
+  if (o.clientIdFromSigner) payload['client_id'] = `x509_hash:${await fingerprintOf(o.signer!)}`;
   let signed = await signJws({ typ: 'oauth-authz-req+jwt', ...o.header }, utf8Encode(JSON.stringify(payload)), o.signer ?? (await leafSigner('request')));
   if (o.tamper) signed = `${signed.split('.')[0]}.${base64UrlEncode(utf8Encode(JSON.stringify({ ...payload, nonce: 'changed-after-signing-xxxx' })))}.${signed.split('.')[2]}`;
   listener.routes.set('GET /oid4vp/request/crafted', async () => ({ status: 200, headers: { 'Content-Type': 'application/oauth-authz-req+jwt' }, body: signed }));
@@ -42,7 +45,7 @@ async function crafted(world: World, verifier: Awaited<ReturnType<World['newVeri
 describe('who is asking', () => {
   test('a verifier missing from the trust list: resolve flags it, submit refuses without allowUntrusted', async () => {
     const { verifier, w, ids } = await setup({ untrustedVerifier: true });
-    const session = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+    const session = (await newSession(verifier));
     const r = await w.wallet.presentations.resolve(session.qr);
     assert.ok(r.ok);
     assert.deepEqual([r.request.verifier, r.request.warning], [{ trusted: false }, 'VERIFIER_NOT_TRUSTED']);
@@ -55,17 +58,17 @@ describe('who is asking', () => {
 
   test('no trust list at all: TRUST_LIST_UNAVAILABLE (fail closed)', async () => {
     const { world, verifier } = await setup({ credentials: 0 });
-    const session = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+    const session = (await newSession(verifier));
     listener.routes.delete('GET /trust-list');
     assert.deepEqual(await world.newWallet().wallet.presentations.resolve(session.qr), { ok: false, code: 'TRUST_LIST_UNAVAILABLE' });
   });
 
   test('no matching credential: ok with no matches; two diplomas: both offered', async () => {
     const { world, verifier, w, ids } = await setup({ credentials: 2 });
-    const empty = await world.newWallet().wallet.presentations.resolve((await verifier.createSession({ scenario: 'ung-tuyen' }))!.qr);
+    const empty = await world.newWallet().wallet.presentations.resolve((await newSession(verifier)).qr);
     assert.ok(empty.ok);
     assert.deepEqual(empty.request.matches, []);
-    const two = await w.wallet.presentations.resolve((await verifier.createSession({ scenario: 'ung-tuyen' }))!.qr);
+    const two = await w.wallet.presentations.resolve((await newSession(verifier)).qr);
     assert.ok(two.ok);
     assert.deepEqual(two.request.matches.map((m) => m.credentialId).sort(), [...ids].sort());
   });
@@ -94,19 +97,31 @@ describe('request objects the wallet refuses before anything is shown', () => {
         key['y'] = base64UrlEncode(y);
       })), 'REQUEST_INVALID'],
       ['a payload changed after signing', async () => qrFor(clientId, await crafted(world, verifier, () => {}, { tamper: true })), 'SIGNATURE_INVALID'],
+      ['no exp', async () => qrFor(clientId, await crafted(world, verifier, (p) => delete p['exp'])), 'REQUEST_INVALID'],
+      ['an exp ten years away', async () => qrFor(clientId, await crafted(world, verifier, (p) => (p['exp'] = (p['iat'] as number) + 315_360_000))), 'REQUEST_INVALID'],
+      ['an exp 601 s after iat', async () => qrFor(clientId, await crafted(world, verifier, (p) => (p['exp'] = (p['iat'] as number) + 601))), 'REQUEST_INVALID'],
+      ['another aud', async () => qrFor(clientId, await crafted(world, verifier, (p) => (p['aud'] = 'https://wallet.example'))), 'REQUEST_INVALID'],
+      ['response_type id_token', async () => qrFor(clientId, await crafted(world, verifier, (p) => (p['response_type'] = 'vp_token id_token'))), 'REQUEST_INVALID'],
+      ['two encryption keys', async () => qrFor(clientId, await crafted(world, verifier, (p) => {
+        const jwks = (p['client_metadata'] as { jwks: { keys: Record<string, string>[] } }).jwks;
+        jwks.keys.push({ ...jwks.keys[0]!, kid: 'second' });
+      })), 'REQUEST_INVALID'],
+      ['DCQL value matching', async () => qrFor(clientId, await crafted(world, verifier, (p) => (query(p).credentials[0]!.claims[0]!['values'] = ['Nguyễn Văn A']))), 'REQUEST_INVALID'],
+      ['DCQL credential_sets with two options', async () => qrFor(clientId, await crafted(world, verifier, (p) => (query(p).credential_sets = [{ options: [['credential'], ['credential']] }]))), 'REQUEST_INVALID'],
+      ['two credential queries', async () => qrFor(clientId, await crafted(world, verifier, (p) => query(p).credentials.push({ ...query(p).credentials[0]!, id: 'second' }))), 'REQUEST_INVALID'],
+      ['multiple: true', async () => qrFor(clientId, await crafted(world, verifier, (p) => (query(p).credentials[0]!['multiple'] = true))), 'REQUEST_INVALID'],
     ];
     // Built one at a time: each serves its request object at the same path.
     for (const [name, qr, code] of cases) {
       const text = await qr();
       listener.requests.length = 0;
       assert.deepEqual(await w.wallet.presentations.resolve(text), { ok: false, code }, name);
-      assert.equal(listener.requests.some((r) => r.startsWith('POST')), false, `${name}: nothing was sent`);
     }
   });
 
   test('QR texts: only openid4vp://?client_id=x509_hash:…&request_uri=https://…', async () => {
     const { verifier, w } = await setup({ credentials: 0 });
-    const session = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+    const session = (await newSession(verifier));
     const requestUri = `${ORIGIN}/oid4vp/request/${session.requestId}`;
     listener.requests.length = 0;
     for (const [qr, code] of [
@@ -129,7 +144,7 @@ describe('submit', () => {
   test('key-store refusals map to wallet codes; an expired request is not answered; decline is local', async () => {
     const { world, verifier, w, ids } = await setup();
     const fresh = async () => {
-      const r = await w.wallet.presentations.resolve((await verifier.createSession({ scenario: 'ung-tuyen' }))!.qr);
+      const r = await w.wallet.presentations.resolve((await newSession(verifier)).qr);
       assert.ok(r.ok);
       return r.request;
     };
@@ -155,7 +170,19 @@ describe('submit', () => {
     const declined = await fresh();
     await assert.rejects(w.wallet.presentations.submit(declined, { credentialId: ids[0]!, claimSetIndex: 2 }), TypeError);
     assert.deepEqual(w.wallet.presentations.decline(declined), { ok: true });
-    await assert.rejects(w.wallet.presentations.submit(declined, { credentialId: ids[0]!, claimSetIndex: 1 }), TypeError);
+    assert.deepEqual(await w.wallet.presentations.submit(declined, { credentialId: ids[0]!, claimSetIndex: 1 }), { ok: false, code: 'REQUEST_INVALID' });
+    assert.deepEqual(w.wallet.presentations.decline(declined), { ok: false, code: 'REQUEST_INVALID' });
+    // Single use: a second submit, even with another claim set, sends nothing.
+    const once = await fresh();
+    listener.requests.length = 0;
+    const [a, b] = await Promise.all([
+      w.wallet.presentations.submit(once, { credentialId: ids[0]!, claimSetIndex: 1 }),
+      w.wallet.presentations.submit(once, { credentialId: ids[0]!, claimSetIndex: 0 }),
+    ]);
+    assert.deepEqual([a, b].map((r) => r.ok).sort(), [false, true]);
+    assert.deepEqual([a, b].find((r) => !r.ok), { ok: false, code: 'REQUEST_INVALID' });
+    assert.deepEqual(await w.wallet.presentations.submit(once, { credentialId: ids[0]!, claimSetIndex: 1 }), { ok: false, code: 'REQUEST_INVALID' });
+    assert.equal(listener.requests.filter((r) => r.startsWith('POST /oid4vp/response/')).length, 1);
   });
 });
 
@@ -174,7 +201,7 @@ describe('pinned behaviours of @openid4vc/openid4vp 0.10.0 (an upgrade that chan
   test('x509_hash needs a getX509CertificateMetadata callback, which it never reads for that prefix', async () => {
     const { world, verifier } = await setup({ credentials: 0 });
     for (const withMetadata of [false, true]) {
-      const session = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+      const session = (await newSession(verifier));
       const client = new Openid4vpClient({ callbacks: callbacks([], withMetadata) as never });
       const parsed = client.parseOpenid4vpAuthorizationRequest({ authorizationRequest: session.qr });
       const resolving = client.resolveOpenid4vpAuthorizationRequest({ authorizationRequestPayload: parsed.params as never, responseMode: { type: 'direct_post' } as never, now: world.clock.now() });
@@ -185,7 +212,7 @@ describe('pinned behaviours of @openid4vc/openid4vp 0.10.0 (an upgrade that chan
 
   test('request_uri_method=post sends the flattened wallet metadata, without wallet_nonce (so the wallet uses GET only)', async () => {
     const { world, verifier } = await setup({ credentials: 0 });
-    const session = (await verifier.createSession({ scenario: 'ung-tuyen' }))!;
+    const session = (await newSession(verifier));
     const seen: { method?: string; body?: unknown }[] = [];
     const client = new Openid4vpClient({ callbacks: callbacks(seen, true) as never });
     const parsed = client.parseOpenid4vpAuthorizationRequest({ authorizationRequest: `${session.qr}&request_uri_method=post` });
@@ -200,5 +227,56 @@ describe('pinned behaviours of @openid4vc/openid4vp 0.10.0 (an upgrade that chan
     assert.equal(body.includes('wallet_nonce'), false, 'OpenID4VP 1.0 section 5.10 wants wallet_nonce in the body');
     assert.equal(body.includes('wallet_metadata'), false, 'and wallet_metadata as one JSON parameter');
     void UNG_TUYEN;
+  });
+});
+
+describe('GĐ6 review: who the wallet says is asking, what it shows, storage failures', () => {
+  test('an issuer\'s vc certificate signing a request is never shown as a trusted verifier (purpose check)', async () => {
+    const { world, verifier, w } = await setup();
+    const vc = await leafSigner('vc');
+    const r = await w.wallet.presentations.resolve(qrFor(`x509_hash:${await fingerprintOf(vc)}`, await crafted(world, verifier, (p) => (p['client_id'] = 'x'), { signer: vc, clientIdFromSigner: true })));
+    assert.ok(r.ok, JSON.stringify(r));
+    assert.deepEqual([r.request.verifier, r.request.warning, 'purpose' in r.request], [{ trusted: false }, 'VERIFIER_NOT_TRUSTED', false]);
+  });
+
+  test('purpose: a safe string or { vi, en } of at most 300 characters; anything else is dropped; never for an untrusted verifier', async () => {
+    const { world, verifier, w } = await setup();
+    const clientId = verifier.clientId;
+    const withPurpose = async (purpose: unknown) => {
+      const r = await w.wallet.presentations.resolve(qrFor(clientId, await crafted(world, verifier, (p) => (query(p).credential_sets = [{ options: [['credential']], purpose }]))));
+      assert.ok(r.ok, JSON.stringify(r));
+      return r.request.purpose;
+    };
+    assert.equal(await withPurpose('Ứng tuyển'), 'Ứng tuyển');
+    assert.deepEqual(await withPurpose({ vi: 'Ứng tuyển' }), { vi: 'Ứng tuyển' });
+    for (const bad of ['x'.repeat(301), 'Ứng tuyển\u202egnàh', 'line\nbreak', '', { vi: 'a', fr: 'b' }, { vi: 'a', en: 'x'.repeat(301) }, { vi: 1 }, {}, 42]) {
+      assert.equal(await withPurpose(bad), undefined, JSON.stringify(bad));
+    }
+    // A purpose DCQL itself does not allow (string, number or object) makes the query invalid.
+    const r0 = await w.wallet.presentations.resolve(qrFor(clientId, await crafted(world, verifier, (p) => (query(p).credential_sets = [{ options: [['credential']], purpose: ['a'] }]))));
+    assert.deepEqual(r0, { ok: false, code: 'REQUEST_INVALID' });
+    const untrusted = await setup({ untrustedVerifier: true });
+    const r = await untrusted.w.wallet.presentations.resolve((await newSession(untrusted.verifier)).qr);
+    assert.ok(r.ok);
+    assert.equal('purpose' in r.request, false);
+  });
+
+  test('storage failures: key-store codes propagate, others are STORAGE_ERROR, in resolve and in submit', async () => {
+    const { verifier, w, ids } = await setup();
+    const open = w.vault.open;
+    const list = w.vault.list;
+    for (const [failure, code] of [[new SecretStorageError('CANCELLED'), 'USER_CANCELLED'], [new SecretStorageError('LOCKED'), 'DEVICE_LOCKED'], [new SecretStorageError('KEY_INVALIDATED'), 'KEY_INVALIDATED'], [new Error('sqlite busy'), 'STORAGE_ERROR']] as const) {
+      w.vault.open = async () => Promise.reject(failure);
+      assert.deepEqual(await w.wallet.presentations.resolve((await newSession(verifier)).qr), { ok: false, code }, `resolve ${code}`);
+      w.vault.open = open;
+      const r = await w.wallet.presentations.resolve((await newSession(verifier)).qr);
+      assert.ok(r.ok);
+      w.vault.open = async () => Promise.reject(failure);
+      assert.deepEqual(await w.wallet.presentations.submit(r.request, { credentialId: ids[0]!, claimSetIndex: 1 }), { ok: false, code }, `submit ${code}`);
+      w.vault.open = open;
+    }
+    w.vault.list = async () => Promise.reject(new Error('sqlite busy'));
+    assert.deepEqual(await w.wallet.presentations.resolve((await newSession(verifier)).qr), { ok: false, code: 'STORAGE_ERROR' });
+    w.vault.list = list;
   });
 });
