@@ -203,19 +203,30 @@ value as an OpenID4VP `x509_hash`.
   `DISCLOSURE_INVALID`.
 - KB-JWT: `typ: kb+jwt`, `alg: ES256`, payload `iat`, `aud`, `nonce`, `sd_hash`;
   accepted when `iat` is within 5 minutes (± 60 s).
-- Status list token: JWS `typ: statuslist+jwt` with `x5c` (profile `status`),
-  payload `sub` (= list URI), `iat`, `exp` (24 h), `ttl` (900), `status_list:
-  { bits: 2, lst }`; 131 072 entries; values 0 valid, 1 revoked, 2 suspended.
+- Status list token (Token Status List draft 21 §5.1): JWS `typ: statuslist+jwt`,
+  `alg: ES256`, `x5c` [leaf, issuing CA] of a `status` certificate (profile
+  `status`); payload `sub` (= list URI `<iss>/status/<n>`), `iat`, `exp` (24 h),
+  `ttl` (900), `status_list: { bits: 2, lst }`; `lst` = base64url of the ZLIB
+  (RFC 1950) compressed 32 768-byte array of 131 072 entries, entry `i` in bits
+  `2·(i mod 4)` and up of byte `⌊i / 4⌋`; values 0 valid, 1 revoked, 2
+  suspended (3 is refused). At most 128 KB.
 - Trust list token: JWS `typ: identra-trust-list+jwt` with `x5c` of exactly one
   certificate signed directly by a pinned root; payload `iat`, `exp` (24 h),
   `ttl` (3600), `issuers: [{ ma_to_chuc, ten, chung_thu: [{ sha256, muc_dich }],
   vct, cong_doan?, validFrom, validUntil }]`, `verifiers: [{ ma_to_chuc, ten,
-  chung_thu: [...] }]`.
+  chung_thu: [...], validFrom?, validUntil? }]`. `ma_to_chuc` is
+  `VATVN-<tax code>`; `sha256` is 43 base64url characters; `muc_dich` is `vc` or
+  `status` under `issuers` and `request` under `verifiers`; instants are ISO 8601
+  in UTC (`…Z`). At most 256 KB and 1000 entries.
 
-Caching rules shared by both lists (ADR-0013 §4, ADR-0015 §6): reload when the
-held copy is older than `ttl`; if the reload fails keep using the held copy
-until its `exp`; never accept a copy whose `iat` is older than the held one;
-with no valid copy the answer is `unavailable` / `TrustListUnavailableError`.
+Caching rules shared by both lists (ADR-0013 §4, ADR-0015 §6): a held copy is
+used without a reload while younger than `min(ttl, maxAgeSeconds ?? ttl)`, the
+age counted from when this process fetched it (`maxAgeSeconds: 0` = always try
+to reload: the server-side verifier); otherwise reload; if the reload fails or
+yields an invalid token keep using the held copy until its `exp` (+ 60 s skew);
+never accept a copy whose `iat` is older than the held one; with no valid copy
+the answer is `unavailable` / `TrustListUnavailableError`. Concurrent reads of
+one URL share one request; the status checker holds at most 100 lists.
 
 ## 6. Testing
 
@@ -233,3 +244,65 @@ with no valid copy the answer is `unavailable` / `TrustListUnavailableError`.
 - Crypto adapters: RFC 7515 Appendix A.3 ES256 vector; sign → verify →
   one-byte tamper fails; `alg: none` and `HS256` rejected; high-S accepted;
   DER → r||s conversion.
+
+## 7. Status list and trust list (GĐ7a)
+
+`sdk-core` (pure; fetch and clock injected):
+
+- `createStatusList()`, `statusListFromBytes(bytes)`, `decodeStatusList({ bits, lst })`:
+  the list model on `@owf/token-status-list` (bit packing and ZLIB, ADR-0017).
+  Index and value are range-checked here (the library allows 3); decoding refuses
+  `bits ≠ 2`, anything but exactly 32 768 inflated bytes, and stops inflating once
+  the output passes 32 768 bytes (in the library's 64 KiB output chunks).
+- `createStatusListToken({ list, uri, signer, now, ttlSeconds = 900, lifetimeSeconds = 86 400 })`,
+  `createTrustListToken({ issuers, verifiers, signer, now, ttlSeconds = 3600, lifetimeSeconds = 86 400 })`.
+  The trust-list signer must have an `x5c` of exactly one certificate.
+- `verifyStatusListToken(token, { uri, issuer: { maToChuc }, chainValidator, trustRegistry, verifier, now })`
+  and `verifyTrustListToken(token, { chainValidator, verifier, now })` return
+  `{ ok: true, … }` or `{ ok: false, reason, detail }` and never throw for bad input.
+  In order: size cap (`too_large`); strict JWS (`malformed`); `typ` exact (`typ`);
+  `alg` ES256 (`alg`); `x5c` with profile `status` / `trust-list` (`chain`); signature
+  with the leaf key (`signature`); numeric `iat` and `exp` present, `ttl` a positive
+  integer if present (`claims`); `iat` ≤ now + 60 s (`not_yet_valid`); `exp` > now − 60 s
+  (`expired`). Then for a status list: `sub` = `uri` (`claims`); the signer
+  fingerprint is in the trust list with purpose `status`, its `organizationIdentifier`
+  equals that entry's `maToChuc`, and that `maToChuc` is the issuer's (`not_trusted`;
+  `trust_list_unavailable` when the registry has no list); `status_list` decodes
+  (`claims`). For a trust list: the payload validator (`claims`), which also refuses
+  unknown fields and purposes, a purpose outside its section, malformed fingerprints
+  or instants, `validFrom ≥ validUntil`, and one fingerprint listed twice.
+- `createStatusListChecker({ fetch, verifier, chainValidator, trustRegistry, clock, maxAgeSeconds? })`
+  (`StatusChecker`): refuses a non-https `uri` and an `idx` outside the list without a
+  request; `GET` with `timeoutMs: 5000`, HTTP 200 only; caches per (issuer
+  `maToChuc`, `uri`) by the rules of section 5 and re-checks the signer against the
+  trust list on every answer. Every failure is `'unavailable'`.
+- `createSignedTrustListRegistry({ url, fetch, verifier, chainValidator, clock, maxAgeSeconds? })`
+  (`TrustRegistry`): `lookup(fingerprint, at = clock.now())` gives the entry with the
+  purpose of the matched certificate, `null` when absent or `at` is outside
+  `[validFrom, validUntil]`; `refresh()`; `current()` (iat, exp, ttl, entry counts)
+  for monitoring (ADR-0014 §7).
+- `createMappedFetch(fetch, { 'https://api-identra.awncorp.vn': 'http://127.0.0.1:4000' })`:
+  development and test deployments send network access for a canonical origin
+  elsewhere; identifiers stay canonical. Only the exact origin followed by `/`, `?`,
+  `#` or nothing is mapped.
+
+`sdk-server` (Node):
+
+- `createFileKeyStore(dir)` reads the layout of `scripts/pki/make-demo-pki.sh`:
+  `orgs/<name>/<purpose>.key.pem` + `.chain.pem` (purpose `vc` is the file `vc` or
+  `vc-product`, exactly one of them), `trust-list-signer/trust-list.key.pem` +
+  `.cert.pem`, `root.cert.pem` (+ `root2.cert.pem`). Names are lower-case words
+  joined by hyphens; key files must be regular files without group or other
+  permissions; keys are imported non-extractable and must match their certificate.
+- `createStatusListService({ issuerUri, keyStore, storage, random, clock })`:
+  `allocate(issuer)` draws a random index and claims it with `storage.reserve`, which
+  must be atomic (Postgres: unique key `(issuer, n, idx)`, `INSERT … ON CONFLICT DO
+  NOTHING`), so two concurrent allocations never get one index; `setStatus` uses
+  `storage.save(…, expectedVersion)` (optimistic concurrency, retried); `revoked`
+  is final (`StatusRevokedError`); `token(issuer, n)` re-signs when the stored
+  version changed or the token is an hour old. All credentials use list 1 for now.
+- `createTrustListService({ source, keyStore, clock })` validates the source with the
+  core validator and re-signs when it changed or after an hour; an invalid source
+  throws.
+- `scripts/pki/make-trust-list-source.mjs <demo-pki-dir> [--out file]` writes the
+  trust-list source of the demo organisations.

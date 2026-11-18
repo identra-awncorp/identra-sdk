@@ -8,6 +8,7 @@ and OpenSSL 3.0 or later (tested with 3.0.17).
 | `identra-pki.sh` | The operational tool: Root, Issuing CA, organisation keys and CSRs, leaf and trust-list-signer certificates |
 | `make-demo-pki.sh <outdir> [<issuer-base-url>]` | The DEMO set of ADR-0015 section 10 (every name says DEMO, fake tax codes) |
 | `make-test-pki.sh <outdir>` | Test material for `npm test`, including invalid certificates, with fixed dates |
+| `make-trust-list-source.mjs <demo-pki-dir> [--out file]` | The trust-list source JSON of the demo organisations, from a `make-demo-pki.sh` directory (needs `npm run build`) |
 | `ensure-test-pki.sh` | Run by `npm test`; regenerates `.pki/test` and `.pki/demo` when the scripts change |
 
 Rules the scripts enforce:
