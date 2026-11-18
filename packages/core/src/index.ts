@@ -18,3 +18,37 @@ export {
   type VerifiedCredential,
   type VerifyCredentialOptions,
 } from './sd-jwt/verify.js';
+// Status list and trust list (GĐ7a, docs/architecture.md section 7).
+export {
+  createStatusList,
+  decodeStatusList,
+  statusListFromBytes,
+  STATUS_LIST_BYTES,
+  STATUS_LIST_ENTRIES,
+  STATUS_VALUE,
+  type StatusList,
+  type StatusValue,
+} from './status/list.js';
+export {
+  createStatusListToken,
+  STATUS_LIST_TOKEN_MAX_BYTES,
+  STATUS_LIST_TOKEN_TYP,
+  verifyStatusListToken,
+  type VerifiedStatusListToken,
+} from './status/token.js';
+export { createStatusListChecker, STATUS_CACHE_MAX_URIS } from './status/checker.js';
+export type { TokenFailure, TokenFailureReason } from './signed-token.js';
+export {
+  isFingerprint,
+  TRUST_LIST_MAX_ENTRIES,
+  validateTrustListContent,
+  validateTrustListPayload,
+  type TrustListCertificate,
+  type TrustListContent,
+  type TrustListIssuer,
+  type TrustListPayload,
+  type TrustListVerifier,
+} from './trust/payload.js';
+export { createTrustListToken, TRUST_LIST_TOKEN_MAX_BYTES, TRUST_LIST_TOKEN_TYP, verifyTrustListToken, type VerifiedTrustListToken } from './trust/token.js';
+export { createSignedTrustListRegistry, type SignedTrustListRegistry } from './trust/registry.js';
+export { createMappedFetch } from './mapped-fetch.js';
