@@ -9,9 +9,9 @@ const MAX_TOKEN_BYTES = 2048;
 const SKEW_SECONDS = 60;
 const JTI = /^[A-Za-z0-9_-]{22}$/;
 
-export function signAccessToken(o: { signer: Signer & { kid: string }; issuerUri: string; jti: string; now: Date }): Promise<string> {
+export function signAccessToken(o: { signer: Signer & { kid: string }; issuerUri: string; jti: string; now: Date; lifetimeSeconds: number }): Promise<string> {
   const iat = Math.floor(o.now.getTime() / 1000);
-  const payload = { iss: o.issuerUri, aud: o.issuerUri, iat, exp: iat + ACCESS_TOKEN_SECONDS, jti: o.jti };
+  const payload = { iss: o.issuerUri, aud: o.issuerUri, iat, exp: iat + o.lifetimeSeconds, jti: o.jti };
   return signJws({ typ: 'at+jwt', kid: o.signer.kid }, utf8Encode(JSON.stringify(payload)), o.signer);
 }
 

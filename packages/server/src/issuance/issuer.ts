@@ -4,7 +4,7 @@
 // dependency (state store, callbacks, signer) fails.
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import {
-  base64UrlDecode, base64UrlEncode, issueDiploma, jwkThumbprint, normalizeEcPublicJwk, VCT,
+  base64UrlDecode, base64UrlEncode, issueDiploma, jwkThumbprint, normalizeEcPublicJwk, utf8Encode, VCT,
   type Clock, type DiplomaClaims, type EcPublicJwk, type Hasher, type RandomSource, type Signer, type Verifier,
 } from '@identra/sdk-core';
 import { ACCESS_TOKEN_SECONDS, signAccessToken, verifyAccessToken } from './access-token.js';
@@ -72,6 +72,8 @@ export interface CredentialIssuerConfig {
   store: ProtocolStateStore;
   keys: IssuerKeys;
   credentials: Record<string, CredentialHandlers>;
+  /** Shorter lifetimes, for tests; the defaults (ADR-0010) are also the upper bounds. */
+  lifetimes?: { offerSeconds?: number; accessTokenSeconds?: number; nonceSeconds?: number };
 }
 
 export type OfferStatus = 'pending' | 'issued' | 'expired';
@@ -83,6 +85,8 @@ export interface CredentialIssuer {
   /** The PIN is returned here once and stored only as a keyed hash. */
   createOffer(input: { subjectRef: string; configurationId: string }): Promise<{ offerId: string; offerUri: string; txCode: string; expiresAt: string }>;
   offer(offerId: string): Promise<HttpResponse>;
+  /** Ends an offer at once: the code no longer redeems and the status reads `expired`. Safe on a used, expired or unknown offer. */
+  cancelOffer(offerId: string): Promise<void>;
   /** Null when unknown or older than 30 minutes. */
   offerStatus(offerId: string): Promise<{ status: OfferStatus; subjectRef: string; credentialId?: string } | null>;
   token(request: HttpRequest): Promise<HttpResponse>;
@@ -90,11 +94,20 @@ export interface CredentialIssuer {
   credential(request: HttpRequest): Promise<HttpResponse>;
 }
 
-interface OfferRecord { offer: unknown; subjectRef: string; configurationId: string; pinKey: string; pinMac: string; expiresAt: number }
-interface StatusRecord { status: 'pending' | 'issued' | 'destroyed'; subjectRef: string; createdAt: number; expiresAt: number; credentialId?: string }
+interface OfferRecord { offer: unknown; code: string; subjectRef: string; configurationId: string; pinMac: string; expiresAt: number }
+/** Written once at creation; `issued:<offerId>` and `ended:<offerId>` are separate keys, so no update can overwrite another. */
+interface StatusRecord { subjectRef: string; createdAt: number; expiresAt: number }
 interface TokenRecord { offerId: string; subjectRef: string; configurationId: string }
 
-const mac = (key: string, pin: string) => createHmac('sha256', base64UrlDecode(key)).update(pin, 'utf8').digest();
+const mac = (key: Uint8Array, pin: string) => createHmac('sha256', key).update(pin, 'utf8').digest();
+const NONCE = /^[A-Za-z0-9_-]{22}$/;
+
+/** A lifetime override: a positive integer no larger than the default. */
+function lifetime(value: number | undefined, max: number, name: string): number {
+  if (value === undefined) return max;
+  if (!Number.isSafeInteger(value) || value <= 0 || value > max) throw new TypeError(`lifetimes.${name} must be an integer from 1 to ${max}`);
+  return value;
+}
 const contentType = (r: HttpRequest) => (r.headers['content-type'] ?? '').toLowerCase();
 
 /** Six decimal digits, uniform: 32-bit draws above the largest multiple of 10^6 are drawn again. */
@@ -117,7 +130,13 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
     issuerUri, display: config.display, configurations, hasher, random,
     requestEncryptionJwk: keys.requestEncryption.publicJwk, decryptionKey: keys.requestEncryption.privateKey,
   });
+  const offerSeconds = lifetime(config.lifetimes?.offerSeconds, OFFER_SECONDS, 'offerSeconds');
+  const tokenSeconds = lifetime(config.lifetimes?.accessTokenSeconds, ACCESS_TOKEN_SECONDS, 'accessTokenSeconds');
+  const nonceSeconds = lifetime(config.lifetimes?.nonceSeconds, NONCE_SECONDS, 'nonceSeconds');
+  if (!(keys.pinKey instanceof Uint8Array) || keys.pinKey.length !== 32) throw new TypeError('keys.pinKey must be 32 bytes (generateIssuerKeys)');
   const key = (kind: string, id: string) => `vci:${issuerUri}:${kind}:${id}`;
+  /** Secret-bearing values (codes, token ids, nonces) never appear in a key name: their SHA-256 does. */
+  const hashedKey = async (kind: string, value: string) => key(kind, base64UrlEncode(await hasher.sha256(utf8Encode(value))));
   const newId = () => base64UrlEncode(random.bytes(16));
   const read = async <T>(k: string): Promise<T | null> => {
     const v = await store.get(k);
@@ -125,16 +144,19 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
   };
   const ok = (value: unknown) => jsonResponse(200, value);
 
-  /** Code and offer are gone; the status reads `expired` from now on. */
-  async function destroyOffer(offerId: string, code: string): Promise<void> {
-    await store.take(key('code', code));
-    await store.take(key('offer', offerId));
-    const status = await read<StatusRecord>(key('status', offerId));
-    if (status) await putStatus(offerId, { ...status, status: 'destroyed' });
+  /** Seconds the status of an offer created at `createdAt` stays readable (0 when it no longer is). */
+  const statusLeft = (createdAt: number) => Math.ceil((createdAt + OFFER_STATUS_SECONDS * 1000 - clock.now().getTime()) / 1000);
+  /** Sets a status flag (`issued` or `ended`) of an existing offer; each flag is its own key. */
+  async function flag(kind: 'issued' | 'ended', offerId: string, value: string): Promise<void> {
+    const s = await read<StatusRecord>(key('status', offerId));
+    const left = s ? statusLeft(s.createdAt) : 0;
+    if (left > 0) await store.put(key(kind, offerId), value, left);
   }
-  async function putStatus(offerId: string, s: StatusRecord): Promise<void> {
-    const left = Math.ceil((s.createdAt + OFFER_STATUS_SECONDS * 1000 - clock.now().getTime()) / 1000);
-    if (left > 0) await store.put(key('status', offerId), JSON.stringify(s), left);
+  /** Code and offer are gone (each taken atomically); the status reads `expired` unless it was issued. */
+  async function endOffer(offerId: string): Promise<void> {
+    const record = await store.take(key('offer', offerId));
+    if (record !== null) await store.take(await hashedKey('code', (JSON.parse(record) as OfferRecord).code));
+    await flag('ended', offerId, '1');
   }
 
   return {
@@ -148,14 +170,13 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
       const offerId = newId();
       const code = base64UrlEncode(random.bytes(32));
       const txCode = drawPin(random);
-      const pinKey = base64UrlEncode(random.bytes(32));
       const now = clock.now().getTime();
-      const expiresAt = now + OFFER_SECONDS * 1000;
+      const expiresAt = now + offerSeconds * 1000;
       const { offerUri, offer } = await lib.createOffer({ offerUri: `${issuerUri}/offers/${offerId}`, configurationId, preAuthorizedCode: code, txCodeDescription: TX_CODE_DESCRIPTION });
-      const record: OfferRecord = { offer, subjectRef, configurationId, pinKey, pinMac: base64UrlEncode(mac(pinKey, txCode)), expiresAt };
-      await putStatus(offerId, { status: 'pending', subjectRef, createdAt: now, expiresAt });
-      await store.put(key('offer', offerId), JSON.stringify(record), OFFER_SECONDS);
-      await store.put(key('code', code), offerId, OFFER_SECONDS);
+      const record: OfferRecord = { offer, code, subjectRef, configurationId, pinMac: base64UrlEncode(mac(keys.pinKey, txCode)), expiresAt };
+      await store.put(key('status', offerId), JSON.stringify({ subjectRef, createdAt: now, expiresAt } satisfies StatusRecord), OFFER_STATUS_SECONDS);
+      await store.put(key('offer', offerId), JSON.stringify(record), offerSeconds);
+      await store.put(await hashedKey('code', code), offerId, offerSeconds);
       return { offerId, offerUri, txCode, expiresAt: new Date(expiresAt).toISOString() };
     },
 
@@ -165,17 +186,24 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
       return ok(record.offer);
     },
 
+    async cancelOffer(offerId) {
+      if (ID.test(offerId)) await endOffer(offerId);
+    },
+
     async offerStatus(offerId) {
       const s = ID.test(offerId) ? await read<StatusRecord>(key('status', offerId)) : null;
       if (!s) return null;
-      const status: OfferStatus = s.status === 'issued' ? 'issued' : s.status === 'destroyed' || s.expiresAt <= clock.now().getTime() ? 'expired' : 'pending';
-      return { status, subjectRef: s.subjectRef, ...(s.credentialId !== undefined ? { credentialId: s.credentialId } : {}) };
+      const credentialId = await store.get(key('issued', offerId));
+      if (credentialId !== null) return { status: 'issued', subjectRef: s.subjectRef, credentialId };
+      const ended = (await store.get(key('ended', offerId))) !== null;
+      return { status: ended || s.expiresAt <= clock.now().getTime() ? 'expired' : 'pending', subjectRef: s.subjectRef };
     },
 
     async token(request) {
       if (!contentType(request).startsWith('application/x-www-form-urlencoded') || request.body.length > 4096) return oauthError(400, 'invalid_request', 'form-encoded token request expected');
       const params = new URLSearchParams(request.body);
       if (new Set(params.keys()).size !== [...params.keys()].length) return oauthError(400, 'invalid_request', 'a parameter is repeated');
+      if (params.get('grant_type') === null) return oauthError(400, 'invalid_request', 'grant_type is required');
       if (params.get('grant_type') !== PRE_AUTHORIZED_GRANT) return oauthError(400, 'unsupported_grant_type', 'only the pre-authorized code grant is supported');
       const code = params.get('pre-authorized_code');
       const txCode = params.get('tx_code');
@@ -183,39 +211,41 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
       const invalidGrant = oauthError(400, 'invalid_grant', 'the pre-authorized code or the transaction code is not valid');
       if (!CODE.test(code)) return invalidGrant;
 
-      const offerId = await store.get(key('code', code));
+      const codeKey = await hashedKey('code', code);
+      const offerId = await store.get(codeKey);
       const record = offerId === null ? null : await read<OfferRecord>(key('offer', offerId));
       if (offerId === null || !record || record.expiresAt <= clock.now().getTime()) return invalidGrant;
       // The attempt is counted before the comparison, so concurrent guesses cannot exceed the limit.
-      const attempt = await store.increment(key('attempts', offerId), OFFER_SECONDS);
+      const attempt = await store.increment(key('attempts', offerId), offerSeconds);
       if (attempt > MAX_TX_CODE_ATTEMPTS) return invalidGrant;
-      const given = mac(record.pinKey, txCode);
+      const given = mac(keys.pinKey, txCode);
       if (!/^[0-9]{6}$/.test(txCode) || !timingSafeEqual(given, base64UrlDecode(record.pinMac))) {
-        if (attempt === MAX_TX_CODE_ATTEMPTS) await destroyOffer(offerId, code);
+        if (attempt === MAX_TX_CODE_ATTEMPTS) await endOffer(offerId);
         return invalidGrant;
       }
       // Single use: of concurrent requests with the right PIN, only the one that takes the code wins.
-      if ((await store.take(key('code', code))) === null) return invalidGrant;
+      if ((await store.take(codeKey)) === null) return invalidGrant;
       await store.take(key('offer', offerId));
       const jti = newId();
       const token: TokenRecord = { offerId, subjectRef: record.subjectRef, configurationId: record.configurationId };
-      await store.put(key('token', jti), JSON.stringify(token), ACCESS_TOKEN_SECONDS);
-      const accessToken = await signAccessToken({ signer: keys.accessToken.signer, issuerUri, jti, now: clock.now() });
-      return ok({ access_token: accessToken, token_type: 'Bearer', expires_in: ACCESS_TOKEN_SECONDS });
+      await store.put(await hashedKey('token', jti), JSON.stringify(token), tokenSeconds);
+      const accessToken = await signAccessToken({ signer: keys.accessToken.signer, issuerUri, jti, now: clock.now(), lifetimeSeconds: tokenSeconds });
+      return jsonResponse(200, { access_token: accessToken, token_type: 'Bearer', expires_in: tokenSeconds }, { Pragma: 'no-cache' });
     },
 
     async nonce() {
       const cNonce = base64UrlEncode(random.bytes(16));
-      await store.put(key('nonce', cNonce), '1', NONCE_SECONDS);
-      return ok({ c_nonce: cNonce, c_nonce_expires_in: NONCE_SECONDS });
+      await store.put(await hashedKey('nonce', cNonce), '1', nonceSeconds);
+      return ok({ c_nonce: cNonce, c_nonce_expires_in: nonceSeconds });
     },
 
     async credential(request) {
       const now = clock.now();
       const jti = await verifyAccessToken(request.headers['authorization'], { publicJwk: keys.accessToken.publicJwk, verifier, issuerUri, now });
-      const token = jti === null ? null : await read<TokenRecord>(key('token', jti));
+      const tokenKey = jti === null ? null : await hashedKey('token', jti);
+      const token = tokenKey === null ? null : await read<TokenRecord>(tokenKey);
       const invalidToken = oauthError(401, 'invalid_token', 'the access token is not valid');
-      if (jti === null || !token) return invalidToken;
+      if (tokenKey === null || !token) return invalidToken;
       if (request.body.length > MAX_BODY_BYTES) return oauthError(400, 'invalid_credential_request', 'the request is too large');
 
       const encrypted = contentType(request).startsWith('application/jwt');
@@ -232,12 +262,13 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
         }
         encryption = { jwk: { ...publicJwk, alg: 'ECDH-ES' }, enc };
       }
+      if (parsed.draftProof) return oauthError(400, 'invalid_credential_request', 'use proofs, not the draft-era proof member');
       if (parsed.jwtProofs.length !== 1 || parsed.otherProofs) return oauthError(400, 'invalid_proof', 'exactly one jwt proof is required');
       const proof = await verifyProof(parsed.jwtProofs[0], { issuerUri, verifier, now });
       if (!proof.ok) return oauthError(400, 'invalid_proof', 'the proof is not valid');
-      if ((await store.take(key('nonce', proof.nonce))) === null) return oauthError(400, 'invalid_nonce', 'the c_nonce is unknown, expired or used');
+      if (!NONCE.test(proof.nonce) || (await store.take(await hashedKey('nonce', proof.nonce))) === null) return oauthError(400, 'invalid_nonce', 'the c_nonce is unknown, expired or used');
       // One credential per access token: consumed here, before any effect.
-      if ((await store.take(key('token', jti))) === null) return invalidToken;
+      if ((await store.take(tokenKey)) === null) return invalidToken;
 
       // Order of effects (architecture section 8): a failure from here on throws; the token is spent,
       // an allocated status index stays reserved and unused, and the offer is not marked issued.
@@ -252,8 +283,7 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
         offerId: token.offerId, subjectRef: token.subjectRef, statusUri: status.uri, statusIdx: status.idx, cnfThumbprint, issuedAt,
       });
       try {
-        const s = await read<StatusRecord>(key('status', token.offerId));
-        if (s) await putStatus(token.offerId, { ...s, status: 'issued', credentialId });
+        await flag('issued', token.offerId, credentialId);
       } catch {
         // The credential is issued and recorded by onIssued; only the portal's display status lags.
       }

@@ -117,7 +117,7 @@ export interface CredentialVault {
   open(id: string): Promise<string>;
   /** Deletes the row only (idempotent) and leaves its wallet key behind; prefer removeWithKey. */
   remove(id: string): Promise<void>;
-  /** Deletes the row, then its wallet key (idempotent). */
+  /** Deletes the wallet key, then the row (idempotent; after a failure, calling it again completes it). */
   removeWithKey(id: string, keyStore: WalletKeyStore): Promise<void>;
   /**
    * Deletes exactly the rows sealed under a different data key (their key-check value differs
@@ -327,8 +327,10 @@ export function createCredentialVault(options: { repository: CredentialRepositor
     async removeWithKey(id, keyStore) {
       const row = await repository.get(id);
       if (!row) return;
-      await repository.delete(id);
+      // Key first: a row without its key is visible (it cannot be presented) and a retry finishes
+      // the job; a key without its row would never be found again.
       await keyStore.delete(row.key_id);
+      await repository.delete(id);
     },
 
     async purgeUndecryptable() {

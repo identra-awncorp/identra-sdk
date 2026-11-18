@@ -30,6 +30,12 @@ export interface WalletConfig {
   seen?: SeenStore;
   verifier?: Verifier;
   hasher?: Hasher;
+  /**
+   * Exact origins (`https://host[:port]`) whose offers and presentation requests the wallet opens;
+   * a QR code naming any other origin is URL_NOT_ALLOWED before any request. The Identra app sets
+   * the API origin (ADR-0010 point 6). Unset: any acceptable https host.
+   */
+  allowedOrigins?: string[];
 }
 
 /** A status list URL as the credential policy admits it: `<iss>/status/<n>` (checked again by the policy). */
@@ -43,6 +49,8 @@ export function createWallet(config: WalletConfig) {
   if (typeof fetch !== 'function') throw new TypeError('fetch is required');
   if (httpsOrigin(trustListUrl) === null) throw new TypeError('trustListUrl must be an https URL');
   for (const vct of supportedVcts) if (!Object.hasOwn(REQUIRED_CLAIMS, vct)) throw new TypeError(`${vct} is not a credential type the wallet can receive`);
+  const allowedOrigins = config.allowedOrigins === undefined ? null : [...config.allowedOrigins];
+  if (allowedOrigins && !allowedOrigins.every((o) => httpsOrigin(o) === o)) throw new TypeError('allowedOrigins must be exact https origins of acceptable hosts');
 
   // The trust list and the status lists the credential policy names; nothing else.
   const listsFetch = guardFetch(fetch, {
@@ -53,7 +61,7 @@ export function createWallet(config: WalletConfig) {
   const chainValidator = createCertificateChainValidator({ trustedRoots, verifier, hasher });
   const trustRegistry = createSignedTrustListRegistry({ url: trustListUrl, fetch: listsFetch, verifier, chainValidator, clock, ...(seen ? { seen } : {}) });
   const statusChecker = createStatusListChecker({ fetch: listsFetch, verifier, chainValidator, trustRegistry, clock, ...(seen ? { seen } : {}) });
-  const ctx: WalletContext = { keyStore, vault, fetch, random, clock, verifier, hasher, chainValidator, trustRegistry, statusChecker, supportedVcts };
+  const ctx: WalletContext = { keyStore, vault, fetch, random, clock, verifier, hasher, chainValidator, trustRegistry, statusChecker, supportedVcts, allowedOrigins };
 
   return {
     offers: createIssuance(ctx),

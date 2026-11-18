@@ -29,13 +29,26 @@ export interface IssuerSession {
 // Header names copied into the library's Response; HttpFetch cannot enumerate headers.
 const RESPONSE_HEADERS = ['content-type', 'www-authenticate', 'dpop-nonce', 'cache-control'];
 
+/** Response size cap per kind of library request (the library names it); anything else gets the smallest. */
+export const RESPONSE_CAPS: Readonly<Record<string, number>> = Object.freeze({
+  credentialOffer: 65_536,
+  credentialIssuerMetadata: 65_536,
+  authorizationServerMetadata: 65_536,
+  accessTokenRequest: 16_384,
+  nonceRequest: 16_384,
+  credentialRequest: 65_536,
+  requestObject: 65_536,
+});
+const SMALLEST_CAP = 16_384;
+
 /** The library's fetch (RequestInit in, Response out) over an HttpFetch. Needs the globals Headers and Response. */
 function libraryFetch(fetch: HttpFetch) {
-  return async (input: string, init: RequestInit): Promise<Response> => {
+  return async (input: string, init: RequestInit, context?: { type?: string }): Promise<Response> => {
+    const maxBytes = RESPONSE_CAPS[context?.type ?? ''] ?? SMALLEST_CAP;
     const headers: Record<string, string> = {};
     new Headers(init.headers).forEach((value, name) => (headers[name] = value));
     if (init.body !== undefined && init.body !== null && typeof init.body !== 'string') throw new TypeError('only string request bodies are supported');
-    const res = await fetch(input, { method: (init.method ?? 'GET').toUpperCase(), headers, ...(typeof init.body === 'string' ? { body: init.body } : {}) });
+    const res = await fetch(input, { method: (init.method ?? 'GET').toUpperCase(), headers, maxBytes, ...(typeof init.body === 'string' ? { body: init.body } : {}) });
     const bytes = utf8Encode(await res.text());
     return {
       status: res.status,

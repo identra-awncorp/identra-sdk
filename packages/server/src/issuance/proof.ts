@@ -10,11 +10,20 @@ const MAX_PROOF_BYTES = 4096;
 /** Header members naming the key another way; the proof must carry exactly `jwk`. */
 const OTHER_KEY_MEMBERS = ['kid', 'x5c', 'x5u', 'jku', 'trust_chain', 'key_attestation'];
 
+/** Optional JWK members that say the key is not an ES256 signing key (`kid` says nothing and is ignored). */
+function contradictsSigning(jwk: Record<string, unknown>): boolean {
+  if (jwk['alg'] !== undefined && jwk['alg'] !== 'ES256') return true;
+  if (jwk['use'] !== undefined && jwk['use'] !== 'sig') return true;
+  const ops = jwk['key_ops'];
+  return ops !== undefined && !(Array.isArray(ops) && ops.includes('verify'));
+}
+
 export type ProofResult = { ok: true; jwk: EcPublicJwk; nonce: string } | { ok: false; error: 'invalid_proof' };
 
 /**
  * All of: compact JWS of at most 4 KB; `typ` openid4vci-proof+jwt; `alg` ES256; header `jwk` a
- * valid on-curve P-256 public key with no private member and no other key reference; signature by
+ * valid on-curve P-256 public key with no private member, no other key reference and no `alg` /
+ * `use` / `key_ops` that contradicts ES256 signing; signature by
  * that key; `aud` = issuer identifier; numeric `iat` within [now - 360 s, now + 60 s]; a non-empty
  * string `nonce`. Never throws.
  */
@@ -26,7 +35,7 @@ export async function verifyProof(jwt: unknown, o: { issuerUri: string; verifier
   if (header['typ'] !== PROOF_TYP || checkJwsAlgorithm(header) !== null) return fail;
   if (OTHER_KEY_MEMBERS.some((m) => m in header)) return fail;
   const jwk = normalizeEcPublicJwk(header['jwk']);
-  if (!jwk) return fail;
+  if (!jwk || contradictsSigning(header['jwk'] as Record<string, unknown>)) return fail;
   if ((await verifyJws(decoded.jws, jwk, o.verifier)) !== null) return fail;
   let p: unknown;
   try {

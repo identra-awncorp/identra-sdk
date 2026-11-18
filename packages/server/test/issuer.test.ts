@@ -6,12 +6,13 @@ import { describe, test } from 'node:test';
 import { CompactEncrypt, compactDecrypt, importJWK } from 'jose';
 import {
   base64Decode, base64Encode, base64UrlDecode, base64UrlEncode, decodeCredentialUnverified, normalizeEcPublicJwk, utf8Decode, utf8Encode,
-  type RandomSource, type Signer,
+  type Hasher, type RandomSource, type Signer,
 } from '@identra/sdk-core';
+import { sha256 } from '@noble/hashes/sha2.js';
 import { createWebCryptoSigner, generateWebCryptoKeyPair, webCryptoHasher, webCryptoRandom, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import {
   createCredentialIssuer, createMemoryStateStore, createMemoryStatusListStorage, createStatusListService, generateIssuerKeys,
-  type CredentialHandlers, type HttpResponse, type IssuedEvent, type ProtocolStateStore,
+  type CredentialHandlers, type CredentialIssuerConfig, type HttpResponse, type IssuedEvent, type ProtocolStateStore,
 } from '@identra/sdk-server';
 import { fakeClock } from './helpers.js';
 
@@ -27,7 +28,7 @@ const b64json = (v: unknown) => base64UrlEncode(utf8Encode(JSON.stringify(v)));
 const body = (r: HttpResponse) => JSON.parse(r.body) as Record<string, unknown>;
 const form = (fields: Record<string, string>) => ({ headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(fields).toString() });
 
-async function world(o: { handlers?: Partial<CredentialHandlers>; store?: (s: ProtocolStateStore) => ProtocolStateStore; random?: RandomSource } = {}) {
+async function world(o: { handlers?: Partial<CredentialHandlers>; store?: (s: ProtocolStateStore) => ProtocolStateStore; random?: RandomSource; hasher?: Hasher; lifetimes?: CredentialIssuerConfig['lifetimes'] } = {}) {
   const clock = fakeClock(NOW);
   const statusStorage = createMemoryStatusListStorage();
   const keyStore = { signer: async () => { throw new Error('unused'); }, trustListSigner: async () => { throw new Error('unused'); }, trustedRoots: () => [] };
@@ -36,7 +37,13 @@ async function world(o: { handlers?: Partial<CredentialHandlers>; store?: (s: Pr
   const allocations: { uri: string; idx: number }[] = [];
   const puts: string[] = [];
   const memory = createMemoryStateStore(clock);
-  const recording: ProtocolStateStore = { ...memory, put: (k, v, t) => (puts.push(v), memory.put(k, v, t)) };
+  const names = new Set<string>();
+  const recording: ProtocolStateStore = {
+    put: (k, v, t) => (puts.push(v), names.add(k), memory.put(k, v, t)),
+    get: (k) => (names.add(k), memory.get(k)),
+    take: (k) => (names.add(k), memory.take(k)),
+    increment: (k, t) => (names.add(k), memory.increment(k, t)),
+  };
   const keys = await generateIssuerKeys(webCryptoRandom);
   const issuer = createCredentialIssuer({
     issuerUri: ISS, display: { vi: 'Trường Mẫu', en: 'Sample University' }, signer: await vcSigner,
@@ -45,7 +52,8 @@ async function world(o: { handlers?: Partial<CredentialHandlers>; store?: (s: Pr
       allocations.push(a);
       return a;
     },
-    hasher: webCryptoHasher, verifier: webCryptoVerifier, random: o.random ?? webCryptoRandom, clock, store: (o.store ?? ((s) => s))(recording), keys,
+    hasher: o.hasher ?? webCryptoHasher, verifier: webCryptoVerifier, random: o.random ?? webCryptoRandom, clock, store: (o.store ?? ((s) => s))(recording), keys,
+    ...(o.lifetimes ? { lifetimes: o.lifetimes } : {}),
     credentials: {
       [CONFIG]: {
         resolveClaims: o.handlers?.resolveClaims ?? (async () => ({ ...DIPLOMA })),
@@ -77,7 +85,7 @@ async function world(o: { handlers?: Partial<CredentialHandlers>; store?: (s: Pr
   const credential = (at: string, request: unknown, contentType = 'application/json') =>
     issuer.credential({ headers: { authorization: `Bearer ${at}`, 'content-type': contentType }, body: typeof request === 'string' ? request : JSON.stringify(request) });
   const requestWith = async (proofs: unknown) => ({ credential_configuration_id: CONFIG, proofs });
-  return { clock, issuer, keys, issued, allocations, statusStorage, holder, puts, newOffer, token, accessToken, cNonce, proof, credential, requestWith };
+  return { clock, issuer, keys, issued, allocations, statusStorage, holder, puts, names, newOffer, token, accessToken, cNonce, proof, credential, requestWith };
 }
 
 const error = (r: HttpResponse) => [r.status, body(r)['error']];
@@ -370,5 +378,97 @@ describe('order of effects', () => {
     assert.equal(w.allocations.length, 0);
     assert.equal(w.issued.length, 0);
     failTake = false;
+  });
+});
+
+describe('review fixes (GĐ5 review F5, F8 and notes)', () => {
+  test('codes, token ids and nonces never appear in a store key; the PIN key never reaches the store', async () => {
+    const w = await world();
+    const o = await w.newOffer();
+    const tokenResponse = await w.token(o.code, o.txCode);
+    assert.equal(tokenResponse.headers['Pragma'], 'no-cache');
+    const at = body(tokenResponse)['access_token'] as string;
+    const jti = (JSON.parse(utf8Decode(base64UrlDecode(at.split('.')[1]!))) as { jti: string }).jti;
+    const nonce = await w.cNonce();
+    assert.equal((await w.credential(at, await w.requestWith({ jwt: [await w.proof({ nonce })] }))).status, 200);
+    const keys = [...w.names].join('\n');
+    for (const secret of [o.code, jti, nonce]) assert.equal(keys.includes(secret), false);
+    assert.equal(w.puts.some((v) => v.includes(base64UrlEncode(w.keys.pinKey))), false);
+  });
+
+  test('100 concurrent wrong PINs before the right one, on a store with latency: never more than 5 compared (40 offers, 0 won)', async () => {
+    // Every store call waits the same 2 ms, so calls complete in the order they were made; the
+    // noble hasher keeps the order too. A counter that is read and written separately would let
+    // all 100 compare and the last, right, PIN win every time.
+    const latency = (s: ProtocolStateStore): ProtocolStateStore => {
+      const wait = () => new Promise((r) => setTimeout(r, 2));
+      return { put: async (...a) => (await wait(), s.put(...a)), get: async (k) => (await wait(), s.get(k)), take: async (k) => (await wait(), s.take(k)), increment: async (...a) => (await wait(), s.increment(...a)) };
+    };
+    const w = await world({ store: latency, hasher: { sha256: async (d) => sha256(d) } });
+    let won = 0;
+    for (let trial = 0; trial < 40; trial++) {
+      const o = await w.newOffer();
+      const wrong = o.txCode === '000000' ? '000001' : '000000';
+      const results = await Promise.all(Array.from({ length: 100 }, (_, i) => w.token(o.code, i === 99 ? o.txCode : wrong)));
+      if (results.some((r) => r.status === 200)) won++;
+      assert.equal((await w.issuer.offerStatus(o.offerId))?.status, 'expired');
+    }
+    assert.equal(won, 0);
+  });
+
+  test('the attempt limit is exactly 5: four wrong PINs leave the right one usable', async () => {
+    const w = await world();
+    const o = await w.newOffer();
+    const wrong = o.txCode === '000000' ? '000001' : '000000';
+    for (let i = 0; i < 4; i++) assert.deepEqual(error(await w.token(o.code, wrong)), [400, 'invalid_grant']);
+    assert.equal((await w.token(o.code, o.txCode)).status, 200);
+  });
+
+  test('missing grant_type, a nonce of the wrong form, the draft proof member, a proof jwk that is not for ES256 signing', async () => {
+    const w = await world();
+    assert.deepEqual(error(await w.issuer.token(form({ 'pre-authorized_code': 'x', tx_code: '123456' }))), [400, 'invalid_request']);
+    const at = await w.accessToken();
+    for (const nonce of ['x'.repeat(200), 'a:b:c:d:e:f:g:h:i:j:k:', 'é'.repeat(22)]) {
+      assert.deepEqual(error(await w.credential(at, await w.requestWith({ jwt: [await w.proof({ nonce })] }))), [400, 'invalid_nonce'], nonce);
+    }
+    const draft = { credential_configuration_id: CONFIG, proof: { proof_type: 'jwt', jwt: await w.proof() } };
+    assert.deepEqual(error(await w.credential(at, draft)), [400, 'invalid_credential_request']);
+    for (const extra of [{ alg: 'ES384' }, { use: 'enc' }, { key_ops: ['encrypt'] }, { key_ops: 'verify' }]) {
+      const r = await w.credential(at, await w.requestWith({ jwt: [await w.proof({ header: { jwk: { ...w.holder.publicJwk, ...extra } } })] }));
+      assert.deepEqual(error(r), [400, 'invalid_proof'], JSON.stringify(extra));
+    }
+    const fine = { alg: 'ES256', use: 'sig', key_ops: ['verify'], kid: 'k1' };
+    assert.equal((await w.credential(at, await w.requestWith({ jwt: [await w.proof({ header: { jwk: { ...w.holder.publicJwk, ...fine } } })] }))).status, 200);
+  });
+
+  test('cancelOffer: the code stops working and the status reads expired; harmless on used, issued and unknown offers', async () => {
+    const w = await world();
+    const o = await w.newOffer();
+    await w.issuer.cancelOffer(o.offerId);
+    assert.deepEqual(error(await w.token(o.code, o.txCode)), [400, 'invalid_grant']);
+    assert.equal((await w.issuer.offer(o.offerId)).status, 404);
+    assert.equal((await w.issuer.offerStatus(o.offerId))?.status, 'expired');
+    const used = await w.newOffer();
+    const at = body(await w.token(used.code, used.txCode))['access_token'] as string;
+    assert.equal((await w.credential(at, await w.requestWith({ jwt: [await w.proof()] }))).status, 200);
+    await w.issuer.cancelOffer(used.offerId);
+    assert.deepEqual(await w.issuer.offerStatus(used.offerId), { status: 'issued', subjectRef: 'sv001', credentialId: 'cred-1' });
+    await w.issuer.cancelOffer('AAAAAAAAAAAAAAAAAAAAAA');
+    await w.issuer.cancelOffer('not an id');
+  });
+
+  test('lifetimes can be shortened for tests, never raised', async () => {
+    const w = await world({ lifetimes: { offerSeconds: 30, accessTokenSeconds: 20, nonceSeconds: 10 } });
+    const o = await w.newOffer();
+    assert.equal(new Date(o.expiresAt).getTime(), NOW.getTime() + 30_000);
+    const t = await w.token(o.code, o.txCode);
+    assert.equal(body(t)['expires_in'], 20);
+    assert.equal(body(await w.issuer.nonce())['c_nonce_expires_in'], 10);
+    const late = await w.newOffer();
+    w.clock.advance(31);
+    assert.deepEqual(error(await w.token(late.code, late.txCode)), [400, 'invalid_grant']);
+    for (const lifetimes of [{ offerSeconds: 601 }, { accessTokenSeconds: 301 }, { nonceSeconds: 0 }, { nonceSeconds: 1.5 }]) {
+      await assert.rejects(world({ lifetimes }), TypeError, JSON.stringify(lifetimes));
+    }
   });
 });

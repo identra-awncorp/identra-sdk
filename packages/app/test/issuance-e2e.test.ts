@@ -28,6 +28,7 @@ for (const backend of ['noble', 'webcrypto'] as const) {
     if (!resolved.ok) return;
     assert.deepEqual(resolved.offer, {
       issuerUri: ISS,
+      issuerOrigin: ORIGIN,
       issuerDisplay: [{ name: 'Trường Mẫu', locale: 'vi' }, { name: 'Sample University', locale: 'en' }],
       configuration: { id: 'bang-tot-nghiep-v1', vct: VCT.diploma, display: [{ name: 'Bằng tốt nghiệp', locale: 'vi' }, { name: 'Diploma', locale: 'en' }] },
       txCode: { length: 6, inputMode: 'numeric', description: 'Nhập mã PIN 6 chữ số được cấp cùng mã QR' },
@@ -42,7 +43,7 @@ for (const backend of ['noble', 'webcrypto'] as const) {
     const accepted = await wallet.offers.accept(resolved.offer, { txCode });
     assert.equal(accepted.ok, true, JSON.stringify(accepted));
     if (!accepted.ok) return;
-    assert.deepEqual({ ...accepted, credentialId: typeof accepted.credentialId }, { ok: true, credentialId: 'string', vct: VCT.diploma, issuerName: 'Trường Mẫu (TEST)' });
+    assert.deepEqual({ ...accepted, credentialId: typeof accepted.credentialId }, { ok: true, credentialId: 'string', vct: VCT.diploma, issuerName: 'Trường Mẫu (TEST)', status: 'valid' });
     assert.equal(rows.size, 1);
     assert.equal(secrets.size, 1);
     // The credential request and response went encrypted (ADR-0010 point 9, OpenID4VCI 1.0 section 10).

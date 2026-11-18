@@ -16,4 +16,6 @@ export interface WalletContext {
   trustRegistry: TrustRegistry;
   statusChecker: StatusChecker;
   supportedVcts: readonly string[];
+  /** When set, the only origins whose offers and presentation requests the wallet opens. */
+  allowedOrigins: readonly string[] | null;
 }

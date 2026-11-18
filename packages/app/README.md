@@ -38,10 +38,15 @@ wallet used in Node end-to-end tests. Pure JavaScript on `@noble/curves`, `@nobl
 
 Wrap `expo/fetch` on React Native, not the built-in fetch: the built-in one always follows
 redirects and has no body stream to stop a large response early; `expo/fetch` honours `redirect`
-and streams the body. The wallet wraps the app's fetch once (https only, the QR's origin only,
-10 s timeout, no redirect, `maxBytes` per call: 64 KB for protocol messages, the list caps for the
-trust list and status lists, 256 KB at most) and passes `timeoutMs` and `maxBytes` down; it cannot
-see a redirect the app's fetch followed by itself.
+and streams the body. The app's fetch must abort the request when `timeoutMs` passes (the body read
+included) and stop reading as soon as the body passes `maxBytes`: the wallet's own timer and size
+check cannot stop a transfer that the fetch keeps reading. The wallet wraps the app's fetch once (https only, the QR's origin only,
+10 s timeout, no redirect, `maxBytes` per call: 64 KB for offers, metadata, credential responses and
+request objects, 16 KB for token, nonce and presentation responses, 128 KB for a status list, 256 KB
+for the trust list) and passes `timeoutMs` and `maxBytes` down; it cannot see a redirect the app's
+fetch followed by itself. It never contacts an IP literal, `localhost` or a host without a dot;
+set `allowedOrigins: ['https://api-identra.awncorp.vn']` in `createWallet` so that QR codes naming
+any other origin are refused before any request.
 
 The data key must not require biometrics: ADR-0009 section 3 asks only that it be readable while
 the device is unlocked, and on Android a biometric re-enrolment permanently invalidates a key
@@ -70,7 +75,8 @@ drop the others still to request. `purgeUndecryptable()` deletes only rows seale
 rows that fail for any other reason, which it keeps.
 
 `remove()` deletes the row and leaves its wallet key in secure storage; prefer
-`removeWithKey()`. iOS keychain items survive an uninstall of the app.
+`removeWithKey()`, which deletes the key first and the row second, so that an interrupted removal
+leaves a detectable keyless row (call it again to finish) rather than an orphaned key. iOS keychain items survive an uninstall of the app.
 
 ## Globals React Native must provide
 

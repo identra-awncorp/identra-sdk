@@ -14,7 +14,7 @@ import {
   createCredentialIssuer, createMemoryStateStore, createPresentationVerifier, type PresentationVerifier, type Scenario, createMemoryStatusListStorage, createStatusListService, createTrustListService, generateIssuerKeys,
   type CredentialHandlers, type CredentialIssuer, type HttpResponse, type IssuedEvent, type IssuerKeyStore, type ProtocolStateStore,
 } from '@identra/sdk-server';
-import { createCredentialVault, createInMemoryCredentialRepository, createInMemorySecretStorage, createSoftwareKeyStore, createWallet, type CredentialRow, type WalletKeyStore } from '@identra/sdk-app';
+import { createCredentialVault, createInMemoryCredentialRepository, createInMemorySecretStorage, createSoftwareKeyStore, createWallet, type CredentialRow, type WalletConfig, type WalletKeyStore } from '@identra/sdk-app';
 
 export const ORIGIN = 'https://api-identra.awncorp.vn';
 export const ISSUERS = `${ORIGIN}/issuers`;
@@ -41,21 +41,47 @@ export function fakeClock(start = NOW) {
   return { now: () => new Date(t), advance: (seconds: number) => void (t += seconds * 1000) };
 }
 
-/** The test's HttpFetch on Node: never follows a redirect, honours timeoutMs and maxBytes. */
+/** Bytes the test fetch has read from response bodies, for tests that prove a cap stops the read early. */
+export const fetchStats = { bytesRead: 0 };
+
+/**
+ * The test's HttpFetch on Node, written as the HttpFetch contract asks of an app: never follows a
+ * redirect; timeoutMs aborts the request, the body read included; the body is streamed and the read
+ * stops (and the connection is dropped) as soon as it passes maxBytes.
+ */
 export const nodeHttpFetch: HttpFetch = async (url, init) => {
-  const r = await fetch(url, {
-    method: init?.method ?? 'GET', redirect: 'manual', signal: AbortSignal.timeout(init?.timeoutMs ?? 10_000),
-    ...(init?.headers ? { headers: init.headers } : {}), ...(init?.body !== undefined ? { body: init.body } : {}),
-  });
   const max = init?.maxBytes ?? 262_144;
-  // A declared size over the cap is refused without reading the body (the caller sees Content-Length too).
-  if (Number(r.headers.get('content-length') ?? 0) > max) {
-    await r.body?.cancel();
-    return { status: r.status, headers: r.headers, text: () => Promise.reject(new Error('response too large')) };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), init?.timeoutMs ?? 10_000);
+  try {
+    const r = await fetch(url, {
+      method: init?.method ?? 'GET', redirect: 'manual', signal: controller.signal,
+      ...(init?.headers ? { headers: init.headers } : {}), ...(init?.body !== undefined ? { body: init.body } : {}),
+    });
+    // A declared size over the cap is refused without reading the body (the caller sees Content-Length too).
+    if (Number(r.headers.get('content-length') ?? 0) > max) {
+      controller.abort();
+      return { status: r.status, headers: r.headers, text: () => Promise.reject(new Error('response too large')) };
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    const reader = r.body?.getReader();
+    for (;;) {
+      const next = reader ? await reader.read() : { done: true as const, value: undefined };
+      if (next.done) break;
+      total += next.value.length;
+      fetchStats.bytesRead += next.value.length;
+      if (total > max) {
+        controller.abort();
+        throw new Error('response too large');
+      }
+      chunks.push(next.value);
+    }
+    const text = new TextDecoder().decode(Buffer.concat(chunks));
+    return { status: r.status, headers: r.headers, text: async () => text };
+  } finally {
+    clearTimeout(timer);
   }
-  const text = await r.text();
-  if (text.length > max) throw new Error('response too large');
-  return { status: r.status, headers: r.headers, text: async () => text };
 };
 
 export const UNG_TUYEN: Scenario = {
@@ -244,6 +270,7 @@ export async function createWorld(listener: Listener, o: WorldOptions = {}) {
     backend: 'noble' | 'webcrypto' = 'noble',
     fetch: HttpFetch = createMappedFetch(nodeHttpFetch, { [ORIGIN]: listener.localOrigin }),
     walletClock: { now(): Date } = clock,
+    extra: Partial<WalletConfig> = {},
   ) {
     const secrets = new Map<string, unknown>();
     const rows = new Map<string, CredentialRow>();
@@ -257,6 +284,7 @@ export async function createWorld(listener: Listener, o: WorldOptions = {}) {
       vault,
       fetch, random: webCryptoRandom, clock: walletClock, trustedRoots: [rootDer()], trustListUrl: TRUST_URL,
       ...(backend === 'webcrypto' ? { verifier: webCryptoVerifier, hasher: webCryptoHasher } : {}),
+      ...extra,
     });
     return { wallet, keyStore, vault, secrets, rows };
   }

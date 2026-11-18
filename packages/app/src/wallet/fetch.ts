@@ -22,7 +22,18 @@ export const DEFAULT_MAX_BYTES = 262_144;
 /** Protocol responses (offer, metadata, token, nonce, credential); a credential is at most 16 KB. */
 export const PROTOCOL_MAX_BYTES = 65_536;
 
-/** The origin of an https URL without userinfo, or null. */
+/**
+ * A host the wallet may contact: a DNS name with a dot, not ending in one, not `localhost` or under
+ * `.localhost`, and not an IP literal (WHATWG URL turns every IPv4 spelling into dotted decimal;
+ * IPv6 literals keep their brackets).
+ */
+function acceptableHost(hostname: string): boolean {
+  if (hostname.startsWith('[') || /^[0-9.]+$/.test(hostname)) return false;
+  if (!hostname.includes('.') || hostname.endsWith('.')) return false;
+  return hostname !== 'localhost' && !hostname.endsWith('.localhost');
+}
+
+/** The origin of an https URL without userinfo on an acceptable host, or null. */
 export function httpsOrigin(url: unknown): string | null {
   if (typeof url !== 'string') return null;
   let u: URL;
@@ -31,7 +42,7 @@ export function httpsOrigin(url: unknown): string | null {
   } catch {
     return null;
   }
-  return u.protocol === 'https:' && u.username === '' && u.password === '' ? u.origin : null;
+  return u.protocol === 'https:' && u.username === '' && u.password === '' && acceptableHost(u.hostname) ? u.origin : null;
 }
 
 /**

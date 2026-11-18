@@ -460,25 +460,29 @@ createMemoryStateStore(clock)             // tests and development
 ```
 
 Keys are `vci:<issuerUri>:<kind>:<id>`. Every single-use value is consumed with
-`take`, so of two concurrent requests at most one succeeds.
+`take`, so of two concurrent requests at most one succeeds. Secret-bearing values
+never appear in a key name: codes, token ids and nonces are keyed by
+base64url(SHA-256(value)).
 
 | Kind | Value | TTL |
 |---|---|---|
-| `offer:<offerId>` | offer JSON, subject, configuration, PIN key and HMAC, expiry | 600 s; taken when the code is redeemed or destroyed |
-| `code:<pre-authorized code>` | offerId | 600 s; taken by the one successful token request |
+| `offer:<offerId>` | offer JSON (with the code), subject, configuration, PIN HMAC, expiry | 600 s; taken when the code is redeemed, the offer destroyed or cancelled |
+| `code:<sha256(code)>` | offerId | 600 s; taken by the one successful token request |
 | `attempts:<offerId>` | PIN attempt counter | 600 s |
-| `status:<offerId>` | `pending` / `issued` / `destroyed`, subject, credentialId | 1800 s from creation |
-| `token:<jti>` | offerId, subject, configuration | 300 s; taken by the one credential request |
-| `nonce:<c_nonce>` | `1` | 300 s; taken by the proof that names it |
+| `status:<offerId>` | subject, created, expiry (written once) | 1800 s from creation |
+| `issued:<offerId>` / `ended:<offerId>` | credentialId / `1`: separate keys, so no update overwrites another; `issued` wins | until the status expires |
+| `token:<sha256(jti)>` | offerId, subject, configuration | 300 s; taken by the one credential request |
+| `nonce:<sha256(c_nonce)>` | `1` | 300 s; taken by the proof that names it |
 
 ### Issuer (`sdk-server`)
 
 ```ts
-generateIssuerKeys(random): Promise<IssuerKeys>   // ES256 access-token key + ECDH P-256 request key, in memory
+generateIssuerKeys(random): Promise<IssuerKeys>   // ES256 access-token key, ECDH P-256 request key, PIN HMAC key: in memory
 createCredentialIssuer({
   issuerUri, display: { vi, en }, signer /* vc: x5c, SAN = issuerUri */, allocateStatus,
   hasher, verifier, random, clock, store, keys,
   credentials: { 'bang-tot-nghiep-v1': { resolveClaims(subjectRef), onIssued(event) } },
+  lifetimes?: { offerSeconds, accessTokenSeconds, nonceSeconds },  // tests: shorter only, defaults are the bounds
 }): CredentialIssuer
 ```
 
@@ -489,6 +493,7 @@ createCredentialIssuer({
 | `jwks()` | `GET /issuers/:name/jwks` | `HttpResponse` (access-token key only) |
 | `createOffer({ subjectRef, configurationId })` | portal `POST /v1/demo/school/offers` | `{ offerId, offerUri, txCode, expiresAt }` |
 | `offer(offerId)` | `GET /issuers/:name/offers/:offerId` | `HttpResponse`, 404 when expired, used or unknown |
+| `cancelOffer(offerId)` | portal (e.g. a new offer replaces the old one) | the code stops working, status `expired`; harmless on a used or unknown offer |
 | `offerStatus(offerId)` | portal `GET /v1/demo/school/offers/:offerId` | `{ status, subjectRef, credentialId? }` or null |
 | `token(request)` | `POST /issuers/:name/token` | `HttpResponse` |
 | `nonce()` | `POST /issuers/:name/nonce` | `HttpResponse` |
@@ -508,31 +513,38 @@ description of ours. A failing dependency (state store, callback, signer) throws
 - Offer: by reference, `openid-credential-offer://?credential_offer_uri=<issuerUri>/offers/<offerId>`;
   offerId 128 bits, pre-authorized code 256 bits; 10 minutes. `tx_code` is 6
   digits, drawn without modulo bias (32-bit draws at or above 4 294 000 000 are
-  drawn again), returned once, stored only as HMAC-SHA-256 under a per-offer
-  256-bit key and compared with `timingSafeEqual`. Status readable 30 minutes.
-- Token: form-encoded, no repeated parameter, `grant_type` pre-authorized code
-  (`unsupported_grant_type`), code and `tx_code` present (`invalid_request`).
+  drawn again), returned once, stored only as HMAC-SHA-256 under the issuer's
+  256-bit PIN key, which lives in process memory only (`IssuerKeys.pinKey`), so
+  the state store alone does not give the PIN away; compared with
+  `timingSafeEqual`. Status readable 30 minutes.
+- Token: form-encoded, no repeated parameter, `grant_type` present
+  (`invalid_request`) and the pre-authorized code grant (`unsupported_grant_type`),
+  code and `tx_code` present (`invalid_request`).
   Unknown, expired, used code or wrong PIN: `invalid_grant`, identical. Each
   attempt is counted (`increment`) before the comparison; attempt 6 and later
   are refused unseen, a wrong 5th attempt destroys the offer. The code is then
   `take`n: of concurrent requests with the right PIN exactly one gets a token.
   Access token: JWS `typ: at+jwt`, `kid`, `iss` = `aud` = issuerUri, `iat`, `exp`
-  (300 s), random `jti`; one credential per token.
+  (300 s), random `jti`; one credential per token. Token responses carry
+  `Cache-Control: no-store` and `Pragma: no-cache`.
 - Nonce: 128-bit `c_nonce`, 300 s, single use, `Cache-Control: no-store`.
 - Credential, in this order: access token (`Bearer`, signature by the in-memory
   key, `typ`, `kid`, `iss`, `aud`, `exp`, record present; else `401 invalid_token`
   with `WWW-Authenticate`); body ≤ 64 KB; the library parses and, for
   `application/jwt`, decrypts (jose, `ECDH-ES`, `A128GCM`/`A256GCM`, the
-  advertised `kid` only); `credential_configuration_id` = the token's; response
+  advertised `kid` only); the draft-era singular `proof` member is refused
+  (`invalid_credential_request`); `credential_configuration_id` = the token's; response
   encryption, when asked, needs an encrypted request, a valid P-256 public `jwk`
   with `alg: ECDH-ES` and `A256GCM`/`A128GCM` (`invalid_encryption_parameters`);
-  exactly one `jwt` proof (`invalid_proof`); the proof (below); its `c_nonce`
-  taken (`invalid_nonce`); the token taken (`invalid_token`). A failure up to
+  exactly one `jwt` proof (`invalid_proof`); the proof (below); its `c_nonce`, of
+  the form the issuer hands out (22 base64url characters), taken (`invalid_nonce`);
+  the token taken (`invalid_token`). A failure up to
   here spends nothing but a taken nonce.
 - Proof (`proof.ts`, our own code on `decodeJws` / `verifyJws`): ≤ 4 KB; `typ`
   `openid4vci-proof+jwt`; `alg` ES256; header `jwk` a valid on-curve P-256 public
   key with no private member and no `kid` / `x5c` / `x5u` / `jku` /
-  `trust_chain` / `key_attestation`; signature by that key; `aud` = issuerUri (a
+  `trust_chain` / `key_attestation` next to it, and no `alg` other than ES256,
+  `use` other than `sig` or `key_ops` without `verify` inside it; signature by that key; `aud` = issuerUri (a
   string); `iat` within [now − 360 s, now + 60 s]; non-empty `nonce`.
 - Order of effects after the token is taken: `resolveClaims` (null:
   `credential_request_denied`, nothing allocated) → `allocateStatus` →
@@ -543,17 +555,19 @@ description of ours. A failing dependency (state store, callback, signer) throws
   throws before `onIssued` returns leaves no record; the offer is not marked
   issued; an allocated status index stays reserved (never reused, never set);
   the token is spent, so the user scans a new offer.
-- Restart: the access-token key and the request-encryption key are generated at
-  start; a restart invalidates outstanding tokens (≤ 300 s) and the encryption
-  key a wallet read just before.
+- Restart: the three in-memory keys are generated at start; a restart
+  invalidates outstanding tokens (≤ 300 s), the encryption key a wallet read just
+  before, and the PINs of pending offers (≤ 10 minutes of offers: the user asks
+  for a new one).
 
 ### Wallet (`sdk-app`)
 
 ```ts
 createWallet({ keyStore, vault, fetch, random, clock, trustedRoots, trustListUrl,
-               supportedVcts? /* [diploma] */, seen?, verifier? /* noble */, hasher? /* noble */ })
-wallet.offers.resolve(qrText) → { ok: true, offer: ResolvedOffer } | WalletFailure
-wallet.offers.accept(offer, { txCode }) → { ok: true, credentialId, vct, issuerName } | WalletFailure
+               supportedVcts? /* [diploma] */, seen?, verifier? /* noble */, hasher? /* noble */,
+               allowedOrigins? /* exact origins of offers and presentation requests */ })
+wallet.offers.resolve(qrText) → { ok: true, offer: ResolvedOffer /* incl. issuerOrigin */ } | WalletFailure
+wallet.offers.accept(offer, { txCode }) → { ok: true, credentialId, vct, issuerName, status: 'valid' | 'unknown' } | WalletFailure
 wallet.credentials.list() → CredentialSummary[]            // metadata only, no decryption
 wallet.credentials.get(id) → { ok: true, credential: CredentialDetails } | WalletFailure
 wallet.credentials.refreshStatus(id) → { ok: true, status, checks } | WalletFailure
@@ -565,9 +579,15 @@ wallet.credentials.remove(id) → { ok: true } | WalletFailure   // row and key
 checker once. Network: every request goes through `guardFetch` (one wrapper):
 https only, no userinfo, an allow-list, 10 s timeout (enforced with a timer and
 passed down as `timeoutMs`), a 3xx is refused (never followed), response size
-capped (`maxBytes` per call, never above the guard's ceiling: 64 KB for protocol
-messages, 256 KB for the lists, which ask for their own token caps;
-`Content-Length` first, then the text read), both passed down to the app's fetch. Protocol requests of an offer may reach only the
+capped (`maxBytes` per call, never above the guard's ceiling: offer, metadata,
+credential response and request object 64 KB, token and nonce responses and
+the presentation response 16 KB, trust list 256 KB, status list 128 KB;
+`Content-Length` first, then the text read), both passed down to the app's
+fetch, which must abort the request at `timeoutMs` and stop reading at
+`maxBytes` (the guard's own timer cannot stop a transfer; HttpFetch contract).
+Hosts: https only, never an IP literal, `localhost` / `*.localhost`, a name
+without a dot or ending in one; with `allowedOrigins`, offers and presentation
+requests on any other origin are refused before any request. Protocol requests of an offer may reach only the
 origin of its `credential_offer_uri`; list requests only the configured trust
 list URL and URLs ending in `/status/<n>` (which the credential policy has
 already reduced to `<iss>/status/<n>`).
@@ -585,13 +605,21 @@ already reduced to `<iss>/status/<n>`).
   credential) → proof → credential request asking for a response encrypted to an
   ephemeral key from `RandomSource` (the library encrypts the request to the
   issuer and refuses a plain response) → exactly one credential string
-  (`ISSUER_ERROR`) → `verifyStoredCredential` passes completely
-  (`CREDENTIAL_INVALID` with `checks`) → `iss` = the offer's issuer
-  (`ISSUER_MISMATCH`) → `vct` = the configuration's → `cnf.jwk` thumbprint = the
-  new key's (`CNF_MISMATCH`) → every claim of the type (`REQUIRED_CLAIMS`) is a
-  disclosed non-empty string (`CLAIMS_INCOMPLETE`) → `vault.save` and status
-  `valid` (`STORAGE_ERROR`). Any failure after the key was created deletes the
-  key; nothing is half saved.
+  (`ISSUER_ERROR`) → `verifyStoredCredential` passes completely, or fails ONLY
+  because the trust list (`issuer_trust` `TRUST_LIST_UNAVAILABLE`, `status`
+  `SKIPPED`) or the status list (`STATUS_UNAVAILABLE`) could not be read — then
+  the credential is kept with status `unknown` and `refreshStatus` settles it
+  later (`CREDENTIAL_INVALID` with `checks` for anything else, an untrusted
+  issuer included) → `iss` = the offer's issuer (`ISSUER_MISMATCH`) → `vct` = the
+  configuration's → `cnf.jwk` thumbprint = the new key's (`CNF_MISMATCH`) → every
+  claim of the type (`REQUIRED_CLAIMS`) is exactly one disclosure with a non-empty
+  string value and absent from the plain payload, so it can be withheld
+  (`CLAIMS_INCOMPLETE`) → `vault.save` and the status (`STORAGE_ERROR`). Any
+  failure after the key was created deletes the key, but only once no row needs
+  it: if a saved row cannot be removed, row and key are both kept.
+- `remove` deletes the key first, then the row (`vault.removeWithKey`): a row
+  without its key is detectable, a key without its row is not; calling it again
+  completes an interrupted removal.
 - `refreshStatus` re-runs `verifyStoredCredential`: `valid`, `revoked`,
   `suspended`, else `unknown` (status or trust list could not be checked, or
   another check failed; ADR-0013 section 4); cached in the vault row, where the
@@ -608,6 +636,15 @@ already reduced to `<iss>/status/<n>`).
 
 Known limitations:
 
+- The access token is a bearer token, sent and returned in clear inside TLS. A
+  party that reads the traffic between Cloudflare and the origin, or Cloudflare
+  itself, sees the PIN, the pre-authorized code and the token and can win the
+  race for the credential with a key of its own. ADR-0016 accepts for 12/12 that
+  Cloudflare reads PINs and issuance codes; sender-constrained tokens (DPoP) and
+  wallet attestation are GĐ8 items (ADR-0015).
+- The offer record holds the pre-authorized code (it is served in the offer); a
+  reader of the state store can redeem it only with the PIN, which needs the
+  in-memory PIN key to check offline.
 - A redirect followed by the app's own fetch is invisible to `guardFetch`; the
   app's `HttpFetch` must not follow redirects (React Native's fetch always does:
   open point for the app).

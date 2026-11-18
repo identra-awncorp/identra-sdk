@@ -79,6 +79,8 @@ export type ParsedCredentialRequest =
       /** Every proof the request carries, whatever its type, flattened; jwt proofs as strings. */
       jwtProofs: unknown[];
       otherProofs: boolean;
+      /** The draft-era singular `proof` member was used (OpenID4VCI 1.0 has only `proofs`). */
+      draftProof: boolean;
       /** The wallet's ephemeral key as received (not yet checked) and enc, or null. */
       responseEncryption: { jwk: unknown; enc: string } | null;
     }
@@ -173,7 +175,8 @@ export function createIssuerLibrary(o: {
           ok: true,
           configurationId: 'credentialConfigurationId' in parsed ? parsed.credentialConfigurationId : undefined,
           jwtProofs: proofs['jwt'] ?? [],
-          otherProofs: Object.keys(proofs).some((k) => k !== 'jwt') || ('proof' in raw && 'proofs' in raw),
+          otherProofs: Object.keys(proofs).some((k) => k !== 'jwt'),
+          draftProof: 'proof' in raw,
           responseEncryption: enc ? { jwk: enc.jwk, enc: enc.enc } : null,
         };
       } catch (e) {

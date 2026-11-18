@@ -41,9 +41,12 @@ export interface Clock {
 }
 
 /**
- * Implementations MUST enforce `timeoutMs` (rejecting when it passes) and `maxBytes` (rejecting a
- * larger response body, default 262 144 bytes when absent) and MUST NOT follow redirects (a 3xx is
- * returned as it is): sdk-core has no timer and reads `text()` whole (ADR-0019, review F6).
+ * Implementations MUST enforce `timeoutMs` (rejecting AND aborting the underlying request when it
+ * passes, the body read included) and `maxBytes` (rejecting a larger response body, default
+ * 262 144 bytes when absent, by stopping the read once the limit is passed rather than after
+ * reading it all) and MUST NOT follow redirects (a 3xx is returned as it is): sdk-core has no
+ * timer and reads `text()` whole (ADR-0019, review F6). A caller that races its own timer cannot
+ * stop the transfer; only the implementation can.
  */
 export type HttpFetch = (
   url: string,

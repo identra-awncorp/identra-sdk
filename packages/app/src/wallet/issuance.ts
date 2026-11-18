@@ -3,7 +3,7 @@
 // accept: token (PIN) -> c_nonce -> new wallet key -> proof -> encrypted credential request ->
 // the credential is verified as the wallet would verify it to present it -> vault. Any failure after
 // the key was created deletes the key again, and nothing is saved.
-import { DIPLOMA_CLAIMS, jwkThumbprint, VCT, verifyStoredCredential, type EcPublicJwk, type HttpFetch } from '@identra/sdk-core';
+import { decodeCredentialUnverified, DIPLOMA_CLAIMS, jwkThumbprint, VCT, verifyStoredCredential, type Check, type EcPublicJwk, type HttpFetch } from '@identra/sdk-core';
 import { generateSecretKey, P256, uncompressedPointToJwk } from '../crypto/noble.js';
 import { Fail, keyFailureCode, WalletErrorCodes as C, type WalletFailure } from './errors.js';
 import { guardFetch, httpsOrigin, PROTOCOL_MAX_BYTES, PROTOCOL_TIMEOUT_MS } from './fetch.js';
@@ -24,12 +24,19 @@ export interface DisplayEntry {
 /** What the consent screen shows. Display names come from the issuer's metadata and are not verified yet. */
 export interface ResolvedOffer {
   issuerUri: string;
+  /** The origin every request of this offer went to; the only fact about the issuer verified at this point. */
+  issuerOrigin: string;
   issuerDisplay: DisplayEntry[];
   configuration: { id: string; vct: string; display: DisplayEntry[] };
   txCode: { length: number | null; inputMode: 'numeric' | 'text'; description: string | null } | null;
 }
 
-export type AcceptResult = { ok: true; credentialId: string; vct: string; issuerName: string } | WalletFailure;
+/**
+ * `status: 'unknown'` when the credential itself verified but the trust list or its status list
+ * could not be read at receipt; refreshStatus settles it later. `issuerName` is then null when the
+ * trust list was the one missing.
+ */
+export type AcceptResult = { ok: true; credentialId: string; vct: string; issuerName: string | null; status: 'valid' | 'unknown' } | WalletFailure;
 
 interface OfferState {
   issuerUri: string;
@@ -102,6 +109,18 @@ function checkMetadata(session: IssuerSession, origin: string, supportedVcts: re
   return { configurationId, vct: supported['vct'], display: displayOf(isObject(meta) ? meta['display'] : supported['display']) };
 }
 
+/**
+ * True when every failing check is only a list that could not be read: issuer_trust with
+ * TRUST_LIST_UNAVAILABLE (and status SKIPPED because of it), or status with STATUS_UNAVAILABLE.
+ * Chain, signature, validity, type and disclosures must all have passed.
+ */
+function onlyListsUnavailable(checks: Check[]): boolean {
+  const trustListDown = checks.some((c) => c.id === 'issuer_trust' && c.code === 'TRUST_LIST_UNAVAILABLE');
+  return checks.every(
+    (c) => c.ok || (c.id === 'issuer_trust' && c.code === 'TRUST_LIST_UNAVAILABLE') || (c.id === 'status' && (c.code === 'STATUS_UNAVAILABLE' || (c.code === 'SKIPPED' && trustListDown))),
+  );
+}
+
 function failure(e: unknown): WalletFailure {
   if (e instanceof Fail) return { ok: false, code: e.code, ...(e.checks ? { checks: e.checks } : {}) };
   return { ok: false, code: failureOf(e).code };
@@ -141,7 +160,7 @@ export function createIssuance(ctx: WalletContext) {
   /** After invalid_grant: the offer still served means the PIN was wrong; gone means expired, used or destroyed. */
   async function wrongPinOrExpired(state: OfferState, fetch: HttpFetch): Promise<WalletFailure> {
     try {
-      const r = await fetch(state.offerUri, { method: 'GET' });
+      const r = await fetch(state.offerUri, { method: 'GET', maxBytes: 65_536 });
       return { ok: false, code: r.status === 200 ? C.TX_CODE_WRONG : C.OFFER_EXPIRED };
     } catch (e) {
       return failure(e);
@@ -152,6 +171,7 @@ export function createIssuance(ctx: WalletContext) {
     try {
       const offerUri = offerUriOf(qrText);
       const origin = httpsOrigin(offerUri)!;
+      if (ctx.allowedOrigins && !ctx.allowedOrigins.includes(origin)) throw new Fail(C.URL_NOT_ALLOWED);
       const deps = depsFor(origin);
       let offer: Record<string, unknown>;
       try {
@@ -167,6 +187,7 @@ export function createIssuance(ctx: WalletContext) {
       const tx = grant['tx_code'];
       const resolved: ResolvedOffer = {
         issuerUri: offer['credential_issuer'] as string,
+        issuerOrigin: origin,
         issuerDisplay: displayOf(session.credentialIssuer['display']),
         configuration: { id: configurationId, vct, display },
         txCode: isObject(tx)
@@ -210,6 +231,7 @@ export function createIssuance(ctx: WalletContext) {
       return failure(e);
     }
     let responseSecret: Uint8Array | undefined;
+    let savedId: string | undefined;
     try {
       responseSecret = generateSecretKey(ctx.random);
       const signer = await keyStoreCall(() => ctx.keyStore.signer(keyId));
@@ -225,23 +247,30 @@ export function createIssuance(ctx: WalletContext) {
         statusChecker: ctx.statusChecker, supportedVcts: ctx.supportedVcts, now: ctx.clock.now(),
       });
       const credential = result.credential;
-      if (!result.ok || !credential?.claims || !credential.issuer) throw new Fail(C.CREDENTIAL_INVALID, result.checks);
+      // A credential that verified except for a list that could not be read is kept as `unknown`.
+      const listsDown = !result.ok && credential !== undefined && onlyListsUnavailable(result.checks);
+      if (!credential || (!result.ok && !listsDown)) throw new Fail(C.CREDENTIAL_INVALID, result.checks);
       if (credential.iss !== state.issuerUri) throw new Fail(C.ISSUER_MISMATCH);
       if (credential.vct !== state.vct) throw new Fail(C.ISSUER_ERROR);
       if (!credential.cnfJwk || (await jwkThumbprint(credential.cnfJwk, ctx.hasher)) !== (await jwkThumbprint(publicJwk, ctx.hasher))) throw new Fail(C.CNF_MISMATCH);
-      const claims = credential.claims;
+      // Every claim of the type must be its own disclosure and absent from the plain payload, or the
+      // wallet could never withhold it (holder_binding passed, so the disclosures match the digests).
+      const { payload, disclosures } = decodeCredentialUnverified(compact);
       const required = REQUIRED_CLAIMS[credential.vct];
-      if (!required || !required.every((n) => typeof claims[n] === 'string' && claims[n] !== '')) throw new Fail(C.CLAIMS_INCOMPLETE);
+      const disclosedOnce = (n: string) => disclosures.filter((d) => d.name === n && typeof d.value === 'string' && d.value !== '').length === 1;
+      if (!required || !required.every((n) => !Object.hasOwn(payload, n) && disclosedOnce(n))) throw new Fail(C.CLAIMS_INCOMPLETE);
 
-      const credentialId = await storage(() => ctx.vault.save({ compact, vct: credential.vct, issuer: credential.iss, keyId }));
-      try {
-        await ctx.vault.setStatus(credentialId, 'valid', ctx.clock.now());
-      } catch {
-        await ctx.vault.remove(credentialId).catch(() => {});
-        throw new Fail(C.STORAGE_ERROR);
-      }
-      return { ok: true, credentialId, vct: credential.vct, issuerName: credential.issuer.ten };
+      savedId = await storage(() => ctx.vault.save({ compact, vct: credential.vct, issuer: credential.iss, keyId }));
+      const id = savedId;
+      await storage(() => ctx.vault.setStatus(id, listsDown ? 'unavailable' : 'valid', ctx.clock.now()));
+      return { ok: true, credentialId: id, vct: credential.vct, issuerName: credential.issuer?.ten ?? null, status: listsDown ? 'unknown' : 'valid' };
     } catch (e) {
+      // The key goes only once no row needs it: a row whose key is gone is worse than both kept.
+      if (savedId !== undefined) {
+        const id = savedId;
+        await ctx.vault.remove(id).catch(() => {});
+        if (!(await ctx.vault.getMeta(id).then((m) => m === null, () => false))) return failure(e);
+      }
       await ctx.keyStore.delete(keyId).catch(() => {});
       return failure(e);
     } finally {

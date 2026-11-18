@@ -171,6 +171,7 @@ export function createPresentations(ctx: WalletContext) {
   async function resolve(qrText: string): Promise<{ ok: true; request: ResolvedPresentation } | WalletFailure> {
     try {
       const qr = parseQr(qrText);
+      if (ctx.allowedOrigins && !ctx.allowedOrigins.includes(qr.origin)) throw new Fail(C.URL_NOT_ALLOWED);
       const deps = depsFor(qr.origin);
       let checked: Awaited<ReturnType<typeof checkJar>> | undefined;
       let refused: unknown;
@@ -258,7 +259,7 @@ export function createPresentations(ctx: WalletContext) {
     const jwe = encryptJwe({ recipientPublicJwk: s.encryptionJwk, enc: s.enc, plaintext: utf8Encode(JSON.stringify(payload)), random: ctx.random, header });
     try {
       const r = await depsFor(s.origin).fetch(s.responseUri, {
-        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `response=${encodeURIComponent(jwe)}`,
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `response=${encodeURIComponent(jwe)}`, maxBytes: 16_384,
       });
       return r.status === 200 ? { ok: true } : fail(C.VERIFIER_ERROR);
     } catch (e) {

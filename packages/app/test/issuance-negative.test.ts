@@ -43,6 +43,13 @@ const diplomaFor = async (world: World, cnfJwk: EcPublicJwk, signer?: Signer, re
   if (revoked) await world.statusService.setStatus('truong-mau', 1, status.idx, 'revoked');
   return issueDiploma({ signer: signer ?? (await leafSigner('vc')), hasher: webCryptoHasher, random: webCryptoRandom, clock: world.clock, iss: ISS, cnfJwk, status, claims: DIPLOMA });
 };
+/** A diploma with all seven claims, only `disclosable` of them selectively disclosable, the rest plain. */
+const plainDiploma = async (world: World, cnfJwk: EcPublicJwk, disclosable: string[]) =>
+  issueCredential({
+    signer: await leafSigner('vc'), hasher: webCryptoHasher, random: webCryptoRandom, clock: world.clock, iss: ISS, vct: VCT.diploma,
+    cnfJwk, status: await world.statusService.allocate('truong-mau'), claims: { ...DIPLOMA }, disclosable, ...(disclosable.length > 0 ? { sdDigests: 10 } : {}),
+  });
+
 /** Rewrites the JSON a route answers. */
 function rewrite(key: string, edit: (json: Record<string, unknown>) => void) {
   const inner = listener.routes.get(key)!;
@@ -158,6 +165,14 @@ describe('a malicious or failing issuer after the wallet key exists: exact code,
     ['a revoked credential', (world) => maliciousCredential(world, async (jwk) => [{ credential: await diplomaFor(world, jwk, undefined, true) }]), 'CREDENTIAL_INVALID', ['status', 'REVOKED']],
     ['two credentials', (world) => maliciousCredential(world, async (jwk) => [{ credential: await diplomaFor(world, jwk) }, { credential: await diplomaFor(world, jwk) }]), 'ISSUER_ERROR'],
     ['a string that is not an SD-JWT', (world) => maliciousCredential(world, async () => [{ credential: 'not-an-sd-jwt' }]), 'CREDENTIAL_INVALID', ['structure', 'MALFORMED']],
+    ['a diploma whose claims are all plain payload claims', (world) => maliciousCredential(world, async (jwk) => [{ credential: await plainDiploma(world, jwk, []) }]), 'CLAIMS_INCOMPLETE'],
+    ['a diploma with only one claim disclosable', (world) => maliciousCredential(world, async (jwk) => [{ credential: await plainDiploma(world, jwk, ['ho_ten']) }]), 'CLAIMS_INCOMPLETE'],
+    ['a response encrypted to a key the wallet did not send', (world) => async (req) => {
+      const r = await maliciousCredential(world, async (jwk) => [{ credential: await diplomaFor(world, jwk) }], { encrypt: false })(req);
+      const { publicJwk } = await generateWebCryptoKeyPair();
+      const jwe = await new CompactEncrypt(utf8Encode(r.body)).setProtectedHeader({ alg: 'ECDH-ES', enc: 'A256GCM' }).encrypt(await importJWK(publicJwk, 'ECDH-ES'));
+      return { status: 200, headers: { 'Content-Type': 'application/jwt' }, body: jwe };
+    }, 'ISSUER_ERROR'],
     ['a credential missing a claim', (world) => maliciousCredential(world, async (jwk) => {
       const six: Record<string, string> = { ...DIPLOMA };
       delete six['so_hieu_bang'];
@@ -231,5 +246,114 @@ describe('status vocabulary at the wallet boundary', () => {
     assert.deepEqual([refreshed.ok, refreshed.ok && refreshed.status], [true, 'unknown']);
     assert.equal((await w.wallet.credentials.list())[0]!.status, 'unknown');
     assert.equal([...w.rows.values()][0]!.status_cache, 'unavailable');
+  });
+});
+
+describe('GĐ5 review fixes', () => {
+  test('F4: trust list or status list unreachable at receipt: stored as unknown, settled by refreshStatus; an untrusted issuer is still refused', async () => {
+    const world = await createWorld(listener);
+    const trustRoute = listener.routes.get('GET /trust-list')!;
+    const statusRoute = listener.routes.get('GET /issuers/truong-mau/status/*')!;
+    listener.routes.delete('GET /trust-list');
+    const a = world.newWallet();
+    const r1 = await resolvedOffer(world, a);
+    const noTrust = await a.wallet.offers.accept(r1.offer, { txCode: r1.txCode });
+    assert.deepEqual({ ...noTrust, credentialId: 'x' }, { ok: true, credentialId: 'x', vct: VCT.diploma, issuerName: null, status: 'unknown' });
+    assert.deepEqual([a.rows.size, a.secrets.size, [...a.rows.values()][0]!.status_cache], [1, 1, 'unavailable']);
+    listener.routes.set('GET /trust-list', trustRoute);
+    listener.routes.delete('GET /issuers/truong-mau/status/*');
+    const b = world.newWallet();
+    const r2 = await resolvedOffer(world, b);
+    const noStatus = await b.wallet.offers.accept(r2.offer, { txCode: r2.txCode });
+    assert.deepEqual({ ...noStatus, credentialId: 'x' }, { ok: true, credentialId: 'x', vct: VCT.diploma, issuerName: 'Trường Mẫu (TEST)', status: 'unknown' });
+    listener.routes.set('GET /issuers/truong-mau/status/*', statusRoute);
+    for (const [w, r] of [[a, noTrust], [b, noStatus]] as const) {
+      const settled = await w.wallet.credentials.refreshStatus((r as { credentialId: string }).credentialId);
+      assert.equal(settled.ok && settled.status, 'valid');
+    }
+    world.trust.content = { ...world.trust.content, issuers: [] };
+    world.clock.advance(3601); // the wallets' held trust lists are stale; a fresh wallet reads the new one anyway
+    const c = world.newWallet();
+    const r3 = await resolvedOffer(world, c);
+    const untrusted = await c.wallet.offers.accept(r3.offer, { txCode: r3.txCode });
+    assert.equal((untrusted as { code: string }).code, 'CREDENTIAL_INVALID');
+    assert.equal((untrusted as { checks: { id: string; code: string }[] }).checks.find((x) => x.id === 'issuer_trust')?.code, 'ISSUER_NOT_TRUSTED');
+    nothingLeft(c);
+  });
+
+  test('F7: remove deletes the key first and a retry completes after either step failed', async () => {
+    const world = await createWorld(listener);
+    const w = world.newWallet();
+    const id = (await (async () => { const r = await resolvedOffer(world, w); return w.wallet.offers.accept(r.offer, { txCode: r.txCode }); })()) as { credentialId: string };
+    const del = w.keyStore.delete;
+    w.keyStore.delete = async () => Promise.reject(new Error('keychain busy'));
+    assert.deepEqual(await w.wallet.credentials.remove(id.credentialId), { ok: false, code: 'STORAGE_ERROR' });
+    assert.deepEqual([w.rows.size, w.secrets.size], [1, 1], 'nothing removed: no key without a row');
+    w.keyStore.delete = del;
+    const removeRow = w.vault.remove;
+    const repoDelete = w.rows.delete.bind(w.rows);
+    w.rows.delete = () => { throw new Error('db busy'); };
+    assert.deepEqual(await w.wallet.credentials.remove(id.credentialId), { ok: false, code: 'STORAGE_ERROR' });
+    assert.deepEqual([w.rows.size, w.secrets.size], [1, 0], 'the row is left, detectably keyless');
+    w.rows.delete = repoDelete;
+    void removeRow;
+    assert.deepEqual(await w.wallet.credentials.remove(id.credentialId), { ok: true });
+    assert.deepEqual([w.rows.size, w.secrets.size], [0, 0]);
+  });
+
+  test('F7: a late failure in accept never leaves a row without its key', async () => {
+    const world = await createWorld(listener);
+    const w = world.newWallet();
+    w.vault.setStatus = async () => Promise.reject(new Error('db'));
+    w.vault.remove = async () => Promise.reject(new Error('db'));
+    const r = await resolvedOffer(world, w);
+    assert.deepEqual(await w.wallet.offers.accept(r.offer, { txCode: r.txCode }), { ok: false, code: 'STORAGE_ERROR' });
+    const row = [...w.rows.values()][0]!;
+    assert.equal(w.secrets.has(`identra.key.${row.key_id}`), true, 'the row that could not be removed keeps its key');
+    const v = world.newWallet();
+    v.vault.setStatus = async () => Promise.reject(new Error('db'));
+    const r2 = await resolvedOffer(world, v);
+    assert.deepEqual(await v.wallet.offers.accept(r2.offer, { txCode: r2.txCode }), { ok: false, code: 'STORAGE_ERROR' });
+    nothingLeft(v);
+  });
+
+  test('F8: an authorization server on another origin is never contacted', async () => {
+    const world = await createWorld(listener);
+    rewrite(METADATA, (m) => (m['authorization_servers'] = ['https://evil.example/as']));
+    const contacted: string[] = [];
+    const w = world.newWallet('noble', createMappedFetch((url, init) => (contacted.push(url), nodeHttpFetch(url, init)), { [ORIGIN]: listener.localOrigin }));
+    const r = await w.wallet.offers.resolve((await world.offer()).offerUri);
+    assert.equal(r.ok, false);
+    assert.deepEqual(contacted.filter((u) => !u.startsWith(listener.localOrigin)), []);
+  });
+
+  test('F8: refreshStatus writes unknown, never valid, when the trust list is unavailable', async () => {
+    const world = await createWorld(listener);
+    const w = world.newWallet();
+    const r = await resolvedOffer(world, w);
+    const a = (await w.wallet.offers.accept(r.offer, { txCode: r.txCode })) as { credentialId: string };
+    listener.routes.delete('GET /trust-list');
+    world.clock.advance(86_461);
+    const refreshed = await w.wallet.credentials.refreshStatus(a.credentialId);
+    assert.equal(refreshed.ok && refreshed.status, 'unknown');
+    assert.equal([...w.rows.values()][0]!.status_cache, 'unavailable');
+  });
+
+  test('F8: the response key is fresh for every credential and is never the credential key', async () => {
+    const world = await createWorld(listener);
+    const w = world.newWallet();
+    const seen: string[] = [];
+    const real = listener.routes.get(CREDENTIAL)!;
+    listener.routes.set(CREDENTIAL, async (req) => {
+      const { plaintext } = await compactDecrypt(req.body, world.keys.requestEncryption.privateKey);
+      seen.push(JSON.stringify((JSON.parse(utf8Decode(plaintext)) as { credential_response_encryption: { jwk: { x: string } } }).credential_response_encryption.jwk.x));
+      return real(req);
+    });
+    for (let i = 0; i < 2; i++) {
+      const r = await resolvedOffer(world, w);
+      assert.equal((await w.wallet.offers.accept(r.offer, { txCode: r.txCode })).ok, true);
+    }
+    const cnfXs = await Promise.all([...w.rows.values()].map(async (row) => JSON.stringify((await w.keyStore.signer(row.key_id)).publicJwk.x)));
+    assert.equal(new Set([...seen, ...cnfXs]).size, 4);
   });
 });
