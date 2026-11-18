@@ -1,12 +1,10 @@
-export * from './types/did.js';
-export * from './types/exchange.js';
-export * from './types/proof.js';
-export * from './types/vc.js';
-export * from './types/vp.js';
-export * from './demo/demo-proof.js';
-export * from './demo/demo-fixtures.js';
-export * from './validation/validation-result.js';
-export * from './validation/did-validation.js';
-export * from './validation/vc-validation.js';
-export * from './validation/vp-validation.js';
-export * from './validation/exchange-validation.js';
+// Main entry of @identra/sdk-core. Imports no platform library and touches no platform global.
+export * from './encoding.js';
+export * from './interfaces.js';
+export * from './results.js';
+export * from './ecdsa-der.js';
+export * from './jwk.js';
+export * from './jws.js';
+export * from './did-jwk.js';
+export { parseCertificate, type ParsedCertificate } from './x509/parse.js';
+export { createCertificateChainValidator, MAX_CERTIFICATE_BYTES, CLOCK_SKEW_MS } from './x509/chain.js';

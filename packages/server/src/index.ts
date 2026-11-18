@@ -1,3 +1,2 @@
-export * from './did-registry.js';
-export * from './identra-server-sdk.js';
-export * from './session-store.js';
+// Placeholder: this package is rebuilt in a later phase (see docs/architecture.md section 1).
+export {};

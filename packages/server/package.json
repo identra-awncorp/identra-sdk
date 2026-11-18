@@ -1,7 +1,7 @@
 {
   "name": "@identra/sdk-server",
   "version": "0.0.0",
-  "description": "Identra server SDK for demo issuer, verifier, DID registry, and sessions.",
+  "description": "Identra issuer and verifier server SDK (rebuilt in a later phase).",
   "license": "UNLICENSED",
   "type": "module",
   "main": "./dist/index.js",

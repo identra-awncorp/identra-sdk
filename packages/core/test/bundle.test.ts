@@ -1,0 +1,84 @@
+// React Native proxy check (ADR-0004 "Bổ sung 2026-11-19"): the core main entry bundles with
+// esbuild --platform=neutral, and the bundle validates a chain inside a node:vm realm that has
+// only ECMAScript built-ins plus TextEncoder / TextDecoder / atob / btoa: no crypto, Buffer,
+// process or fetch. Signatures are checked by the injected pure-JS (noble) verifier.
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import vm from 'node:vm';
+import * as esbuild from 'esbuild';
+import { createCertificateChainValidator } from '@identra/sdk-core';
+import { nobleHasher, nobleVerifier } from './helpers/noble.js';
+import { b64, ca, leaf, NOW, x5c } from './helpers/pki.js';
+
+const testDist = new URL('.', import.meta.url).pathname;
+const options: esbuild.BuildOptions = { bundle: true, platform: 'neutral', mainFields: ['module', 'main'], write: false, logLevel: 'silent' };
+
+test('the core main entry bundles for a neutral platform without any Node built-in', async () => {
+  const r = await esbuild.build({ ...options, format: 'esm', entryPoints: ['@identra/sdk-core'], absWorkingDir: testDist, metafile: true });
+  const metafile = r.metafile!;
+  const inputs = Object.keys(metafile.inputs);
+  assert.ok(inputs.some((p) => p.includes('micro-key-producer')));
+  assert.deepEqual(inputs.filter((p) => p.startsWith('node:') || !p.includes('/')), []);
+  assert.deepEqual(Object.values(metafile.outputs)[0]!.imports, []);
+  // The guard itself: a neutral build refuses a Node built-in.
+  await assert.rejects(esbuild.build({ ...options, stdin: { contents: "import 'node:crypto';", resolveDir: testDist } }));
+});
+
+// A realm with ECMAScript built-ins only, plus what React Native provides (with a TextDecoder polyfill).
+function restrictedRealm(): vm.Context {
+  const ctx = vm.createContext({});
+  // TextEncoder is defined inside the realm so that it returns this realm's Uint8Array, as on Hermes.
+  vm.runInContext(
+    `{ const u = unescape, e = encodeURIComponent, U8 = Uint8Array, S = String;
+      globalThis.TextEncoder = class TextEncoder {
+        get encoding() { return 'utf-8'; }
+        encode(s = '') { const b = u(e(S(s))); const o = new U8(b.length); for (let i = 0; i < b.length; i++) o[i] = b.charCodeAt(i); return o; }
+      }; }`,
+    ctx,
+  );
+  Object.assign(ctx, { TextDecoder, atob, btoa });
+  return ctx;
+}
+
+test('the bundle validates certificate chains in a realm without crypto, Buffer, process or fetch', async () => {
+  const entry = `
+    import { createCertificateChainValidator, base64Decode } from '@identra/sdk-core';
+    import { nobleVerifier, nobleHasher } from './helpers/noble.js';
+    export async function run(json) {
+      const input = JSON.parse(json);
+      const validator = createCertificateChainValidator({ trustedRoots: [base64Decode(input.root)], verifier: nobleVerifier, hasher: nobleHasher });
+      const out = [];
+      for (const c of input.cases) {
+        const r = await validator.validate({ x5c: c.x5c, profile: c.profile, now: new Date(input.now) });
+        out.push([r.code, r.fingerprint ?? null, r.leaf?.subject.O ?? null]);
+      }
+      return JSON.stringify(out);
+    }`;
+  const built = await esbuild.build({ ...options, format: 'iife', globalName: 'IdentraBundle', stdin: { contents: entry, resolveDir: testDist } });
+  const code = built.outputFiles![0]!.text;
+
+  const cases = [
+    { x5c: x5c('vc'), profile: 'vc' },
+    { x5c: x5c('utf8'), profile: 'vc' },
+    { x5c: [b64(leaf('trust-list'))], profile: 'trust-list' },
+    { x5c: x5c('evil-vc', 'evil-issuing'), profile: 'vc' },
+    { x5c: x5c('expired'), profile: 'vc' },
+  ];
+  const input = JSON.stringify({ root: b64(ca('root')), now: NOW.toISOString(), cases });
+
+  const ctx = restrictedRealm();
+  assert.equal(vm.runInContext('[typeof crypto, typeof Buffer, typeof process, typeof fetch, typeof require, typeof window].join()', ctx), Array(6).fill('undefined').join());
+  vm.runInContext(code, ctx);
+  const got: unknown[][] = JSON.parse(await vm.runInContext(`IdentraBundle.run(${JSON.stringify(input)})`, ctx));
+
+  // Reference: the same validation in the full Node realm.
+  const validator = createCertificateChainValidator({ trustedRoots: [ca('root')], verifier: nobleVerifier, hasher: nobleHasher });
+  const expected: unknown[][] = [];
+  for (const c of cases) {
+    const r = await validator.validate({ x5c: c.x5c, profile: c.profile as 'vc', now: NOW });
+    expected.push([r.code, r.fingerprint ?? null, r.leaf?.subject.O ?? null]);
+  }
+  assert.deepEqual(got, expected);
+  assert.deepEqual(got.map((r) => r[0]), [null, null, null, 'CERT_CHAIN_UNTRUSTED', 'CERT_EXPIRED']);
+  assert.equal(got[1]?.[2], 'Trường Mẫu TEST');
+});

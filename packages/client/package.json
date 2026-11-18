@@ -1,7 +1,7 @@
 {
   "name": "@identra/sdk-client",
   "version": "0.0.0",
-  "description": "Identra web/client SDK for demo presentation flows.",
+  "description": "Identra web verifier-session client (rebuilt in a later phase).",
   "license": "UNLICENSED",
   "type": "module",
   "main": "./dist/index.js",

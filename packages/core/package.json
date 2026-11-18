@@ -1,7 +1,7 @@
 {
   "name": "@identra/sdk-core",
   "version": "0.0.0",
-  "description": "Platform-neutral Identra SSI types and demo primitives.",
+  "description": "Platform-neutral Identra core: interfaces, JWS, X.509 chain validation, did:jwk.",
   "license": "UNLICENSED",
   "type": "module",
   "main": "./dist/index.js",
@@ -10,9 +10,16 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./webcrypto": {
+      "types": "./dist/webcrypto/index.d.ts",
+      "import": "./dist/webcrypto/index.js"
     }
   },
   "files": [
     "dist"
-  ]
+  ],
+  "dependencies": {
+    "micro-key-producer": "0.10.2"
+  }
 }

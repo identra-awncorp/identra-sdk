@@ -2,17 +2,29 @@
   "name": "identra-sdk-workspace",
   "version": "0.0.0",
   "private": true,
-  "description": "Identra SDK family for demo SSI flows across web client, mobile app, and server.",
+  "description": "Identra SDK family: SD-JWT VC wallet, issuer and verifier building blocks with X.509 issuer authentication.",
   "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
   "workspaces": [
     "packages/*"
   ],
   "scripts": {
-    "build": "tsc -b packages/core packages/client packages/app packages/server",
-    "typecheck": "tsc -b packages/core packages/client packages/app packages/server --pretty",
-    "test": "node examples/client-demo.mjs && node examples/app-demo.mjs && node examples/server-demo.mjs"
+    "build": "tsc -b",
+    "typecheck": "tsc -b tsconfig.json packages/core/test",
+    "lint": "eslint .",
+    "pretest": "npm run typecheck && sh scripts/pki/ensure-test-pki.sh",
+    "test": "node --test \"packages/*/test-dist/**/*.test.js\""
   },
   "devDependencies": {
-    "typescript": "^5.8.2"
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "@types/node": "24.19.2",
+    "esbuild": "0.28.2",
+    "eslint": "10.15.0",
+    "typescript": "5.8.3",
+    "typescript-eslint": "8.73.0"
   }
 }

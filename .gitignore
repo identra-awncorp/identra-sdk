@@ -34,3 +34,14 @@ temp/
 Thumbs.db
 .idea/
 .vscode/
+
+# Compiled tests
+test-dist/
+
+# Generated PKI material (scripts/pki). Private keys must never be committed.
+.pki/
+*.key.pem
+*.key
+*.p8
+*.pkcs8
+*.csr.pem

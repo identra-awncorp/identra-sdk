@@ -1,2 +1,2 @@
-export * from './credential-store.js';
-export * from './identra-app-sdk.js';
+// Placeholder: this package is rebuilt in a later phase (see docs/architecture.md section 1).
+export {};

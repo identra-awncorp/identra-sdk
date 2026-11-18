@@ -1,19 +1,17 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "types": [],
     "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "paths": {
-      "@identra/sdk-core": ["./packages/core/src/index.ts"],
-      "@identra/sdk-client": ["./packages/client/src/index.ts"],
-      "@identra/sdk-app": ["./packages/app/src/index.ts"],
-      "@identra/sdk-server": ["./packages/server/src/index.ts"]
-    }
+    "forceConsistentCasingInFileNames": true
   }
 }

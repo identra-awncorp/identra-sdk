@@ -1,0 +1,90 @@
+// Result model and error codes (docs/architecture.md section 3, ADR-0006 section 5).
+// UI and logs branch on these codes, never on messages.
+
+export const ErrorCodes = Object.freeze({
+  // 1 structure
+  MALFORMED: 'MALFORMED',
+  TYP_INVALID: 'TYP_INVALID',
+  TOO_LARGE: 'TOO_LARGE',
+  // 2 algorithm
+  ALG_NOT_ALLOWED: 'ALG_NOT_ALLOWED',
+  // 3 certificate_chain
+  CERT_CHAIN_MALFORMED: 'CERT_CHAIN_MALFORMED',
+  CERT_CHAIN_UNTRUSTED: 'CERT_CHAIN_UNTRUSTED',
+  CERT_NOT_YET_VALID: 'CERT_NOT_YET_VALID',
+  CERT_EXPIRED: 'CERT_EXPIRED',
+  CERT_CONSTRAINT_INVALID: 'CERT_CONSTRAINT_INVALID',
+  CERT_KEY_NOT_ALLOWED: 'CERT_KEY_NOT_ALLOWED',
+  ISSUER_MISMATCH: 'ISSUER_MISMATCH',
+  // 4 signature
+  SIGNATURE_INVALID: 'SIGNATURE_INVALID',
+  // 5 validity_time
+  NOT_YET_VALID: 'NOT_YET_VALID',
+  EXPIRED: 'EXPIRED',
+  // 6 credential_type
+  VCT_UNSUPPORTED: 'VCT_UNSUPPORTED',
+  // 7 issuer_trust
+  ISSUER_NOT_TRUSTED: 'ISSUER_NOT_TRUSTED',
+  TRUST_LIST_UNAVAILABLE: 'TRUST_LIST_UNAVAILABLE',
+  // 8 status
+  REVOKED: 'REVOKED',
+  SUSPENDED: 'SUSPENDED',
+  STATUS_UNAVAILABLE: 'STATUS_UNAVAILABLE',
+  // 9 holder_binding
+  DISCLOSURE_INVALID: 'DISCLOSURE_INVALID',
+  KB_INVALID: 'KB_INVALID',
+  NONCE_MISMATCH: 'NONCE_MISMATCH',
+  AUD_MISMATCH: 'AUD_MISMATCH',
+  // 10 product_chain
+  CHAIN_BROKEN: 'CHAIN_BROKEN',
+  // other
+  CLIENT_ID_MISMATCH: 'CLIENT_ID_MISMATCH',
+  VERIFIER_NOT_TRUSTED: 'VERIFIER_NOT_TRUSTED',
+  DID_RESOLUTION_FAILED: 'DID_RESOLUTION_FAILED',
+  KEY_NOT_FOUND: 'KEY_NOT_FOUND',
+  SKIPPED: 'SKIPPED',
+} as const);
+
+export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
+
+/** Credential checks (architecture section 3) and the steps of certificate chain validation (section 4). */
+export type CheckId =
+  | 'structure'
+  | 'algorithm'
+  | 'certificate_chain'
+  | 'signature'
+  | 'validity_time'
+  | 'credential_type'
+  | 'issuer_trust'
+  | 'status'
+  | 'holder_binding'
+  | 'product_chain'
+  | 'chain_format'
+  | 'chain_signatures'
+  | 'chain_validity'
+  | 'chain_constraints'
+  | 'leaf_key'
+  | 'issuer_uri';
+
+export interface Check {
+  id: CheckId;
+  ok: boolean;
+  code: ErrorCode | null;
+  skipped?: true;
+  /** For logs only; never contains claim values, credentials, disclosures or KB-JWTs (ADR-0014 section 4). */
+  detail?: string;
+}
+
+/** ok = every listed check is ok. */
+export interface VerificationResult {
+  ok: boolean;
+  checks: Check[];
+}
+
+/** Thrown by a TrustRegistry when it holds no valid trust list (ADR-0015 section 6). */
+export class TrustListUnavailableError extends Error {
+  constructor(message = 'no valid trust list is held') {
+    super(message);
+    this.name = 'TrustListUnavailableError';
+  }
+}
