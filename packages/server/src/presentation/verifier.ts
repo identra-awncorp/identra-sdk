@@ -2,7 +2,7 @@
 // and 6, vc-api.md section 6, docs/architecture.md section 9). Protocol operations return a ready HTTP
 // response and never throw for bad input from the network; they throw only when a dependency fails.
 import {
-  base64UrlEncode, signJws, utf8Encode, verifyPresentation,
+  base64UrlEncode, claimSetsNested, MAX_CLAIM_SETS, signJws, utf8Encode, verifyPresentation,
   type Check, type Clock, type ErrorCode, type RandomSource, type Signer, type VerifyCredentialOptions,
 } from '@identra/sdk-core';
 import type { JWK } from 'jose';
@@ -129,7 +129,11 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
     }
     return listing;
   }
-  const queries = Object.fromEntries(Object.entries(config.scenarios).map(([name, s]) => [name, dcqlQueryOf(s)]));
+  const queries = Object.fromEntries(Object.entries(config.scenarios).map(([name, s]) => {
+    // The wallet refuses claim sets that are not a strictly shrinking chain (ADR-0008 section 5).
+    if (!claimSetsNested(s.claimSets)) throw new TypeError(`scenario ${name}: claim sets must each be a proper subset of the one before, at most ${MAX_CLAIM_SETS}`);
+    return [name, dcqlQueryOf(s)];
+  }));
   const clientId = `x509_hash:${fingerprint}`;
   const key = (kind: string, id: string) => `vp:${clientId}:${kind}:${id}`;
   const newId = () => base64UrlEncode(random.bytes(16));

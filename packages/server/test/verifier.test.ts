@@ -30,7 +30,7 @@ type RequestPayload = {
 };
 const form = (body: string, contentType = 'application/x-www-form-urlencoded') => ({ headers: { 'content-type': contentType }, body });
 
-async function world(o: { store?: (s: ProtocolStateStore) => ProtocolStateStore; requestEntry?: Partial<TrustEntry> | null; signer?: string } = {}) {
+async function world(o: { store?: (s: ProtocolStateStore) => ProtocolStateStore; requestEntry?: Partial<TrustEntry> | null; signer?: string; claimSets?: string[][] } = {}) {
   const clock = fakeClock(NOW);
   const entries = new Map<string, TrustEntry | null>([
     [await fingerprint('vc'), { maToChuc: 'VATVN-0100000001', ten: 'Trường Mẫu', mucDich: 'vc', vct: [VCT.diploma] }],
@@ -44,7 +44,7 @@ async function world(o: { store?: (s: ProtocolStateStore) => ProtocolStateStore;
   const verifier = await createPresentationVerifier({
     apiOrigin: 'https://api-identra.awncorp.vn', signer: await signerOf(o.signer ?? 'request'),
     verification: { verifier: webCryptoVerifier, hasher: webCryptoHasher, chainValidator, trustRegistry, statusChecker: { check: async () => 'valid' }, supportedVcts: [VCT.diploma] },
-    random: webCryptoRandom, clock, store, scenarios: { 'ung-tuyen': SCENARIO },
+    random: webCryptoRandom, clock, store, scenarios: { 'ung-tuyen': o.claimSets ? { ...SCENARIO, claimSets: o.claimSets } : SCENARIO },
   });
   const holder = await createWebCryptoSigner(await generateWebCryptoKeyPair());
   const credential = await issueDiploma({
@@ -76,6 +76,14 @@ describe('construction and the request object', () => {
     await assert.rejects(world({ requestEntry: null }), /purpose request/, 'not listed');
     await assert.rejects(world({ requestEntry: { mucDich: 'vc' } }), /purpose request/, 'listed for another purpose');
     await assert.rejects(world({ requestEntry: { maToChuc: 'VATVN-0100000009' } }), /purpose request/, 'another organisation');
+  });
+
+  test('a scenario whose claim sets do not shrink strictly (ADR-0008 section 5) is refused at construction', async () => {
+    for (const claimSets of [[['ho_ten'], ['ho_ten', 'nganh']], [['ho_ten', 'nganh'], ['ho_ten', 'nganh']], [['ho_ten', 'nganh'], ['nam_tot_nghiep']], [['ho_ten', 'ho_ten']], [],
+      [['ho_ten', 'nganh', 'hang_tot_nghiep', 'nam_tot_nghiep', 'so_hieu_bang'], ['ho_ten', 'nganh', 'hang_tot_nghiep', 'nam_tot_nghiep'], ['ho_ten', 'nganh', 'hang_tot_nghiep'], ['ho_ten', 'nganh'], ['ho_ten']]]) {
+      await assert.rejects(world({ claimSets }), /proper subset/, JSON.stringify(claimSets));
+    }
+    await world({ claimSets: [['ho_ten', 'nganh', 'hang_tot_nghiep', 'nam_tot_nghiep'], ['ho_ten', 'nganh', 'hang_tot_nghiep'], ['ho_ten', 'nganh'], ['ho_ten']] });
   });
 
   test('the request object: header, 256-bit nonce and state, exactly one encryption key, the fixed members', async () => {

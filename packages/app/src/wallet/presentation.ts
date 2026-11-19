@@ -5,7 +5,7 @@
 // signed and no key is touched. submit: presentation of exactly the chosen claim set, KB-JWT bound
 // to client_id and nonce, encrypted to the session key, POSTed to response_uri. decline: local only.
 import {
-  base64UrlDecode, createPresentation, decodeCredentialUnverified, normalizeEcPublicJwk, utf8Decode, utf8Encode,
+  base64UrlDecode, claimSetsNested, createPresentation, decodeCredentialUnverified, normalizeEcPublicJwk, utf8Decode, utf8Encode,
   type EcPublicJwk, type ErrorCode,
 } from '@identra/sdk-core';
 import { encryptJwe, type JweEnc } from '../jwe.js';
@@ -166,6 +166,8 @@ export function createPresentations(ctx: WalletContext) {
     const sets = Array.isArray(cq['claim_sets']) ? (cq['claim_sets'] as unknown[]) : [[...claimNames.keys()]];
     const claimSets = sets.map((set) => (Array.isArray(set) ? set.map((id) => claimNames.get(id as string)) : []));
     if (claimSets.some((set) => set.length === 0 || set.some((n) => n === undefined))) throw new Fail(C.REQUEST_INVALID);
+    // ADR-0008 section 5: each later option only shrinks the first, so "share less" never adds a field.
+    if (!claimSetsNested(claimSets as string[][])) throw new Fail(C.REQUEST_INVALID);
     return {
       jwk: chain.leaf.publicJwk, fingerprint: chain.fingerprint, organisation: chain.leaf.subject.organizationIdentifier,
       state: {

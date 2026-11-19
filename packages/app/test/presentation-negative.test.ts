@@ -119,6 +119,32 @@ describe('request objects the wallet refuses before anything is shown', () => {
     }
   });
 
+  test('claim sets must shrink strictly, at most 4 (ADR-0008 section 5): "share less" can never add a field', async () => {
+    const { world, verifier, w, ids } = await setup();
+    const clientId = `x509_hash:${await fingerprintOf(await leafSigner('request'))}`;
+    const withSets = (sets: string[][]) => async () => qrFor(clientId, await crafted(world, verifier, (p) => {
+      const cq = query(p).credentials[0]!;
+      cq.claims = [...new Set(sets.flat())].map((n) => ({ id: n, path: [n] }));
+      cq['claim_sets'] = sets;
+    }));
+    const [a, b, c, d, e] = ['ho_ten', 'nganh', 'hang_tot_nghiep', 'nam_tot_nghiep', 'so_hieu_bang'] as const;
+    const refused: [string, string[][]][] = [
+      ['a later option adds a field', [[a, b], [a, b, c]]],
+      ['a later option swaps a field', [[a, b, c], [a, b, d]]],
+      ['disjoint options', [[a, b], [c]]],
+      ['the same option twice', [[a, b], [a, b]]],
+      ['a field twice in one option', [[a, a, b], [a]]],
+      ['five options', [[a, b, c, d, e], [a, b, c, d], [a, b, c], [a, b], [a]]],
+    ];
+    for (const [name, sets] of refused) {
+      const text = await withSets(sets)();
+      assert.deepEqual(await w.wallet.presentations.resolve(text), { ok: false, code: 'REQUEST_INVALID' }, name);
+    }
+    const r = await w.wallet.presentations.resolve(await withSets([[a, b, c, d], [a, b, c], [a, b], [a]])());
+    assert.ok(r.ok, JSON.stringify(r));
+    assert.deepEqual(r.request.matches.map((m) => [m.credentialId, m.claimSets.map((s) => s.claims)]), [[ids[0], [[a, b, c, d], [a, b, c], [a, b], [a]]]]);
+  });
+
   test('QR texts: only openid4vp://?client_id=x509_hash:…&request_uri=https://…', async () => {
     const { verifier, w } = await setup({ credentials: 0 });
     const session = (await newSession(verifier));

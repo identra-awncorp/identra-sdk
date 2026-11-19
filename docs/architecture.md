@@ -158,7 +158,7 @@ Other codes: `CLIENT_ID_MISMATCH`, `VERIFIER_NOT_TRUSTED` (wallet checking a
 presentation request), `DID_RESOLUTION_FAILED`, `KEY_NOT_FOUND` (`did:jwk`
 helper only; the credential path no longer resolves DIDs, ADR-0015), `SKIPPED`,
 and the wallet operation codes of section 8 (`OFFER_INVALID`, `URL_NOT_ALLOWED`,
-`TX_CODE_WRONG`, `OFFER_EXPIRED`, `NETWORK_ERROR`, `ISSUER_ERROR`,
+`TX_CODE_WRONG`, `TX_CODE_REQUIRED`, `OFFER_EXPIRED`, `NETWORK_ERROR`, `ISSUER_ERROR`,
 `CREDENTIAL_INVALID`, `CNF_MISMATCH`, `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`,
 `CREDENTIAL_NOT_FOUND`) and of section 9 (`QUERY_NOT_SATISFIED`, `TOO_MANY_ATTEMPTS`,
 `REQUEST_INVALID`, `REQUEST_EXPIRED`, `VERIFIER_ERROR`, `KEY_INVALIDATED`,
@@ -601,9 +601,9 @@ description of ours. A failing dependency (state store, callback, signer) throws
 createWallet({ keyStore, vault, fetch, random, clock, trustedRoots, trustListUrl,
                supportedVcts? /* [diploma] */, seen?, verifier? /* noble */, hasher? /* noble */,
                allowedOrigins? /* exact origins of offers and presentation requests */ })
-wallet.offers.resolve(qrText) → { ok: true, offer: ResolvedOffer /* incl. issuerOrigin */ } | WalletFailure
+wallet.offers.resolve(qrText) → { ok: true, offer: ResolvedOffer /* incl. issuerOrigin, readonly codeRedeemed */ } | WalletFailure
 wallet.offers.accept(offer, { txCode }) → { ok: true, credentialId, vct, issuerName: string | null, status: 'valid' | 'unknown' }
-                                        | { ok: false, code, checks?, retryable: boolean }
+                                        | { ok: false, code, checks?, retryable: boolean, codeRedeemed: boolean }
 wallet.offers.discard(offer) → Promise<void>   // forget a held token / pending credential (deletes its key)
 wallet.credentials.list() → CredentialSummary[]            // metadata only, no decryption
 wallet.credentials.get(id) → { ok: true, credential: CredentialDetails } | WalletFailure
@@ -667,8 +667,23 @@ already reduced to `<iss>/status/<n>`).
   `accept` (no second credential request); `discard` deletes that key when the
   user gives up. Calls of `accept` on one offer run one after the other.
   `retryable` says whether the same offer can still complete: the PIN was wrong
-  and the offer exists, a usable token is held, a no-answer token request, or a
-  credential waits to be stored; otherwise a new offer is needed.
+  and the offer exists, the PIN was missing, a usable token is held, a no-answer
+  token request, or a credential waits to be stored; otherwise a new offer is
+  needed. `retryable` does NOT say whether the PIN is still needed;
+  `codeRedeemed` does, on every failure and as the read-only `offer.codeRedeemed`
+  (so a UI can decide whether to ask for the PIN before calling `accept` again):
+  true once the token step succeeded for this offer (the wallet holds or held a
+  token; a retry needs no PIN), false before (a retry must send the PIN again).
+  While `codeRedeemed` is false, an `accept` without a `txCode` (or with an empty
+  one) on an offer whose grant has `tx_code` is `TX_CODE_REQUIRED`, `retryable:
+  true`, with no request at all: a token request with an empty PIN would spend
+  one of the issuer's five attempts. A token request with no answer
+  (`NETWORK_ERROR`, `retryable: true, codeRedeemed: false`) leaves the wallet
+  unable to know whether the issuer redeemed the code: if the request never
+  arrived, the next `accept` with the PIN completes; if it arrived and only the
+  answer was lost, the code is spent and that `accept` is `OFFER_EXPIRED`,
+  `retryable: false` (the issuer answers `invalid_grant` and no longer serves the
+  offer). The wallet cannot tell these apart before trying.
 - `remove` deletes the key first, then the row (`vault.removeWithKey`): a row
   without its key is detectable, a key without its row is not; calling it again
   completes an interrupted removal.
@@ -686,7 +701,7 @@ already reduced to `<iss>/status/<n>`).
   then the wallet codes `KEY_INVALIDATED`, `USER_CANCELLED`, `DEVICE_LOCKED`;
   `KEY_NOT_FOUND` stays itself; anything else is `STORAGE_ERROR`.
 - Codes (`WalletErrorCodes`, entries of `ErrorCodes`): `OFFER_INVALID`,
-  `URL_NOT_ALLOWED`, `TX_CODE_WRONG`, `OFFER_EXPIRED`, `NETWORK_ERROR`,
+  `URL_NOT_ALLOWED`, `TX_CODE_WRONG`, `TX_CODE_REQUIRED`, `OFFER_EXPIRED`, `NETWORK_ERROR`,
   `ISSUER_ERROR`, `CREDENTIAL_INVALID`, `ISSUER_MISMATCH`, `CNF_MISMATCH`,
   `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`, `CREDENTIAL_NOT_FOUND`, plus the key and
   presentation codes of section 9.
@@ -747,7 +762,10 @@ createPresentationVerifier({
   the trust-list `ten`. The query of each scenario is built once (one `dc+sd-jwt`
   credential query `credential` of `vct`, one claim per name, `claim_sets` in
   order of preference, `credential_sets[0].purpose`) and validated by `dcql`; no
-  HTTP input reaches it.
+  HTTP input reaches it. Construction throws for a scenario whose claim sets are
+  not a strictly shrinking chain (`claimSetsNested` of `sdk-core`: 1 to 4 sets,
+  none empty or with a repeated name, each a proper subset of the one before),
+  the rule the wallet enforces (ADR-0008 §5).
 - Session: `id` and `requestId` independent 128-bit values; `nonce` and `state`
   256 bits; 5 minutes; an ephemeral ECDH P-256 key whose private JWK lives only in
   the state store (`key:<requestId>`, taken when the session is final). The
@@ -824,8 +842,12 @@ wallet.presentations.decline(request) → { ok: true } | WalletFailure   // loca
   public JWK; `A256GCM` (preferred) or `A128GCM`; exactly one `dc+sd-jwt`
   credential query, without `multiple`, whose claims are single top-level names
   without `values`; `credential_sets` absent or exactly one set with exactly one
-  option naming that query (the form that carries the purpose). Anything else is
-  `REQUEST_INVALID`. The library then checks the
+  option naming that query (the form that carries the purpose); claim sets
+  (DCQL `claim_sets`, or all claims when absent) a strictly decreasing chain by
+  set inclusion: at most 4, none empty or with a repeated name, each later option
+  a proper subset of the one before (equal options refused), so the first holds
+  every requested field and a "share less" switch can only drop fields, never
+  add one (ADR-0008 §5). Anything else is `REQUEST_INVALID`. The library then checks the
   `x509_hash` itself (it demands a `getX509CertificateMetadata` callback that it
   does not use for that prefix: a stub, pinned by a test). Time checks use the
   injected clock.

@@ -69,7 +69,8 @@ describe('PIN and offer lifetime', () => {
     const world = await createWorld(listener);
     const w = world.newWallet();
     const { offer, txCode } = await resolvedOffer(world, w);
-    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode: otherPin(txCode) }), { ok: false, code: 'TX_CODE_WRONG', retryable: true });
+    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode: otherPin(txCode) }), { ok: false, code: 'TX_CODE_WRONG', retryable: true, codeRedeemed: false });
+    assert.equal(offer.codeRedeemed, false);
     nothingLeft(w);
     assert.equal((await w.wallet.offers.accept(offer, { txCode })).ok, true);
   });
@@ -81,7 +82,7 @@ describe('PIN and offer lifetime', () => {
     const codes = [];
     for (let i = 0; i < 5; i++) codes.push(((await w.wallet.offers.accept(offer, { txCode: otherPin(txCode) })) as { code: string }).code);
     assert.deepEqual(codes, ['TX_CODE_WRONG', 'TX_CODE_WRONG', 'TX_CODE_WRONG', 'TX_CODE_WRONG', 'OFFER_EXPIRED']);
-    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'OFFER_EXPIRED', retryable: false });
+    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'OFFER_EXPIRED', retryable: false, codeRedeemed: false });
     nothingLeft(w);
   });
 
@@ -90,14 +91,14 @@ describe('PIN and offer lifetime', () => {
     const w = world.newWallet();
     const first = await resolvedOffer(world, w);
     world.clock.advance(601);
-    assert.deepEqual(await w.wallet.offers.accept(first.offer, { txCode: first.txCode }), { ok: false, code: 'OFFER_EXPIRED', retryable: false });
+    assert.deepEqual(await w.wallet.offers.accept(first.offer, { txCode: first.txCode }), { ok: false, code: 'OFFER_EXPIRED', retryable: false, codeRedeemed: false });
     assert.deepEqual(await w.wallet.offers.resolve(first.offerUri), { ok: false, code: 'OFFER_EXPIRED' });
     const other = world.newWallet();
     const second = await resolvedOffer(world, w);
     const again = await other.wallet.offers.resolve(second.offerUri);
     assert.equal((await w.wallet.offers.accept(second.offer, { txCode: second.txCode })).ok, true);
     assert.ok(again.ok);
-    assert.deepEqual(await other.wallet.offers.accept(again.offer, { txCode: second.txCode }), { ok: false, code: 'OFFER_EXPIRED', retryable: false });
+    assert.deepEqual(await other.wallet.offers.accept(again.offer, { txCode: second.txCode }), { ok: false, code: 'OFFER_EXPIRED', retryable: false, codeRedeemed: false });
     nothingLeft(other);
   });
 });
@@ -208,7 +209,7 @@ describe('a malicious or failing issuer after the wallet key exists: exact code,
     const w = world.newWallet();
     const { offer, txCode } = await resolvedOffer(world, w);
     assert.equal(offer.issuerUri, 'https://api-identra.awncorp.vn/issuers/truong-khac');
-    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'ISSUER_MISMATCH', retryable: false });
+    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'ISSUER_MISMATCH', retryable: false, codeRedeemed: true });
     nothingLeft(w);
   });
 
@@ -216,7 +217,7 @@ describe('a malicious or failing issuer after the wallet key exists: exact code,
     const world = await createWorld(listener, { handlers: { onIssued: async () => { throw new Error('database down'); } } });
     const w = world.newWallet();
     const { offer, txCode, offerId } = await resolvedOffer(world, w);
-    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'ISSUER_ERROR', retryable: false });
+    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'ISSUER_ERROR', retryable: false, codeRedeemed: true });
     nothingLeft(w);
     assert.equal((await world.issuer.offerStatus(offerId))?.status, 'pending');
   });
@@ -228,7 +229,7 @@ describe('a malicious or failing issuer after the wallet key exists: exact code,
     const w = world.newWallet();
     const { offer, txCode } = await resolvedOffer(world, w);
     failing = true;
-    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'ISSUER_ERROR', retryable: false });
+    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'ISSUER_ERROR', retryable: false, codeRedeemed: true });
     nothingLeft(w);
     assert.equal(world.issued.length, 0);
   });
@@ -308,7 +309,7 @@ describe('GĐ5 review fixes', () => {
     w.vault.setStatus = async () => Promise.reject(new Error('db'));
     w.vault.remove = async () => Promise.reject(new Error('db'));
     const r = await resolvedOffer(world, w);
-    assert.deepEqual(await w.wallet.offers.accept(r.offer, { txCode: r.txCode }), { ok: false, code: 'STORAGE_ERROR', retryable: false });
+    assert.deepEqual(await w.wallet.offers.accept(r.offer, { txCode: r.txCode }), { ok: false, code: 'STORAGE_ERROR', retryable: false, codeRedeemed: true });
     const row = [...w.rows.values()][0]!;
     assert.equal(w.secrets.has(`identra.key.${row.key_id}`), true, 'the row that could not be removed keeps its key');
     // The row was removed: the received credential and its key wait in the offer for the next accept,
@@ -317,7 +318,7 @@ describe('GĐ5 review fixes', () => {
     const setStatus = v.vault.setStatus;
     v.vault.setStatus = async () => Promise.reject(new Error('db'));
     const r2 = await resolvedOffer(world, v);
-    assert.deepEqual(await v.wallet.offers.accept(r2.offer, { txCode: r2.txCode }), { ok: false, code: 'STORAGE_ERROR', retryable: true });
+    assert.deepEqual(await v.wallet.offers.accept(r2.offer, { txCode: r2.txCode }), { ok: false, code: 'STORAGE_ERROR', retryable: true, codeRedeemed: true });
     assert.deepEqual([v.rows.size, v.secrets.size], [0, 1]);
     await v.wallet.offers.discard(r2.offer);
     nothingLeft(v);
@@ -388,10 +389,12 @@ describe('resumable accept (app review A)', () => {
       const { offer, txCode } = await resolvedOffer(world, w);
       const real = w.keyStore[where];
       (w.keyStore as unknown as Record<string, unknown>)[where] = async () => Promise.reject(new WalletKeyError('CANCELLED'));
-      assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'USER_CANCELLED', retryable: true }, where);
+      assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'USER_CANCELLED', retryable: true, codeRedeemed: true }, where);
       assert.equal(w.secrets.size, 0, `${where}: no key left behind`);
+      assert.equal(offer.codeRedeemed, true, where);
       (w.keyStore as unknown as Record<string, unknown>)[where] = real;
-      const second = await w.wallet.offers.accept(offer, { txCode: otherPin(txCode) }); // the PIN is ignored on a resume
+      // The PIN is not needed, and ignored, on a resume after the token step.
+      const second = await w.wallet.offers.accept(offer, where === 'create' ? {} : { txCode: otherPin(txCode) });
       assert.equal(second.ok, true, `${where}: ${JSON.stringify(second)}`);
       assert.deepEqual([count(TOKEN), w.rows.size, w.secrets.size], [1, 1, 1], where);
     }
@@ -402,11 +405,55 @@ describe('resumable accept (app review A)', () => {
       const world = await createWorld(listener);
       const w = failingOnce(world, suffix);
       const { offer, txCode } = await resolvedOffer(world, w);
-      assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'NETWORK_ERROR', retryable: true }, suffix);
+      assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'NETWORK_ERROR', retryable: true, codeRedeemed: true }, suffix);
       assert.equal(w.secrets.size, 0);
       assert.equal((await w.wallet.offers.accept(offer, { txCode })).ok, true, suffix);
       assert.deepEqual([count(TOKEN), count(CREDENTIAL_POST)], [1, 1], suffix);
     }
+  });
+
+  test('no answer to the token request: codeRedeemed false; without the PIN TX_CODE_REQUIRED and nothing sent; with it one credential', async () => {
+    const world = await createWorld(listener);
+    const sent: string[] = [];
+    let failed = false;
+    const w = world.newWallet('noble', createMappedFetch(async (url, init) => {
+      sent.push(url);
+      if (!failed && url.endsWith('/token')) {
+        failed = true;
+        throw new DOMException('The operation timed out.', 'TimeoutError'); // what the app's fetch throws at timeoutMs
+      }
+      return nodeHttpFetch(url, init);
+    }, { [ORIGIN]: listener.localOrigin }));
+    const { offer, txCode } = await resolvedOffer(world, w);
+    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'NETWORK_ERROR', retryable: true, codeRedeemed: false });
+    assert.equal(offer.codeRedeemed, false);
+    sent.length = 0;
+    listener.requests.length = 0;
+    for (const input of [undefined, {}, { txCode: '' }]) {
+      assert.deepEqual(await w.wallet.offers.accept(offer, input), { ok: false, code: 'TX_CODE_REQUIRED', retryable: true, codeRedeemed: false }, JSON.stringify(input));
+    }
+    assert.deepEqual([sent, listener.requests], [[], []], 'no request at all, so no PIN attempt is spent');
+    assert.equal((await w.wallet.offers.accept(offer, { txCode })).ok, true);
+    assert.equal(offer.codeRedeemed, true);
+    assert.deepEqual([count(TOKEN), count(CREDENTIAL_POST), world.issued.length, w.rows.size, w.secrets.size], [1, 1, 1, 1, 1]);
+  });
+
+  test('a token answer lost on the way back: the code was spent, so the retry with the PIN is OFFER_EXPIRED', async () => {
+    const world = await createWorld(listener);
+    let lost = false;
+    const w = world.newWallet('noble', createMappedFetch(async (url, init) => {
+      const r = await nodeHttpFetch(url, init);
+      if (!lost && url.endsWith('/token')) {
+        lost = true;
+        throw new TypeError('fetch failed');
+      }
+      return r;
+    }, { [ORIGIN]: listener.localOrigin }));
+    const { offer, txCode } = await resolvedOffer(world, w);
+    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'NETWORK_ERROR', retryable: true, codeRedeemed: false });
+    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'OFFER_EXPIRED', retryable: false, codeRedeemed: false });
+    assert.equal(world.issued.length, 0);
+    nothingLeft(w);
   });
 
   test('a failing vault write: the received credential is stored on the next accept, without a second credential request', async () => {
@@ -415,7 +462,7 @@ describe('resumable accept (app review A)', () => {
     const { offer, txCode } = await resolvedOffer(world, w);
     const save = w.vault.save;
     w.vault.save = async () => Promise.reject(new Error('disk full'));
-    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'STORAGE_ERROR', retryable: true });
+    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'STORAGE_ERROR', retryable: true, codeRedeemed: true });
     w.vault.save = save;
     const second = await w.wallet.offers.accept(offer, { txCode });
     assert.equal(second.ok, true);
@@ -432,7 +479,7 @@ describe('resumable accept (app review A)', () => {
     w.keyStore.create = create;
     world.clock.advance(301);
     listener.requests.length = 0;
-    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'OFFER_EXPIRED', retryable: false });
+    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'OFFER_EXPIRED', retryable: false, codeRedeemed: true });
     assert.deepEqual(listener.requests, []);
 
     const world2 = await createWorld(listener);
@@ -440,10 +487,10 @@ describe('resumable accept (app review A)', () => {
     const second = await resolvedOffer(world2, v);
     const real = listener.routes.get(CREDENTIAL)!;
     listener.routes.set(CREDENTIAL, async () => ({ status: 400, headers: { 'Content-Type': 'application/json' }, body: '{"error":"invalid_proof"}' }));
-    assert.deepEqual(await v.wallet.offers.accept(second.offer, { txCode: second.txCode }), { ok: false, code: 'ISSUER_ERROR', retryable: false });
+    assert.deepEqual(await v.wallet.offers.accept(second.offer, { txCode: second.txCode }), { ok: false, code: 'ISSUER_ERROR', retryable: false, codeRedeemed: true });
     listener.routes.set(CREDENTIAL, real);
     listener.requests.length = 0;
-    assert.deepEqual(await v.wallet.offers.accept(second.offer, { txCode: second.txCode }), { ok: false, code: 'OFFER_EXPIRED', retryable: false });
+    assert.deepEqual(await v.wallet.offers.accept(second.offer, { txCode: second.txCode }), { ok: false, code: 'OFFER_EXPIRED', retryable: false, codeRedeemed: true });
     assert.deepEqual(listener.requests, [], 'neither the code nor the token is sent again');
     nothingLeft(v);
   });

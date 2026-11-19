@@ -11,7 +11,7 @@ export const RESPONSE_ENC_VALUES = ['A256GCM', 'A128GCM'];
 
 export interface Scenario {
   vct: string;
-  /** Claim sets in order of preference; each a list of top-level claim names. */
+  /** Claim sets in order of preference; each a list of top-level claim names and a proper subset of the one before (at most 4). */
   claimSets: string[][];
   purpose: { vi: string; en: string };
 }

@@ -41,7 +41,24 @@ export const SD_JWT_LIMITS = Object.freeze({
   clockSkewSeconds: 60,
 });
 
-export type DiplomaClaims = Record<(typeof DIPLOMA_CLAIMS)[number], string>;
+/** At most this many DCQL claim sets (options) per request. */
+export const MAX_CLAIM_SETS = 4;
+
+/**
+ * ADR-0008 section 5: the first claim set holds every requested name and each later one only
+ * shrinks it, so "share less" can never add a field. True when there are 1 to MAX_CLAIM_SETS sets,
+ * none empty or with a repeated name, and each is a proper subset of the one before.
+ */
+export function claimSetsNested(sets: readonly (readonly string[])[]): boolean {
+  if (sets.length === 0 || sets.length > MAX_CLAIM_SETS) return false;
+  return sets.every((set, i) => {
+    if (set.length === 0 || new Set(set).size !== set.length) return false;
+    const prev = sets[i - 1];
+    return prev === undefined || (set.length < prev.length && set.every((n) => prev.includes(n)));
+  });
+}
+
+export type DiplomaClaims =Record<(typeof DIPLOMA_CLAIMS)[number], string>;
 export type CongDoan = (typeof CONG_DOAN)[number];
 export interface ProductEventClaims {
   /** GS1 element string `(01)<GTIN>(21)<serial>`. */

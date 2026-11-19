@@ -11,6 +11,8 @@ export const WalletErrorCodes = Object.freeze({
   URL_NOT_ALLOWED: ErrorCodes.URL_NOT_ALLOWED,
   /** Wrong PIN; the same resolved offer can be accepted again. */
   TX_CODE_WRONG: ErrorCodes.TX_CODE_WRONG,
+  /** The offer needs a PIN, the code is not redeemed yet, and accept got none: nothing was sent. */
+  TX_CODE_REQUIRED: ErrorCodes.TX_CODE_REQUIRED,
   /** The offer expired, was used, or was destroyed after five wrong PINs. */
   OFFER_EXPIRED: ErrorCodes.OFFER_EXPIRED,
   /** Unreachable or too slow. */

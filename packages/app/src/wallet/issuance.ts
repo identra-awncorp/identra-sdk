@@ -29,6 +29,11 @@ export interface ResolvedOffer {
   issuerDisplay: DisplayEntry[];
   configuration: { id: string; vct: string; display: DisplayEntry[] };
   txCode: { length: number | null; inputMode: 'numeric' | 'text'; description: string | null } | null;
+  /**
+   * True once the token step succeeded for this offer (the wallet holds or held an access token):
+   * the PIN was accepted and is not needed again. False before; then a resume needs the PIN.
+   */
+  readonly codeRedeemed: boolean;
 }
 
 /**
@@ -42,10 +47,19 @@ export type AcceptResult =
 
 /**
  * `retryable`: true when `accept` on the SAME resolved offer can still complete (the PIN was wrong
- * and the offer still exists, or the wallet still holds an unexpired, unused access token, or a
- * received credential waits to be stored); false when a new offer is needed.
+ * and the offer still exists, the PIN was missing, a token request got no answer, the wallet still
+ * holds an unexpired, unused access token, or a received credential waits to be stored); false when
+ * a new offer is needed.
+ * `codeRedeemed`: the offer's `codeRedeemed` at the end of this call. True: a retry needs no PIN.
+ * False: a retry must send the PIN again (TX_CODE_REQUIRED without it). After a token request with
+ * no answer (NETWORK_ERROR, codeRedeemed false) the wallet cannot know whether the issuer redeemed
+ * the code: the next accept with the PIN completes, or is OFFER_EXPIRED when the lost request had
+ * consumed it.
  */
-export type AcceptFailure = WalletFailure & { retryable: boolean };
+export type AcceptFailure = WalletFailure & { retryable: boolean; codeRedeemed: boolean };
+/** A failure of one attempt, before `codeRedeemed` is added from the offer state. */
+type AttemptFailure = WalletFailure & { retryable: boolean };
+type AttemptResult = Exclude<AcceptResult, AcceptFailure> | AttemptFailure;
 
 /** A token without `expires_in` is trusted for this long. */
 const DEFAULT_TOKEN_SECONDS = 60;
@@ -63,6 +77,8 @@ interface OfferState {
   vct: string;
   /** The pre-authorized code was redeemed: it is never sent again. */
   codeUsed: boolean;
+  /** The offer's grant carries `tx_code`: the token request needs a PIN. */
+  txCodeRequired: boolean;
   /** The access token, in memory only, until the issuer answered a credential request or it expired. */
   token: { value: string; expiresAt: number } | null;
   /** A c_nonce not yet sent in a proof. */
@@ -184,7 +200,7 @@ export function createIssuance(ctx: WalletContext) {
   });
 
   /** After invalid_grant: the offer still served means the PIN was wrong; gone means expired, used or destroyed. */
-  async function wrongPinOrExpired(state: OfferState, fetch: HttpFetch): Promise<AcceptFailure> {
+  async function wrongPinOrExpired(state: OfferState, fetch: HttpFetch): Promise<AttemptFailure> {
     try {
       const r = await fetch(state.offerUri, { method: 'GET', maxBytes: 65_536 });
       return r.status === 200 ? { ok: false, code: C.TX_CODE_WRONG, retryable: true } : { ok: false, code: C.OFFER_EXPIRED, retryable: false };
@@ -194,10 +210,10 @@ export function createIssuance(ctx: WalletContext) {
   }
 
   const tokenUsable = (state: OfferState) => state.token !== null && ctx.clock.now().getTime() < state.token.expiresAt - TOKEN_MARGIN_MS;
-  const fails = (e: unknown, retryable: boolean): AcceptFailure => ({ ...failure(e), retryable });
+  const fails = (e: unknown, retryable: boolean): AttemptFailure => ({ ...failure(e), retryable });
 
   /** Stores a received credential. A failure keeps it (and its key) in the offer state for the next accept. */
-  async function storeReceived(state: OfferState, r: Received): Promise<AcceptResult> {
+  async function storeReceived(state: OfferState, r: Received): Promise<AttemptResult> {
     let savedId: string | undefined;
     try {
       savedId = await storage(() => ctx.vault.save({ compact: r.compact, vct: r.vct, issuer: r.iss, keyId: r.keyId }));
@@ -252,6 +268,10 @@ export function createIssuance(ctx: WalletContext) {
       const { configurationId, vct, display } = checkMetadata(session, origin, ctx.supportedVcts);
       const grant = (offer['grants'] as Record<string, Record<string, unknown>>)[PRE_AUTHORIZED_GRANT]!;
       const tx = grant['tx_code'];
+      const state: OfferState = {
+        issuerUri: offer['credential_issuer'] as string, offerUri, origin, session, configurationId, vct, codeUsed: false, txCodeRequired: isObject(tx),
+        token: null, nonce: null, received: null, queue: Promise.resolve(),
+      };
       const resolved: ResolvedOffer = {
         issuerUri: offer['credential_issuer'] as string,
         issuerOrigin: origin,
@@ -264,8 +284,11 @@ export function createIssuance(ctx: WalletContext) {
               description: typeof tx['description'] === 'string' ? tx['description'] : null,
             }
           : null,
+        get codeRedeemed() {
+          return state.codeUsed;
+        },
       };
-      offers.set(resolved, { issuerUri: resolved.issuerUri, offerUri, origin, session, configurationId, vct, codeUsed: false, token: null, nonce: null, received: null, queue: Promise.resolve() });
+      offers.set(resolved, state);
       return { ok: true, offer: resolved };
     } catch (e) {
       return failure(e);
@@ -276,23 +299,27 @@ export function createIssuance(ctx: WalletContext) {
    * Token (PIN) -> c_nonce -> new wallet key -> proof -> credential request -> verify -> store.
    * Resumable: after the PIN was accepted, the access token (and an unused c_nonce) stay in the
    * offer's memory, so a later accept on the SAME resolved offer continues from the c_nonce with a
-   * new key attempt and ignores `txCode`. The token is dropped once the issuer answered a credential
-   * request (success or a definitive error) and when it expires; it is never stored or logged.
+   * new key attempt and ignores `txCode`. Before that (`offer.codeRedeemed` false) an offer with a
+   * PIN needs `txCode`: without one it is TX_CODE_REQUIRED and nothing is sent. The token is
+   * dropped once the issuer answered a credential request (success or a definitive error) and when
+   * it expires; it is never stored or logged.
    */
   async function accept(offer: ResolvedOffer, input: { txCode?: string } = {}): Promise<AcceptResult> {
     const state = offers.get(offer);
     if (!state) throw new TypeError('offer must come from wallet.offers.resolve');
-    const run = state.queue.then(() => attempt(state, input.txCode));
+    const run = state.queue.then(() => attempt(state, input.txCode)).then((r): AcceptResult => (r.ok ? r : { ...r, codeRedeemed: state.codeUsed }));
     state.queue = run.catch(() => {});
     return run;
   }
 
-  async function attempt(state: OfferState, txCode: string | undefined): Promise<AcceptResult> {
+  async function attempt(state: OfferState, txCode: string | undefined): Promise<AttemptResult> {
     if (state.received) return storeReceived(state, state.received);
     const deps = depsFor(state.origin);
     if (!tokenUsable(state)) {
       state.token = null;
       if (state.codeUsed) return { ok: false, code: C.OFFER_EXPIRED, retryable: false };
+      // An empty PIN would cost one of the issuer's five attempts: refused here, nothing is sent.
+      if (state.txCodeRequired && !txCode) return { ok: false, code: C.TX_CODE_REQUIRED, retryable: true };
       try {
         const t = await requestAccessToken(state.session, txCode, deps);
         state.codeUsed = true;

@@ -32,6 +32,7 @@ for (const backend of ['noble', 'webcrypto'] as const) {
       issuerDisplay: [{ name: 'Trường Mẫu', locale: 'vi' }, { name: 'Sample University', locale: 'en' }],
       configuration: { id: 'bang-tot-nghiep-v1', vct: VCT.diploma, display: [{ name: 'Bằng tốt nghiệp', locale: 'vi' }, { name: 'Diploma', locale: 'en' }] },
       txCode: { length: 6, inputMode: 'numeric', description: 'Nhập mã PIN 6 chữ số được cấp cùng mã QR' },
+      codeRedeemed: false,
     });
     assert.equal(secrets.size, 0, 'resolve creates no key');
     assert.deepEqual(listener.requests, [
