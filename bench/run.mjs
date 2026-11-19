@@ -16,7 +16,6 @@ const only = flag('only');
 if (flag('min-ms')) options.minMs = Number(flag('min-ms'));
 const t0 = process.hrtime.bigint();
 const BACKENDS = ['webcrypto', 'noble'];
-const label = { webcrypto: 'WebCrypto', noble: 'noble' };
 
 const w = await buildWorld();
 const results = [];
