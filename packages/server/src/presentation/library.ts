@@ -1,6 +1,7 @@
 // Adapter to @openid4vc/openid4vp, dcql and jose for the verifier: the only file of the verifier
 // that imports them. The library parses the direct_post.jwt response (after our jose decryption)
 // and dcql builds and evaluates the query; every decision is taken by the caller.
+import '@identra/sdk-core/zod-config'; // before the libraries: see sdk-core zod-config.ts
 import { Openid4vpVerifier } from '@openid4vc/openid4vp';
 import { DcqlPresentationResult, DcqlQuery } from 'dcql';
 import { compactDecrypt, decodeProtectedHeader, importJWK, type JWK } from 'jose';

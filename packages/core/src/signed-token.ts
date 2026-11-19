@@ -72,7 +72,8 @@ export async function verifySignedToken(
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return fail('malformed', 'payload is not a JSON object');
   const p = payload as Record<string, unknown>;
   const t = o.now.getTime() / 1000;
-  if (!isTime(p['iat'])) return fail('claims', 'iat is missing or not a number');
+  // An integer: the iat is compared for equality and persisted in `seen`, which holds integers only.
+  if (!isTime(p['iat']) || !Number.isSafeInteger(p['iat'])) return fail('claims', 'iat is missing or not an integer');
   if (!isTime(p['exp'])) return fail('claims', 'exp is missing or not a number');
   if (p['ttl'] !== undefined && !(Number.isSafeInteger(p['ttl']) && (p['ttl'] as number) > 0)) return fail('claims', 'ttl is not a positive integer');
   if (p['exp'] - p['iat'] > MAX_TOKEN_LIFETIME_SECONDS + SKEW_S) return fail('claims', 'exp - iat is more than 24 hours');

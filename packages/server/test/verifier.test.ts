@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs';
 import { describe, test } from 'node:test';
 import { CompactEncrypt, importJWK, type JWK } from 'jose';
 import {
-  base64Decode, base64Encode, base64UrlDecode, base64UrlEncode, createCertificateChainValidator, createPresentation, issueDiploma, utf8Decode, utf8Encode, VCT,
+  base64Decode, base64Encode, base64UrlDecode, base64UrlEncode, createCertificateChainValidator, createPresentation, issueCredential, issueDiploma, utf8Decode, utf8Encode, VCT,
   type Signer, type TrustEntry,
 } from '@identra/sdk-core';
 import { createWebCryptoSigner, generateWebCryptoKeyPair, webCryptoHasher, webCryptoRandom, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
@@ -30,7 +30,7 @@ type RequestPayload = {
 };
 const form = (body: string, contentType = 'application/x-www-form-urlencoded') => ({ headers: { 'content-type': contentType }, body });
 
-async function world(o: { store?: (s: ProtocolStateStore) => ProtocolStateStore; requestEntry?: Partial<TrustEntry> | null; signer?: string; claimSets?: string[][] } = {}) {
+async function world(o: { store?: (s: ProtocolStateStore) => ProtocolStateStore; requestEntry?: Partial<TrustEntry> | null; signer?: string; claimSets?: string[][]; claims?: Record<string, unknown> } = {}) {
   const clock = fakeClock(NOW);
   const entries = new Map<string, TrustEntry | null>([
     [await fingerprint('vc'), { maToChuc: 'VATVN-0100000001', ten: 'Trường Mẫu', mucDich: 'vc', vct: [VCT.diploma] }],
@@ -47,9 +47,10 @@ async function world(o: { store?: (s: ProtocolStateStore) => ProtocolStateStore;
     random: webCryptoRandom, clock, store, scenarios: { 'ung-tuyen': o.claimSets ? { ...SCENARIO, claimSets: o.claimSets } : SCENARIO },
   });
   const holder = await createWebCryptoSigner(await generateWebCryptoKeyPair());
-  const credential = await issueDiploma({
-    signer: await signerOf('vc'), hasher: webCryptoHasher, random: webCryptoRandom, clock, iss: ISS, cnfJwk: holder.publicJwk, status: { idx: 7, uri: `${ISS}/status/1` }, claims: DIPLOMA,
-  });
+  const base = { signer: await signerOf('vc'), hasher: webCryptoHasher, random: webCryptoRandom, clock, iss: ISS, cnfJwk: holder.publicJwk, status: { idx: 7, uri: `${ISS}/status/1` } };
+  const credential = o.claims
+    ? await issueCredential({ ...base, vct: VCT.diploma, claims: o.claims, disclosable: Object.keys(o.claims) })
+    : await issueDiploma({ ...base, claims: DIPLOMA });
   const session = async () => {
     const r = await verifier.createSession({ scenario: 'ung-tuyen' });
     assert.ok(r.ok);
@@ -148,6 +149,34 @@ describe('which responses finalise a session', () => {
     const done = await w.verifier.session(s.id);
     assert.equal(done?.status, 'failed');
     assert.equal(done?.result?.checks.at(-1)?.code, 'QUERY_NOT_SATISFIED');
+  });
+
+  test('a claim of the satisfied claim set that is not a non-empty string: QUERY_NOT_SATISFIED, never verified with the claim missing', async () => {
+    for (const nganh of [42, '', { x: 'y' }, ['CNTT']]) {
+      const w = await world({ claims: { ...DIPLOMA, nganh } });
+      const s = await w.session();
+      assert.equal((await w.answer(s, { credential: [await w.present(s.payload)] })).status, 200);
+      const done = await w.verifier.session(s.id);
+      assert.deepEqual([done?.status, done?.result?.checks.at(-1), done?.result?.claims], ['failed', { id: 'query', ok: false, code: 'QUERY_NOT_SATISFIED' }, undefined], JSON.stringify(nganh));
+    }
+  });
+
+  test('a store failure in the cleanup after the result was written does not fail the response', async () => {
+    let written = false;
+    const w = await world({
+      store: (inner) => ({
+        ...inner,
+        put: async (k, v, t) => {
+          if (k.includes(':result:')) written = true;
+          else if (written) throw new Error('redis down');
+          return inner.put(k, v, t);
+        },
+        take: async (k) => (written ? Promise.reject(new Error('redis down')) : inner.take(k)),
+      }),
+    });
+    const s = await w.session();
+    assert.equal((await w.answer(s, { credential: [await w.present(s.payload)] })).status, 200);
+    assert.equal((await w.verifier.session(s.id))?.status, 'verified');
   });
 
   test(`after ${MAX_RESPONSE_ATTEMPTS} refused responses the session ends as failed with TOO_MANY_ATTEMPTS`, async () => {

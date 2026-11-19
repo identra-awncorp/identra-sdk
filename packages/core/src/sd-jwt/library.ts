@@ -1,6 +1,7 @@
 // Adapters from the Identra interfaces to the callbacks of @sd-jwt/sd-jwt-vc. This is the only
 // file that imports @sd-jwt/*. The library is used to issue and to present (ADR-0004,
 // "Bổ sung 2026-11-19" point 3); verification never calls it.
+import '../zod-config.js'; // before the library: see zod-config.ts
 import { SdJwtVcInstance } from '@sd-jwt/sd-jwt-vc';
 import { base64UrlEncode, utf8Encode } from '../encoding.js';
 import type { Hasher, RandomSource, Signer } from '../interfaces.js';

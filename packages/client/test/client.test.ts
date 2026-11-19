@@ -193,9 +193,11 @@ test('getSession encodes the id, sends no cookies and returns a fresh copy witho
     ],
     verifiedAt: '2026-11-19T10:01:00.000Z',
   };
+  const encoded = fakeFetch([res(200, session('failed', { result: failing }))]);
+  await assert.rejects(createVerifierClient({ baseUrl: `${BASE}/`, fetch: encoded.fetch }).getSession('a/b?c'), { kind: 'malformed', message: 'malformed session response: id' });
+  assert.equal(encoded.calls[0]!.url, `${BASE}/v1/verification/sessions/a%2Fb%3Fc`);
   const f = fakeFetch([res(200, session('failed', { result: failing }))]);
-  const s = await createVerifierClient({ baseUrl: `${BASE}/`, fetch: f.fetch }).getSession('a/b?c');
-  assert.equal(f.calls[0]!.url, `${BASE}/v1/verification/sessions/a%2Fb%3Fc`);
+  const s = await createVerifierClient({ baseUrl: `${BASE}/`, fetch: f.fetch }).getSession(ID);
   assert.equal(f.calls[0]!.init.method, 'GET');
   assert.equal(f.calls[0]!.init.credentials, 'omit');
   assert.equal(f.calls[0]!.init.body, null);
@@ -223,6 +225,7 @@ test('getSession rejects malformed sessions at the trust boundary, naming only t
     [JSON.stringify(session('done')), 'status'],
     [JSON.stringify(session('pending', { verifier: LEAK })), 'verifier'],
     [JSON.stringify(session('pending', { verifier: { name: `A\u202E${LEAK}` } })), 'verifier'],
+    ...(['\u2028', '\u2029', '\u200B', '\u200C', '\u200D', '\u200E', '\u200F', '\uFEFF', '\u00AD', '\u061C', '\u202E', '\u2066', '\u{E0000}', '\u{E0041}', '\u{E007F}', '\u0085', '\u0007']).map((c): [string, string] => [JSON.stringify(session('pending', { verifier: { name: `A${c}${LEAK}` } })), 'verifier']),
     [JSON.stringify(session('pending', { expiresAt: LEAK })), 'expiresAt'],
     [JSON.stringify(session('pending', { serverTime: undefined })), 'serverTime'],
     [JSON.stringify(session('verified')), 'result'],
@@ -284,6 +287,12 @@ test('getSession rejects malformed sessions at the trust boundary, naming only t
     assert.ok(!err.message.includes(LEAK));
   }
   assert.equal(({} as Record<string, unknown>)['polluted'], undefined);
+});
+
+test('F4-4: a session answer about another id than the one requested is malformed, in getSession and watchSession', async () => {
+  const other = { ...session('verified', { result: okResult }), id: 'sess_ffffffffffffffff' };
+  await assert.rejects(createVerifierClient({ baseUrl: BASE, fetch: fakeFetch([res(200, other)]).fetch }).getSession(ID), { kind: 'malformed', message: 'malformed session response: id' });
+  await assert.rejects(createVerifierClient({ baseUrl: BASE, fetch: fakeFetch([res(200, other)]).fetch }).watchSession(ID, { intervalMs: 1 }), { kind: 'malformed' });
 });
 
 test('claims and issuer are copied into fresh objects', async () => {

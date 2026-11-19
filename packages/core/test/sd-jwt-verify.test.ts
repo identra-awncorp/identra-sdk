@@ -93,6 +93,12 @@ describe('step 1 structure', () => {
     assert.equal(check(await verify(await withPayload({ _sd: [digest], _sd_alg: 'sha-256' })), 'structure').code, null, 'a valid shape with only decoys');
     assert.equal(check(await verify(await withPayload({ _sd_alg: 'sha-256' })), 'structure').code, null, '_sd_alg alone is allowed');
   });
+  test('F1-1: a payload nested deeper than 32 levels is MALFORMED in step 1', async () => {
+    const nested = (levels: number) => JSON.parse('['.repeat(levels) + ']'.repeat(levels)) as unknown;
+    // The payload object is level 1.
+    assert.equal(check(await verify(await withPayload({ a: nested(31) })), 'structure').code, null);
+    for (const levels of [32, 4000]) await expectCode(await withPayload({ a: nested(levels) }), 'structure', ErrorCodes.MALFORMED);
+  });
   test('a stored credential carrying a KB-JWT is MALFORMED', async () => {
     const compact = await craft({});
     await expectCode(`${compact}${compact.slice(0, -1)}`, 'structure', ErrorCodes.MALFORMED);

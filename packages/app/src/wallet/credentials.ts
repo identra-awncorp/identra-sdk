@@ -1,5 +1,5 @@
 // The credentials the wallet holds: list (no decryption), display data, status refresh, removal.
-import { base64Decode, base64UrlEncode, decodeCredentialUnverified, verifyStoredCredential, type Check } from '@identra/sdk-core';
+import { decodeCredentialUnverified, verifyStoredCredential, type Check, type StatusChecker } from '@identra/sdk-core';
 import type { CredentialMetadata, StoredCredentialStatus } from '../credential-vault.js';
 import type { WalletContext } from './context.js';
 import { onlyListsUnavailable } from './issuance.js';
@@ -16,11 +16,21 @@ const summaryOf = (r: CredentialMetadata): CredentialSummary => ({
   id: r.id, vct: r.vct, issuerUri: r.issuer, status: toWallet(r.status_cache), statusCheckedAt: r.status_checked_at, createdAt: r.created_at,
 });
 
-/** The trust-list name of the issuer whose x5c leaf signed a stored credential; null while it cannot be read. */
-export async function issuerNameOf(ctx: WalletContext, x5c: unknown): Promise<string | null> {
+// Asked nothing: a display name needs the issuer_trust check, not the credential's status.
+const noStatusRequest: StatusChecker = { check: async () => 'unavailable' };
+
+/**
+ * The trust-list name of a stored credential's issuer, only from a passing issuer_trust check
+ * (chain, signature, purpose `vc`, organisation and `vct` of the trust list entry); null otherwise,
+ * e.g. while the trust list cannot be read. Never requests a status list.
+ */
+export async function issuerNameOf(ctx: WalletContext, compact: string): Promise<string | null> {
   try {
-    const leaf = base64Decode((x5c as string[])[0]!);
-    return (await ctx.trustRegistry.lookup(base64UrlEncode(await ctx.hasher.sha256(leaf)), ctx.clock.now()))?.ten ?? null;
+    const r = await verifyStoredCredential(compact, {
+      verifier: ctx.verifier, hasher: ctx.hasher, chainValidator: ctx.chainValidator, trustRegistry: ctx.trustRegistry,
+      statusChecker: noStatusRequest, supportedVcts: ctx.supportedVcts, now: ctx.clock.now(),
+    });
+    return r.checks.some((c) => c.id === 'issuer_trust' && c.ok) ? (r.credential?.issuer?.ten ?? null) : null;
   } catch {
     return null;
   }
@@ -65,12 +75,12 @@ export function createCredentials(ctx: WalletContext) {
       if (!opened.ok) return opened;
       const row = await ctx.vault.getMeta(id);
       if (!row) return { ok: false, code: C.CREDENTIAL_NOT_FOUND };
-      const { header, payload, disclosures } = decodeCredentialUnverified(opened.compact);
+      const { payload, disclosures } = decodeCredentialUnverified(opened.compact);
       return {
         ok: true,
         credential: {
           ...summaryOf(row),
-          issuerName: await issuerNameOf(ctx, header['x5c']),
+          issuerName: await issuerNameOf(ctx, opened.compact),
           iat: payload['iat'] as number,
           claims: Object.fromEntries(disclosures.map((d) => [d.name, d.value])),
         },
@@ -95,7 +105,7 @@ export function createCredentials(ctx: WalletContext) {
       const statusCode = r.checks.find((c) => c.id === 'status')?.code;
       const status: StoredCredentialStatus = r.ok
         ? 'valid'
-        : statusCode === 'REVOKED' ? 'revoked' : statusCode === 'SUSPENDED' ? 'suspended' : onlyListsUnavailable(r.checks) ? 'unavailable' : 'invalid';
+        : statusCode === 'REVOKED' ? 'revoked' : statusCode === 'SUSPENDED' ? 'suspended' : onlyListsUnavailable(r) ? 'unavailable' : 'invalid';
       const checkedAt = ctx.clock.now();
       try {
         await ctx.vault.setStatus(id, status, checkedAt);

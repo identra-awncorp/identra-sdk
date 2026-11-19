@@ -361,23 +361,66 @@ describe('order of effects', () => {
     assert.equal(w.allocations.length, 0);
   });
 
-  test('state store failure mid-flow: the call rejects and nothing is allocated or recorded', async () => {
-    let failTake = false;
+  test('F3-3: a store failure while nothing is spent is 503 and the same request then succeeds; the offer is taken before the code', async () => {
+    // Token step: each store call before the offer is taken, failing once.
+    for (const [op, part] of [['get', ':code:'], ['get', ':offer:'], ['increment', ':attempts:'], ['take', ':offer:']] as const) {
+      let armed = false;
+      const w = await world({
+        store: (s) => ({
+          ...s,
+          [op]: async (k: string, t?: number) => {
+            if (armed && k.includes(part)) {
+              armed = false;
+              throw new Error('redis down');
+            }
+            return op === 'increment' ? s.increment(k, t!) : s[op](k);
+          },
+        }),
+      });
+      const o = await w.newOffer();
+      armed = true;
+      const failed = await w.token(o.code, o.txCode);
+      assert.deepEqual([...error(failed), failed.headers['Retry-After']], [503, 'temporarily_unavailable', '1'], `${op} ${part}`);
+      assert.equal((await w.token(o.code, o.txCode)).status, 200, `${op} ${part}: the retry gets a token`);
+    }
+    // The offer is taken before the code: a failing code take leaves no offer behind (OFFER_EXPIRED, not a wrong PIN forever).
+    const takes: string[] = [];
     const w = await world({
       store: (s) => ({
         ...s,
         take: async (k) => {
-          if (failTake && k.includes(':token:')) throw new Error('redis down');
+          takes.push(k);
+          if (k.includes(':code:')) throw new Error('redis down');
           return s.take(k);
         },
       }),
     });
-    const at = await w.accessToken();
-    failTake = true;
-    await assert.rejects(w.credential(at, await w.requestWith({ jwt: [await w.proof()] })), /redis down/);
-    assert.equal(w.allocations.length, 0);
-    assert.equal(w.issued.length, 0);
-    failTake = false;
+    const o = await w.newOffer();
+    await assert.rejects(w.token(o.code, o.txCode), /redis down/);
+    assert.deepEqual(takes.map((k) => k.split(':').at(-2)), ['offer', 'code']);
+    assert.equal((await w.issuer.offer(o.offerId)).status, 404);
+
+    // Credential step: each store call up to the token take, failing once: 503, the token is not spent.
+    for (const [op, part] of [['get', ':token:'], ['take', ':nonce:'], ['take', ':token:']] as const) {
+      let armed = false;
+      const w2 = await world({
+        store: (s) => ({
+          ...s,
+          [op]: async (k: string) => {
+            if (armed && k.includes(part)) {
+              armed = false;
+              throw new Error('redis down');
+            }
+            return s[op](k);
+          },
+        }),
+      });
+      const at = await w2.accessToken();
+      armed = true;
+      assert.deepEqual(error(await w2.credential(at, await w2.requestWith({ jwt: [await w2.proof()] }))), [503, 'temporarily_unavailable'], `${op} ${part}`);
+      assert.deepEqual([w2.allocations.length, w2.issued.length], [0, 0]);
+      assert.equal((await w2.credential(at, await w2.requestWith({ jwt: [await w2.proof()] }))).status, 200, `${op} ${part}: the same token works`);
+    }
   });
 });
 

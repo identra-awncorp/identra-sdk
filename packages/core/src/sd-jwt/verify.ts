@@ -5,7 +5,7 @@ import { normalizeEcPublicJwk } from '../jwk.js';
 import { checkJwsAlgorithm, verifyJws } from '../jws.js';
 import { ErrorCodes, TrustListUnavailableError, type Check, type CheckId, type ErrorCode, type VerificationResult } from '../results.js';
 import type { ParsedCertificate } from '../x509/parse.js';
-import { disclosureSegments, parseSdJwt, sdShapeProblem, type ParsedSdJwt } from './compact.js';
+import { disclosureSegments, jsonDepthExceeds, MAX_JSON_DEPTH, parseSdJwt, sdShapeProblem, type ParsedSdJwt } from './compact.js';
 import { isStatusListUri, METADATA_CLAIMS, SD_JWT_LIMITS, VCT } from './credential-types.js';
 import { checkHolderBinding } from './holder-binding.js';
 
@@ -90,6 +90,7 @@ function checkStructure(compact: unknown, presentation: boolean): ParsedSdJwt {
   if (!shapeOk) throw new Failure(ErrorCodes.MALFORMED, 'payload lacks string iss / vct, numeric iat, or has mistyped metadata');
   const sdProblem = sdShapeProblem(p);
   if (sdProblem) throw new Failure(ErrorCodes.MALFORMED, sdProblem);
+  if (jsonDepthExceeds(p, MAX_JSON_DEPTH)) throw new Failure(ErrorCodes.MALFORMED, `payload nests deeper than ${MAX_JSON_DEPTH} levels`);
   return parsed.sdJwt;
 }
 

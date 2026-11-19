@@ -3,10 +3,10 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { Openid4vpClient } from '@openid4vc/openid4vp';
-import { base64Decode, base64UrlDecode, base64UrlEncode, parseCertificate, signJws, utf8Decode, utf8Encode, type Signer } from '@identra/sdk-core';
+import { base64Decode, base64UrlDecode, base64UrlEncode, createMappedFetch, parseCertificate, signJws, utf8Decode, utf8Encode, type HttpFetch, type Signer } from '@identra/sdk-core';
 import { webCryptoHasher } from '@identra/sdk-core/webcrypto';
 import { SecretStorageError, WalletKeyError } from '@identra/sdk-app';
-import { createWorld, leafSigner, newSession, ORIGIN, startListener, UNG_TUYEN, type Listener, type World } from './helpers/world.js';
+import { createWorld, leafSigner, newSession, nodeHttpFetch, ORIGIN, startListener, UNG_TUYEN, type Listener, type World } from './helpers/world.js';
 
 let listener: Listener;
 before(async () => (listener = await startListener(47643)));
@@ -75,8 +75,14 @@ describe('who is asking', () => {
 });
 
 describe('request objects the wallet refuses before anything is shown', () => {
-  test('each rule, with its code', async () => {
-    const { world, verifier, w } = await setup({ credentials: 0 });
+  test('each rule, with its code; a refused request object sends nothing (no POST)', async () => {
+    const { world, verifier } = await setup({ credentials: 0 });
+    // Every request the wallet makes, seen at its own fetch.
+    const sent: string[] = [];
+    const mapped = createMappedFetch(nodeHttpFetch, { [ORIGIN]: listener.localOrigin });
+    const recording: HttpFetch = (url, init) => (sent.push(`${init?.method ?? 'GET'} ${url}`), mapped(url, init));
+    const w = world.newWallet('noble', recording);
+    const credentialId = await world.issueTo(w);
     const request = await leafSigner('request');
     const evil = await leafSigner('evil-vc', 'evil-issuing');
     const clientId = `x509_hash:${await fingerprintOf(request)}`;
@@ -89,6 +95,9 @@ describe('request objects the wallet refuses before anything is shown', () => {
       ['response_mode direct_post', async () => qrFor(clientId, await crafted(world, verifier, (p) => (p['response_mode'] = 'direct_post'))), 'REQUEST_INVALID'],
       ['no nonce', async () => qrFor(clientId, await crafted(world, verifier, (p) => delete p['nonce'])), 'REQUEST_INVALID'],
       ['expired', async () => qrFor(clientId, await crafted(world, verifier, (p) => (p['exp'] = (p['iat'] as number) - 120))), 'REQUEST_EXPIRED'],
+      // F4-6: inside what used to be the 60 s skew, and exactly now: ours, not the library's generic refusal.
+      ['expired 59 s ago', async () => qrFor(clientId, await crafted(world, verifier, (p) => { p['iat'] = (p['iat'] as number) - 100; p['exp'] = (p['iat'] as number) + 41; })), 'REQUEST_EXPIRED'],
+      ['expiring now', async () => qrFor(clientId, await crafted(world, verifier, (p) => { p['iat'] = (p['iat'] as number) - 100; p['exp'] = (p['iat'] as number) + 100; })), 'REQUEST_EXPIRED'],
       ['typ JWT', async () => qrFor(clientId, await crafted(world, verifier, () => {}, { header: { typ: 'JWT' } })), 'REQUEST_INVALID'],
       ['an off-curve encryption key', async () => qrFor(clientId, await crafted(world, verifier, (p) => {
         const key = (p['client_metadata'] as { jwks: { keys: Record<string, string>[] } }).jwks.keys[0]!;
@@ -114,9 +123,17 @@ describe('request objects the wallet refuses before anything is shown', () => {
     // Built one at a time: each serves its request object at the same path.
     for (const [name, qr, code] of cases) {
       const text = await qr();
-      listener.requests.length = 0;
+      sent.length = 0;
       assert.deepEqual(await w.wallet.presentations.resolve(text), { ok: false, code }, name);
+      assert.ok(sent.includes(`GET ${ORIGIN}/oid4vp/request/crafted`), `${name}: the request object was fetched through the recorded fetch`);
+      assert.deepEqual(sent.filter((r) => r.startsWith('POST')), [], `${name}: nothing was sent`);
     }
+    // The recorder does see a POST: an accepted request, submitted.
+    const ok = await w.wallet.presentations.resolve((await newSession(verifier)).qr);
+    assert.ok(ok.ok);
+    sent.length = 0;
+    assert.deepEqual(await w.wallet.presentations.submit(ok.request, { credentialId, claimSetIndex: 1 }), { ok: true });
+    assert.equal(sent.filter((r) => r.startsWith(`POST ${ORIGIN}/oid4vp/response/`)).length, 1);
   });
 
   test('claim sets must shrink strictly, at most 4 (ADR-0008 section 5): "share less" can never add a field', async () => {
@@ -277,6 +294,11 @@ describe('GĐ6 review: who the wallet says is asking, what it shows, storage fai
     assert.deepEqual(await withPurpose({ vi: 'Ứng tuyển' }), { vi: 'Ứng tuyển' });
     for (const bad of ['x'.repeat(301), 'Ứng tuyển\u202egnàh', 'line\nbreak', '', { vi: 'a', fr: 'b' }, { vi: 'a', en: 'x'.repeat(301) }, { vi: 1 }, {}, 42]) {
       assert.equal(await withPurpose(bad), undefined, JSON.stringify(bad));
+    }
+    // F4-2: every character of UNSAFE_DISPLAY_TEXT (separators, zero-width, BOM, soft hyphen, ALM, tags).
+    for (const c of ['\u2028', '\u2029', '\u200B', '\u200C', '\u200D', '\u200E', '\u200F', '\uFEFF', '\u00AD', '\u061C', '\u202E', '\u2066', '\u{E0000}', '\u{E0041}', '\u{E007F}', '\u0085', '\u0007']) {
+      assert.equal(await withPurpose(`Ứng${c}tuyển`), undefined, JSON.stringify(c));
+      assert.equal(await withPurpose({ en: `Job${c}` }), undefined, JSON.stringify(c));
     }
     // A purpose DCQL itself does not allow (string, number or object) makes the query invalid.
     const r0 = await w.wallet.presentations.resolve(qrFor(clientId, await crafted(world, verifier, (p) => (query(p).credential_sets = [{ options: [['credential']], purpose: ['a'] }]))));

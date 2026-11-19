@@ -8,7 +8,7 @@ import type { Hasher, Verifier } from '../interfaces.js';
 import { normalizeEcPublicJwk } from '../jwk.js';
 import { decodeJws, verifyJws } from '../jws.js';
 import { ErrorCodes, type ErrorCode } from '../results.js';
-import { containsReservedKey, type ParsedSdJwt } from './compact.js';
+import { containsReservedKey, jsonDepthExceeds, MAX_JSON_DEPTH, PROTOTYPE_NAMES, type ParsedSdJwt } from './compact.js';
 import { METADATA_CLAIMS, RESERVED_CLAIM_NAMES, SD_JWT_LIMITS } from './credential-types.js';
 
 export type HolderBindingResult =
@@ -40,7 +40,8 @@ async function checkDisclosures(sdJwt: ParsedSdJwt, hasher: Hasher): Promise<Hol
     if (d.array.length !== 3) return invalid('array-element disclosures are not supported');
     const [salt, name, value] = d.array;
     if (typeof salt !== 'string' || typeof name !== 'string') return invalid('disclosure salt and name must be strings');
-    if (RESERVED_CLAIM_NAMES.includes(name)) return invalid('disclosure uses a reserved name');
+    if (RESERVED_CLAIM_NAMES.includes(name) || PROTOTYPE_NAMES.includes(name)) return invalid('disclosure uses a reserved name');
+    if (jsonDepthExceeds(d.array, MAX_JSON_DEPTH)) return invalid(`disclosure nests deeper than ${MAX_JSON_DEPTH} levels`);
     if (METADATA_CLAIMS.includes(name)) return invalid('metadata claim delivered by a disclosure');
     const digest = await disclosureDigest(d.encoded, hasher);
     if (digests.has(digest)) return invalid('duplicate disclosure');

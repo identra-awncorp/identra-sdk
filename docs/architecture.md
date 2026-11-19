@@ -12,11 +12,12 @@ call the SDK (ADR-0005).
 
 | Package | Runs on | Contains | Runtime dependencies (pinned exactly) |
 |---|---|---|---|
-| `@identra/sdk-core` | Node, browser, React Native | Interfaces, JWS, X.509 chain validation, SD-JWT VC issue / present / verify, verification policy, status list, trust list, product chain, `did:jwk` | `@sd-jwt/core`, `@sd-jwt/sd-jwt-vc`, `@owf/token-status-list`, `micro-key-producer` |
+| `@identra/sdk-core` | Node, browser, React Native | Interfaces, JWS, X.509 chain validation, SD-JWT VC issue / present / verify, verification policy, status list, trust list, product chain, `did:jwk` | `@sd-jwt/core`, `@sd-jwt/sd-jwt-vc`, `@owf/token-status-list`, `micro-key-producer`, `zod` (only to set its `jitless` configuration) |
+| `@identra/sdk-core/text` | everywhere | `UNSAFE_DISPLAY_TEXT`, the one character class refused in text shown to a person (also exported by the main entry) | none |
 | `@identra/sdk-core/webcrypto` | Node, browser | `Signer` / `Verifier` / `Hasher` / `RandomSource` on `globalThis.crypto` | none |
 | `@identra/sdk-server` | Node | Key store, OpenID4VCI issuer (section 8), status list and trust list signing (section 7), OpenID4VP verifier (section 9), product-chain append check (section 10) | `@openid4vc/openid4vci`, `@openid4vc/openid4vp`, `@openid4vc/oauth2`, `dcql`, `jose` |
 | `@identra/sdk-app` | React Native, Node (simulated wallet) | `@noble` crypto adapters, JWE, `WalletKeyStore`, credential vault, backup catalogue, the wallet object: OpenID4VCI client (section 8), OpenID4VP wallet (section 9) | `@noble/curves`, `@noble/hashes`, `@noble/ciphers`, `@openid4vc/openid4vci`, `@openid4vc/openid4vp`, `@openid4vc/oauth2`, `dcql` |
-| `@identra/sdk-client` | browser | Verifier session client for web pages (create session, QR payload, poll result); the separate entry `@identra/sdk-client/product` verifies a product chain in the browser (section 10) | none (main entry); `@identra/sdk-core` (product entry) |
+| `@identra/sdk-client` | browser | Verifier session client for web pages (create session, QR payload, poll result); the separate entry `@identra/sdk-client/product` verifies a product chain in the browser (section 10) | `@identra/sdk-core/text` only (main entry); `@identra/sdk-core` (product entry) |
 
 Rules:
 
@@ -32,6 +33,15 @@ Rules:
 - Dependencies are pinned to exact versions. Licences must be MIT or Apache-2.0
   (one recorded exception: `pako`, ADR-0017).
 - IDs and salts come from `RandomSource`, never from `Date.now()` or `Math.random()`.
+- No code from strings: zod (inside `@sd-jwt/*`, `@owf/*`, `@openid4vc/*`, `dcql`)
+  compiles parsers with `new Function` unless its documented `jitless` setting is
+  on before a schema is built. `sdk-core/src/zod-config.ts` sets it, and every SDK
+  module that imports one of those libraries imports it first (`sideEffects` of
+  `sdk-core` names that file, so bundlers keep it). A test imports every entry and
+  runs issue, present, verify, status lists and a product chain under
+  `--disallow-code-generation-from-strings` with the `Function` constructor
+  instrumented: zero calls from zod. The one remaining site is cbor-x's import-time
+  probe (it catches the refusal), listed in the bundle scan.
 
 ## 2. Injected interfaces (`sdk-core`)
 
@@ -143,7 +153,7 @@ interface VerifiedCredential {          // only when steps 1–4 passed
 
 | # | `id` | What | Codes |
 |---|---|---|---|
-| 1 | `structure` | ≤ 16 384 bytes and ≤ 50 disclosures, checked before any decoding (`TOO_LARGE`). ASCII compact `<jwt>~<disclosure>~…~[<kb-jwt>]`; strict JWS; every disclosure is base64url of a JSON array; payload is a JSON object with string `iss` and `vct`, numeric `iat`, numeric `nbf` / `exp` and object `cnf` / `status` when present (shape only, nothing is trusted yet). SD shape of the payload (RFC 9901), with or without disclosures: top-level `_sd`, if present, is an array of unique 43-character base64url digests; `_sd_alg` is exactly `sha-256`, required with `_sd` (allowed alone only as `sha-256`); no key `_sd`, `_sd_alg` or `...` anywhere below the top level. Header `typ` is exactly `dc+sd-jwt`. In `verifyStoredCredential` a KB-JWT is `MALFORMED`: a stored credential never has one | `MALFORMED`, `TYP_INVALID`, `TOO_LARGE` |
+| 1 | `structure` | ≤ 16 384 bytes and ≤ 50 disclosures, checked before any decoding (`TOO_LARGE`). ASCII compact `<jwt>~<disclosure>~…~[<kb-jwt>]`; strict JWS; every disclosure is base64url of a JSON array; payload is a JSON object with string `iss` and `vct`, numeric `iat`, numeric `nbf` / `exp` and object `cnf` / `status` when present (shape only, nothing is trusted yet). SD shape of the payload (RFC 9901), with or without disclosures: top-level `_sd`, if present, is an array of unique 43-character base64url digests; `_sd_alg` is exactly `sha-256`, required with `_sd` (allowed alone only as `sha-256`); no key `_sd`, `_sd_alg` or `...` anywhere below the top level. Header `typ` is exactly `dc+sd-jwt`; the payload nests objects / arrays at most 32 levels (the payload itself is level 1). In `verifyStoredCredential` a KB-JWT is `MALFORMED`: a stored credential never has one | `MALFORMED`, `TYP_INVALID`, `TOO_LARGE` |
 | 2 | `algorithm` | Header `alg` is `ES256` | `ALG_NOT_ALLOWED` |
 | 3 | `certificate_chain` | `CertificateChainValidator` (section 4) with profile `vc` and `expectedIssuerUri` = `iss`; the check carries the code of the failing chain step, and `chainChecks` lists the chain steps without details | `CERT_CHAIN_MALFORMED`, `CERT_CHAIN_UNTRUSTED`, `CERT_NOT_YET_VALID`, `CERT_EXPIRED`, `CERT_CONSTRAINT_INVALID`, `CERT_KEY_NOT_ALLOWED`, `ISSUER_MISMATCH` |
 | 4 | `signature` | Issuer signature with the leaf key | `SIGNATURE_INVALID` |
@@ -151,7 +161,7 @@ interface VerifiedCredential {          // only when steps 1–4 passed
 | 6 | `credential_type` | `vct` is in `supportedVcts` | `VCT_UNSUPPORTED` |
 | 7 | `issuer_trust` | `trustRegistry.lookup(fingerprint, now)` returns an entry with `mucDich` `vc`, `maToChuc` equal to the leaf `organizationIdentifier`, `vct` containing the credential `vct`, and for product events `congDoan` containing the event's `cong_doan`. `TrustListUnavailableError` is `TRUST_LIST_UNAVAILABLE`; any other failure (null, mismatch, other exception) is `ISSUER_NOT_TRUSTED` | `ISSUER_NOT_TRUSTED`, `TRUST_LIST_UNAVAILABLE` |
 | 8 | `status` | Only when steps 6 and 7 passed, otherwise `SKIPPED` and the `StatusChecker` is not called (no request on behalf of an untrusted issuer, nor for a credential of a type the caller does not support). Rules below, then the checker's answer: `valid` passes, `revoked` / `suspended` map to their codes, anything else or an exception is `STATUS_UNAVAILABLE` | `REVOKED`, `SUSPENDED`, `STATUS_UNAVAILABLE` |
-| 9 | `holder_binding` | Always listed by `verifyPresentation`; listed by `verifyStoredCredential` when the compact carries disclosures. Disclosures (ADR-0008 §6), any failure `DISCLOSURE_INVALID`: a top-level `_sd` exists; each disclosure is `[salt, name, value]` with string salt and name (array-element disclosures are refused); name not `_sd`, `...`, `_sd_alg` nor a metadata claim (`iss`, `vct`, `iat`, `nbf`, `exp`, `cnf`, `status`); no duplicate disclosure; digest referenced by the top-level `_sd`; no two disclosures with one name; no clash with a visible payload claim; no `_sd`, `_sd_alg` or `...` key inside a disclosed value. In `verifyPresentation`, the KB-JWT, any failure `KB_INVALID`: present and at most 4 096 bytes; credential has a valid P-256 `cnf.jwk`; header `typ` `kb+jwt` and `alg` `ES256`; signature by `cnf.jwk`; `sd_hash` = base64url(SHA-256(`<jwt>~<disclosures>~`)) recomputed by the verifier; `iat` within [now − 300 s − 60 s, now + 60 s] (both ends inclusive); `exp`, when present, a number > now − 60 s; `nbf`, when present, a number ≤ now + 60 s. Then `nonce` (`NONCE_MISMATCH`), then `aud` (`AUD_MISMATCH`), so an unsigned KB-JWT never yields a mismatch | `DISCLOSURE_INVALID`, `KB_INVALID`, `NONCE_MISMATCH`, `AUD_MISMATCH` |
+| 9 | `holder_binding` | Always listed by `verifyPresentation`; listed by `verifyStoredCredential` when the compact carries disclosures. Disclosures (ADR-0008 §6), any failure `DISCLOSURE_INVALID`: a top-level `_sd` exists; each disclosure is `[salt, name, value]` with string salt and name (array-element disclosures are refused); name not `_sd`, `...`, `_sd_alg`, `__proto__`, `constructor`, `prototype` nor a metadata claim (`iss`, `vct`, `iat`, `nbf`, `exp`, `cnf`, `status`); the disclosure array nests at most 32 levels (it is level 1); no duplicate disclosure; digest referenced by the top-level `_sd`; no two disclosures with one name; no clash with a visible payload claim; no `_sd`, `_sd_alg` or `...` key inside a disclosed value. In `verifyPresentation`, the KB-JWT, any failure `KB_INVALID`: present and at most 4 096 bytes; credential has a valid P-256 `cnf.jwk`; header `typ` `kb+jwt` and `alg` `ES256`; signature by `cnf.jwk`; `sd_hash` = base64url(SHA-256(`<jwt>~<disclosures>~`)) recomputed by the verifier; `iat` within [now − 300 s − 60 s, now + 60 s] (both ends inclusive); `exp`, when present, a number > now − 60 s; `nbf`, when present, a number ≤ now + 60 s. Then `nonce` (`NONCE_MISMATCH`), then `aud` (`AUD_MISMATCH`), so an unsigned KB-JWT never yields a mismatch | `DISCLOSURE_INVALID`, `KB_INVALID`, `NONCE_MISMATCH`, `AUD_MISMATCH` |
 | 10 | `product_chain` | Only in `verifyProductChain` (section 10), listed last for every event (alone at index 3 and later); `SKIPPED` when steps 1–4 failed. The event is a product event of the product being viewed, at its stage position, linked by `prev` to the event before it as received, with a `thoi_diem` that is a valid ISO instant, not later than its own `iat` + 60 s and not earlier than the previous valid step; the five claims are strings of 1–500 characters (`MALFORMED` otherwise) | `CHAIN_BROKEN`, `MALFORMED` |
 
 Other codes: `CLIENT_ID_MISMATCH`, `VERIFIER_NOT_TRUSTED` (wallet checking a
@@ -176,6 +186,9 @@ integer, and `uri` must be exactly `<iss>/status/<n>` with `n` matching
 platform `URL`, so `..`, `%2e`, `\`, whitespace, query, fragment, userinfo, port
 and case variants never reach the checker. Anything else is
 `STATUS_UNAVAILABLE` without a network call. The issuer enforces the same form.
+The wallet does not treat that `STATUS_UNAVAILABLE` as "a list was unreachable":
+a missing or malformed status reference (or an `idx` outside the list) is
+`CREDENTIAL_INVALID` at receipt and `invalid` on refresh (section 8).
 
 Known limitation: no rule ties a credential's `iat` to its certificate's
 validity or to the 12-month signing window of ADR-0015 §14. A key stolen after
@@ -193,7 +206,8 @@ nothing). The issuer refuses a signer without `x5c` [leaf, issuing CA], an
 `__proto__` / `constructor` / `prototype` / `_sd` / `_sd_alg` / `...` / metadata
 names, values JSON cannot carry unchanged (undefined, functions, symbols,
 bigints, non-finite numbers, non-plain objects, cycles; reserved keys at any
-depth), more than 50 disclosable claims, and a result larger than 16 384 bytes.
+depth; more than 31 levels of nesting, so payload and disclosure stay within the
+verifier's 32), more than 50 disclosable claims, and a result larger than 16 384 bytes.
 
 ## 4. X.509 (ADR-0015 §7, §14, §15)
 
@@ -362,7 +376,7 @@ empty.
   `{ ok: true, … }` or `{ ok: false, reason, detail }` and never throw for bad input.
   In order: size cap (`too_large`); strict JWS (`malformed`); `typ` exact (`typ`);
   `alg` ES256 (`alg`); `x5c` with profile `status` / `trust-list` (`chain`); signature
-  with the leaf key (`signature`); numeric `iat` and `exp` present, `ttl` a positive
+  with the leaf key (`signature`); an integer `iat` and a numeric `exp` present, `ttl` a positive
   integer if present, `exp − iat` ≤ 86 460 s (`claims`); `iat` ≤ now + 60 s
   (`not_yet_valid`); `exp` > now − 60 s (`expired`). Then for a status list: `sub` =
   `uri` (`claims`); the signer fingerprint is in the trust list with purpose
@@ -384,10 +398,13 @@ empty.
   (`StatusChecker`): refuses a non-https `uri` and an `idx` outside the list without a
   request; the injected fetch decides which hosts are reachable at all (the wallet
   admits only `/status/<n>` URLs, the server answers only its own lists and refuses
-  every other status URL itself); `GET` with `timeoutMs: 5000` and `maxBytes`,
-  HTTP 200 only; caches per `uri` by the rules
-  of section 5 (a list is verified for any trusted `status` signer whose organisation
-  matches its trust list entry); every answer re-checks the signer against the trust
+  every other status URL itself); `GET` with `timeoutMs: 5000` and `maxBytes`
+  (compared with the UTF-8 byte length of the body), HTTP 200 only; caches per
+  (issuer organisation, `uri`) by the rules of section 5: a list is verified,
+  cached and recorded in `seen` (key `iat:<uri>`) only when its trusted `status`
+  signer belongs to the organisation the caller asked about, so another trusted
+  organisation's list served at that URI (even with a later `iat`) never displaces
+  or blocks the issuer's own; every answer re-checks the signer against the trust
   list and against the caller's issuer organisation. Every failure is `'unavailable'`.
 - `createSignedTrustListRegistry({ url, fetch, verifier, chainValidator, clock, maxAgeSeconds?, seen? })`
   (`TrustRegistry`): `lookup(fingerprint, at = clock.now())` gives the entry with the
@@ -406,8 +423,10 @@ empty.
   `orgs/<name>/<purpose>.key.pem` + `.chain.pem` (purpose `vc` is the file `vc` or
   `vc-product`, exactly one of them), `trust-list-signer/trust-list.key.pem` +
   `.cert.pem`, `root.cert.pem` (+ `root2.cert.pem`). Names are lower-case words
-  joined by hyphens; a key file is opened with `O_NOFOLLOW` and must be a regular
-  file without group or other permissions (checked on the open descriptor); at load
+  joined by hyphens; an organisation directory must not be a symbolic link; a key
+  file is opened with `O_NOFOLLOW | O_NONBLOCK` (a FIFO is refused at once instead
+  of hanging start-up) and must be a regular file without group or other
+  permissions (checked on the open descriptor); at load
   the chain must pass the core validator for the purpose's profile against the
   store's own roots at the current time (for `vc`, against the leaf's only SAN URI),
   and the key must match the leaf; keys are imported non-extractable.
@@ -419,7 +438,11 @@ empty.
   `{ uri, n, idx }`;
   when the draws fail it moves to list `n + 1` (created), and throws
   `StatusListFullError` only when that fails too. The current list number is kept
-  in memory and starts at 1 after a restart. `setStatus(issuer, n, idx, status,
+  in memory; after a start it is the highest stored list of the issuer, read once
+  per issuer from the optional `storage.highestList(issuer)` (Postgres: `SELECT
+  max(n) … WHERE issuer = $1`; null when there is none) or, without it, found by
+  probing `load` upward (lists exist without gaps from 1: doubling steps, then
+  bisection, about 2·log2(n) loads). `setStatus(issuer, n, idx, status,
   { storage }?)` runs on `storage` instead of the service's when given (a storage
   bound to the caller's database transaction), requires a reserved index
   (`StatusIndexNotAllocatedError`), uses `storage.save(…, expectedVersion)`
@@ -474,6 +497,10 @@ Known limitations:
   an older list still inside its 24 h, or a list of a replaced trust-list signer
   until that certificate expires, by an attacker who controls the connection
   (ADR-0019, "Giới hạn còn lại").
+- A server clock stepped back by D seconds delays the publication of revocations
+  by up to D: a new list's `iat` must exceed the last one signed (`lastIat + 1`)
+  and may run at most 5 s ahead of the clock, so the held token is served until
+  the clock catches up.
 
 ## 8. Issuance: OpenID4VCI 1.0, pre-authorized code (GĐ5)
 
@@ -537,7 +564,12 @@ createCredentialIssuer({
 `HttpRequest` is `{ headers /* lower-case names */, body /* raw text */ }`,
 `HttpResponse` is `{ status, headers, body /* text */ }`, sent unchanged. Bad input
 never throws; it gets the OAuth error of the specification with a fixed
-description of ours. A failing dependency (state store, callback, signer) throws.
+description of ours. A failing dependency (state store, callback, signer) throws,
+except a state store failure before anything is spent (at the token step: before
+the offer is taken; at the credential step: up to and including the token take),
+which is answered `503 temporarily_unavailable` with `Retry-After: 1`: the same
+request may be sent again, and the wallet then keeps its token and reports
+`retryable: true`.
 
 - Metadata: issuer identifier with a path (well-known path insertion);
   `nonce_endpoint`; `credential_request_encryption` (one ECDH-ES key with `kid`)
@@ -557,8 +589,10 @@ description of ours. A failing dependency (state store, callback, signer) throws
   code and `tx_code` present (`invalid_request`).
   Unknown, expired, used code or wrong PIN: `invalid_grant`, identical. Each
   attempt is counted (`increment`) before the comparison; attempt 6 and later
-  are refused unseen, a wrong 5th attempt destroys the offer. The code is then
-  `take`n: of concurrent requests with the right PIN exactly one gets a token.
+  are refused unseen, a wrong 5th attempt destroys the offer. The offer is then
+  `take`n, and after it the code: of concurrent requests with the right PIN exactly
+  one gets a token, and a failure between the two leaves no offer whose code is
+  gone (the next attempt is `OFFER_EXPIRED`, not a wrong PIN forever).
   Access token: JWS `typ: at+jwt`, `kid`, `iss` = `aud` = issuerUri, `iat`, `exp`
   (300 s), random `jti`; one credential per token. Token responses carry
   `Cache-Control: no-store` and `Pragma: no-cache`.
@@ -619,7 +653,7 @@ passed down as `timeoutMs`), a 3xx is refused (never followed), response size
 capped (`maxBytes` per call, never above the guard's ceiling: offer, metadata,
 credential response and request object 64 KB, token and nonce responses and
 the presentation response 16 KB, trust list 256 KB, status list 128 KB;
-`Content-Length` first, then the text read), both passed down to the app's
+`Content-Length` first, then the UTF-8 byte length of the text read), both passed down to the app's
 fetch, which must abort the request at `timeoutMs` and stop reading at
 `maxBytes` (the guard's own timer cannot stop a transfer; HttpFetch contract).
 Hosts: https only, never an IP literal, `localhost` / `*.localhost`, a name
@@ -644,10 +678,12 @@ already reduced to `<iss>/status/<n>`).
   issuer and refuses a plain response) → exactly one credential string
   (`ISSUER_ERROR`) → `verifyStoredCredential` passes completely, or fails ONLY
   because the trust list (`issuer_trust` `TRUST_LIST_UNAVAILABLE`, `status`
-  `SKIPPED`) or the status list (`STATUS_UNAVAILABLE`) could not be read — then
-  the credential is kept with status `unknown` and `refreshStatus` settles it
-  later (`CREDENTIAL_INVALID` with `checks` for anything else, an untrusted
-  issuer included) → `iss` = the offer's issuer (`ISSUER_MISMATCH`) → `vct` = the
+  `SKIPPED`) or the status list (`STATUS_UNAVAILABLE`) could not be read, and the
+  credential carries a well-formed status reference (`<iss>/status/<n>`, `idx`
+  inside the list) — then the credential is kept with status `unknown` and
+  `refreshStatus` settles it later; `issuerName` is then null when the trust list
+  was the one missing (`CREDENTIAL_INVALID` with `checks` for anything else, an
+  untrusted issuer and a missing or malformed status reference included) → `iss` = the offer's issuer (`ISSUER_MISMATCH`) → `vct` = the
   configuration's → `cnf.jwk` thumbprint = the new key's (`CNF_MISMATCH`) → every
   claim of the type (`REQUIRED_CLAIMS`) is exactly one disclosure with a non-empty
   string value and absent from the plain payload, so it can be withheld
@@ -669,7 +705,9 @@ already reduced to `<iss>/status/<n>`).
   `retryable` says whether the same offer can still complete: the PIN was wrong
   and the offer exists, the PIN was missing, a usable token is held, a no-answer
   token request, or a credential waits to be stored; otherwise a new offer is
-  needed. `retryable` does NOT say whether the PIN is still needed;
+  needed; a `503` from the issuer (a temporary failure before it spent anything)
+  is retryable too, at the token step and at the credential step (the token is
+  kept). `retryable` does NOT say whether the PIN is still needed;
   `codeRedeemed` does, on every failure and as the read-only `offer.codeRedeemed`
   (so a UI can decide whether to ask for the PIN before calling `accept` again):
   true once the token step succeeded for this offer (the wallet holds or held a
@@ -684,13 +722,17 @@ already reduced to `<iss>/status/<n>`).
   answer was lost, the code is spent and that `accept` is `OFFER_EXPIRED`,
   `retryable: false` (the issuer answers `invalid_grant` and no longer serves the
   offer). The wallet cannot tell these apart before trying.
+- `get` (and the presentation matches) give `issuerName` only from a passing
+  `issuer_trust` check of the stored credential (chain, signature, purpose `vc`,
+  the leaf's organisation, the entry's `vct`; no status list is requested), else null.
 - `remove` deletes the key first, then the row (`vault.removeWithKey`): a row
   without its key is detectable, a key without its row is not; calling it again
   completes an interrupted removal.
 - `refreshStatus` re-runs `verifyStoredCredential` and returns `{ status,
   checks, checkedAt, lastValidAt }`: `valid`, `revoked`, `suspended`, `unknown`
   ONLY when the sole failures are `STATUS_UNAVAILABLE` / `TRUST_LIST_UNAVAILABLE`
-  (try again when online; ADR-0013 section 4), else `invalid` (issuer no longer
+  and the status reference is well-formed (try again when online; ADR-0013
+  section 4), else `invalid` (issuer no longer
   trusted, certificate expired, …). Cached in the vault row; the column says
   `unavailable` for `unknown` and needs the `invalid` value in its CHECK
   constraint (`CREDENTIALS_TABLE_DDL`; an existing table must be recreated).
@@ -725,6 +767,10 @@ Known limitations:
 - Server-side key material (access-token key, request-encryption key, jose's
   ephemeral keys and IVs) comes from WebCrypto, not from the injected
   `RandomSource`; identifiers, codes, PINs, nonces and PIN keys do.
+- The issuer keys (access-token key, request-encryption key, PIN key) live in
+  process memory, generated at start: several server replicas cannot share one
+  state store, because a token, an encrypted request or a PIN of one replica is
+  unusable on another. Run one issuer process (or pin each offer's traffic to one).
 
 ## 9. Presentation: OpenID4VP 1.0, cross-device, `direct_post.jwt` (GĐ6)
 
@@ -794,13 +840,15 @@ createPresentationVerifier({
   `holder_binding` / `TOO_MANY_ATTEMPTS`, so a flood cannot burn CPU
   indefinitely (it can deny that one session, as answering first already could).
   Otherwise `query` runs: `dcql` evaluates the VERIFIED claims, the first
-  satisfied claim set wins (`QUERY_NOT_SATISFIED` otherwise); a proven holder
+  satisfied claim set wins (`QUERY_NOT_SATISFIED` otherwise, and also when a claim
+  of that set is not a non-empty string); a proven holder
   whose credential fails a later check (revoked, untrusted issuer, query)
   finalises the session as `failed` with its checks. Finalising: the open marker
   is `take`n (exactly once: of concurrent responses one result is stored, the
   others get 400), the result is written — if that write fails the marker is put
   back, so the session can still complete — then the session key and the request
-  record are deleted. The stored result is `{ ok, checks: [{ id, ok, code }],
+  record are deleted (a failure of this cleanup is ignored: the result stands, the
+  records expire by their TTL). The stored result is `{ ok, checks: [{ id, ok, code }],
   claims?, issuer?, verifiedAt }`: claims and issuer only when ok, claims = the
   string claims of the satisfied claim set only; any other disclosed claim is
   dropped, not stored and not a failure. Answer `200 {}`.
@@ -837,8 +885,9 @@ wallet.presentations.decline(request) → { ok: true } | WalletFailure   // loca
   (`CLIENT_ID_MISMATCH`); `response_mode` `direct_post.jwt`, `response_type`
   `vp_token`, `aud` `https://self-issued.me/v2`; `response_uri` https on the
   QR's origin (`URL_NOT_ALLOWED`); `nonce` ≥ 16 characters; `exp` present and at
-  most 600 s after min(`iat`, now), `iat` ≤ now + 60 s; `exp` > now − 60 s
-  (`REQUEST_EXPIRED`); exactly one ECDH-ES encryption key, a valid on-curve P-256
+  most 600 s after min(`iat`, now), `iat` ≤ now + 60 s; `exp` > now
+  (`REQUEST_EXPIRED`, decided before the library, which allows no skew there and
+  would refuse it with a generic error; `submit` refuses an expired request anyway); exactly one ECDH-ES encryption key, a valid on-curve P-256
   public JWK; `A256GCM` (preferred) or `A128GCM`; exactly one `dc+sd-jwt`
   credential query, without `multiple`, whose claims are single top-level names
   without `values`; `credential_sets` absent or exactly one set with exactly one
@@ -857,8 +906,10 @@ wallet.presentations.decline(request) → { ok: true } | WalletFailure   // loca
   `{ trusted: false }` and `warning: VERIFIER_NOT_TRUSTED` (red warning,
   ADR-0011 point 3); no trust list → `TRUST_LIST_UNAVAILABLE` (fail closed).
 - Purpose: returned only for a trusted verifier, and only when it is a string or
-  `{ vi?, en? }` of strings of at most 300 characters without control or
-  bidirectional characters; otherwise dropped (a purpose DCQL itself refuses
+  `{ vi?, en? }` of strings of at most 300 characters without any character of
+  `UNSAFE_DISPLAY_TEXT` (`sdk-core`; the same class the client uses for every
+  text it shows): C0 / C1 controls, U+00AD, U+061C, U+200B–200F, U+2028–202E,
+  U+2066–2069, U+FEFF and the tag block U+E0000–E007F; otherwise dropped (a purpose DCQL itself refuses
   makes the request `REQUEST_INVALID`).
 - Matching: `dcql` over the vault's credentials of the query's `vct` values (the
   claims are the stored disclosures); per credential the satisfiable claim sets
@@ -898,6 +949,9 @@ Known limitations:
   `credential_sets` other than the single-option purpose carrier are refused by
   the wallet (`REQUEST_INVALID`); the Identra scenarios use none.
 - `purpose` is the verifier's own text (sanitised, trusted verifiers only).
+- Presenting the same credential to two verifiers is linkable: both see the same
+  issuer signature, status index and `cnf` key (ADR-0001 says so). Batch issuance
+  (several credentials with distinct keys and indexes) is planned for later.
 
 ## 10. Product chain (GĐ6b, ADR-0012)
 
@@ -1008,7 +1062,8 @@ interface ProductEventView { congDoan; thoiDiem; diaDiem; moTa; maSanPham: strin
   `null` and no checks for a list-level code.
 
 `sdk-client/product` (separate entry; the main entry imports only types from
-`sdk-core`, and a bundle test keeps it that way):
+`sdk-core` and `UNSAFE_DISPLAY_TEXT` from `@identra/sdk-core/text`, and a bundle
+test keeps it that way):
 `createProductVerifier({ apiBaseUrl, canonicalApiOrigin = 'https://api-identra.awncorp.vn',
 rootCertificates, fetch?, now? })` → `{ load(gtin, serial) }`. One chain validator
 (pinned roots), signed trust list registry (`<canonical>/trust-list`) and status
@@ -1016,9 +1071,11 @@ checker per verifier, on `createMappedFetch(canonical → apiBaseUrl)` over a
 browser `HttpFetch` that enforces `timeoutMs` over the whole exchange, a body cap
 of 20 × 16 384 + 4 096 bytes, `redirect: 'error'`, `credentials: 'omit'`,
 `referrerPolicy: 'no-referrer'`, `cache: 'no-store'`. The registry and the checker
-get a fetch that refuses, before any mapping, every URL other than
-`<canonical>/trust-list` and `<canonical>/issuers/…`: a trusted certificate whose
-SAN (and so `iss` and status URI) names another host causes no request there
+get a fetch that refuses, before any mapping, every URL other than exactly
+`<canonical>/trust-list` and `<canonical>` followed by
+`^/issuers/[a-z0-9-]{1,64}/status/[1-9][0-9]{0,8}$`: a trusted certificate whose
+SAN (and so `iss` and status URI) names another host, or another path of the API
+origin (`/../`, `%2e%2e`, upper case, a query), causes no request there
 (`STATUS_UNAVAILABLE`). `load` GETs `<canonical>/v1/products/<gtin>/<serial
 percent-encoded as in the Digital Link>/events` (timeout 5 s), requires `{ gtin,
 serial, events: [], serverTime? }` echoing the request, runs `verifyProductChain`

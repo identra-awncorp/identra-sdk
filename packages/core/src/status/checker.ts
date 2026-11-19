@@ -37,18 +37,23 @@ export function createStatusListChecker(options: {
     if (typeof fn !== 'function') throw new TypeError(`${name} is required`);
   }
 
-  // Keyed by URI: a token is verified once (signer trusted for `status`, organisation matching its
-  // trust list entry); each caller then compares the signer's organisation with its own issuer.
+  // Keyed by [issuer organisation, URI]: a token is verified, cached and recorded in `seen` only for
+  // the organisation the caller asked about, so a list signed by another trusted organisation at
+  // this URI (which could carry a later iat) never displaces or blocks the issuer's own lists.
+  const keyOf = (maToChuc: string, uri: string) => JSON.stringify([maToChuc, uri]);
+  const parseKey = (key: string) => JSON.parse(key) as [string, string];
   const cache = createTokenCache<HeldList>({
     clock,
     maxFreshSeconds: STATUS_LIST_MAX_FRESH_SECONDS,
     maxEntries: STATUS_CACHE_MAX_URIS,
     ...(options.maxAgeSeconds !== undefined ? { maxAgeSeconds: options.maxAgeSeconds } : {}),
     ...(seen ? { seen } : {}),
-    async load(uri, now) {
+    seenUrl: (key) => parseKey(key)[1],
+    async load(key, now) {
+      const [issuerMaToChuc, uri] = parseKey(key);
       const token = await fetchToken(httpFetch, uri, STATUS_LIST_TOKEN_MAX_BYTES, 'application/statuslist+jwt');
       if (token === null) return null;
-      const r = await verifyStatusListTokenSigned(token, { uri, issuerMaToChuc: null, chainValidator, trustRegistry, verifier, now });
+      const r = await verifyStatusListTokenSigned(token, { uri, issuerMaToChuc, chainValidator, trustRegistry, verifier, now });
       if (!r.ok) return null;
       return { value: { list: r.list, signer: r.signer }, token, iat: r.iat, exp: r.exp, ...(r.ttl !== undefined ? { ttl: r.ttl } : {}) };
     },
@@ -60,7 +65,7 @@ export function createStatusListChecker(options: {
         if (typeof ref?.uri !== 'string' || !ref.uri.startsWith('https://')) return 'unavailable';
         if (!Number.isSafeInteger(ref.idx) || ref.idx < 0 || ref.idx >= STATUS_LIST_ENTRIES) return 'unavailable';
         if (typeof issuer?.maToChuc !== 'string' || issuer.maToChuc === '') return 'unavailable';
-        const held = await cache.get(ref.uri);
+        const held = await cache.get(keyOf(issuer.maToChuc, ref.uri));
         if (!held) return 'unavailable';
         // Re-checked on every use: the signer may have left the trust list since, and the list
         // must be signed by the organisation that issued this credential.

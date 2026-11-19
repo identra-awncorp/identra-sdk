@@ -5,7 +5,7 @@
 // signed and no key is touched. submit: presentation of exactly the chosen claim set, KB-JWT bound
 // to client_id and nonce, encrypted to the session key, POSTed to response_uri. decline: local only.
 import {
-  base64UrlDecode, claimSetsNested, createPresentation, decodeCredentialUnverified, normalizeEcPublicJwk, utf8Decode, utf8Encode,
+  base64UrlDecode, claimSetsNested, createPresentation, decodeCredentialUnverified, normalizeEcPublicJwk, UNSAFE_DISPLAY_TEXT, utf8Decode, utf8Encode,
   type EcPublicJwk, type ErrorCode,
 } from '@identra/sdk-core';
 import { encryptJwe, type JweEnc } from '../jwe.js';
@@ -78,13 +78,11 @@ function parseQr(qrText: unknown): { clientId: string; requestUri: string; origi
 }
 
 const MAX_PURPOSE_LENGTH = 300;
-// C0 and C1 controls, and the bidirectional marks and overrides that can reorder displayed text.
-const UNSAFE_TEXT = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
-const safeText = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_PURPOSE_LENGTH && !UNSAFE_TEXT.test(v);
+const safeText = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_PURPOSE_LENGTH && !UNSAFE_DISPLAY_TEXT.test(v);
 
 /**
  * The verifier's stated purpose (`credential_sets[0].purpose`) when it is a safe string or
- * `{ vi?, en? }` of safe strings (at most 300 characters, no control or bidi characters); anything
+ * `{ vi?, en? }` of safe strings (at most 300 characters, none of UNSAFE_DISPLAY_TEXT); anything
  * else is dropped, not an error.
  */
 function purposeOf(q: Record<string, unknown>): string | { vi?: string; en?: string } | undefined {
@@ -142,7 +140,9 @@ export function createPresentations(ctx: WalletContext) {
     if (p['iat'] !== undefined && (typeof p['iat'] !== 'number' || p['iat'] > t + SKEW_SECONDS)) throw new Fail(C.REQUEST_INVALID);
     // A request lives minutes, not years: exp at most 600 s after min(iat, now).
     if (p['exp'] > Math.min((p['iat'] as number | undefined) ?? t, t) + MAX_REQUEST_SECONDS) throw new Fail(C.REQUEST_INVALID);
-    if (p['exp'] <= t - SKEW_SECONDS) throw new Fail(C.REQUEST_EXPIRED);
+    // No skew here: the library refuses an exp in the past with a generic error, and submit refuses an
+    // expired request anyway, so an exp that is not in the future is REQUEST_EXPIRED, decided by us first.
+    if (p['exp'] <= t) throw new Fail(C.REQUEST_EXPIRED);
     const meta = isObject(p['client_metadata']) ? p['client_metadata'] : {};
     const keys = isObject(meta['jwks']) && Array.isArray(meta['jwks']['keys']) ? (meta['jwks']['keys'] as unknown[]).filter((k) => isObject(k) && k['alg'] === 'ECDH-ES' && (k['use'] ?? 'enc') === 'enc') : [];
     const key = keys.length === 1 ? (keys[0] as Record<string, unknown>) : null;
@@ -187,7 +187,7 @@ export function createPresentations(ctx: WalletContext) {
     } catch (e) {
       throw new Fail(vaultFailureCode(e));
     }
-    const held: { id: string; vct: string; x5c: unknown; claims: Record<string, unknown> }[] = [];
+    const held: { id: string; vct: string; compact: string; claims: Record<string, unknown> }[] = [];
     for (const row of rows) {
       let compact: string;
       try {
@@ -200,7 +200,7 @@ export function createPresentations(ctx: WalletContext) {
       }
       try {
         const d = decodeCredentialUnverified(compact);
-        held.push({ id: row.id, vct: d.payload['vct'] as string, x5c: d.header['x5c'], claims: Object.fromEntries(d.disclosures.map((x) => [x.name, x.value])) });
+        held.push({ id: row.id, vct: d.payload['vct'] as string, compact, claims: Object.fromEntries(d.disclosures.map((x) => [x.name, x.value])) });
       } catch {
         // not a compact this wallet stored: skipped
       }
@@ -211,7 +211,7 @@ export function createPresentations(ctx: WalletContext) {
     for (let i = 0; i < held.length; i++) {
       if (satisfied[i]!.length === 0) continue;
       out.push({
-        credentialId: held[i]!.id, vct: held[i]!.vct, issuerName: await issuerNameOf(ctx, held[i]!.x5c),
+        credentialId: held[i]!.id, vct: held[i]!.vct, issuerName: await issuerNameOf(ctx, held[i]!.compact),
         claimSets: satisfied[i]!.map((index) => ({ index, claims: [...claimSets[index]!] })),
       });
     }

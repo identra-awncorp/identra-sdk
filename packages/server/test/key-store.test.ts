@@ -1,7 +1,8 @@
 // createFileKeyStore against a freshly generated DEMO PKI: layout, refused names, file modes and
 // key/certificate pairing.
 import assert from 'node:assert/strict';
-import { chmodSync, copyFileSync, cpSync, mkdtempSync, symlinkSync, unlinkSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, copyFileSync, cpSync, mkdtempSync, renameSync, symlinkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -104,6 +105,23 @@ test('ambiguous or symlinked key files, extra roots', async () => {
   await assert.rejects(createFileKeyStore(dir).signer('nha-san-xuat', 'status'), /is not a regular file/);
   copyFileSync(join(dir, 'ca/issuing/ca.cert.pem'), join(dir, 'root2.cert.pem'));
   assert.equal(createFileKeyStore(dir).trustedRoots().length, 2);
+});
+
+test('F2-5: a FIFO in place of a key file is refused at once (no hang); a symlinked organisation directory is refused', async () => {
+  const dir = copy();
+  const org = join(dir, 'orgs/nha-san-xuat');
+  unlinkSync(join(org, 'status.key.pem'));
+  assert.equal(spawnSync('mkfifo', ['-m', '600', join(org, 'status.key.pem')]).status, 0);
+  // In a child process: a blocking open of a FIFO would stall the whole process, test runner included.
+  const load = `import('@identra/sdk-server').then((m) => m.createFileKeyStore(${JSON.stringify(dir)}).signer('nha-san-xuat', 'status')).then(() => console.log('loaded'), (e) => console.log(e.message))`;
+  const r = spawnSync(process.execPath, ['-e', load], { encoding: 'utf8', timeout: 10_000, cwd: new URL('.', import.meta.url).pathname });
+  assert.equal(r.signal, null, 'did not hang');
+  assert.match(r.stdout, /status\.key\.pem is not a regular file/);
+
+  const other = join(dir, 'elsewhere');
+  renameSync(join(dir, 'orgs/kiem-dinh'), other);
+  symlinkSync(other, join(dir, 'orgs/kiem-dinh'));
+  await assert.rejects(createFileKeyStore(dir).signer('kiem-dinh', 'status'), /orgs\/kiem-dinh is a symbolic link/);
 });
 
 test('at load the chain must validate for the purpose against the store\'s own roots', async () => {

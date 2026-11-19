@@ -66,6 +66,25 @@ test('StatusListFullError only when the next list fails too', async () => {
   await assert.rejects(service.allocate('truong-mau'), StatusListFullError);
 });
 
+test('after a restart allocation starts at the highest stored list, with or without storage.highestList', async () => {
+  for (const [lists, withHighest] of [[3, true], [3, false], [1, false], [13, false], [64, false]] as const) {
+    const storage = createMemoryStatusListStorage();
+    for (let n = 1; n <= lists; n++) assert.equal(await storage.save('truong-mau', n, new Uint8Array(STATUS_LIST_BYTES), null), true);
+    const tried: number[] = [];
+    const { highestList, ...plain } = storage;
+    const full: StatusListStorage = {
+      ...(withHighest ? { ...plain, highestList: highestList! } : plain),
+      // Every list but the last stored one is full.
+      reserve: async (issuer, n, idx) => (tried.push(n), n < lists ? false : storage.reserve(issuer, n, idx)),
+    };
+    const service = createStatusListService({ issuerUri, keyStore, storage: full, random: webCryptoRandom, clock: fakeClock() });
+    const got = await service.allocate('truong-mau');
+    assert.equal(got.n, lists, `${lists} lists, highestList ${withHighest}`);
+    assert.ok(tried.every((n) => n === lists), 'no draws wasted on full lists');
+  }
+  assert.equal(await createMemoryStatusListStorage().highestList!('truong-mau'), null);
+});
+
 test('an index that is not 0 is never handed out, so no credential is born revoked', async () => {
   const { service, storage } = setup(indexes(5, 6));
   const bytes = new Uint8Array(STATUS_LIST_BYTES);

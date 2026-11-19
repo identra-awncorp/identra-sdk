@@ -42,6 +42,13 @@ export interface StatusListStorage {
    */
   reserve(issuer: string, n: number, idx: number): Promise<boolean>;
   isReserved(issuer: string, n: number, idx: number): Promise<boolean>;
+  /**
+   * Optional. The highest list number that exists for the issuer, null when none does; read once per
+   * issuer after a start to find the list new credentials go to. Postgres: SELECT max(n) FROM
+   * status_list WHERE issuer = $1. Without it the service probes `load` upward (lists are created in
+   * order 1, 2, 3, … with no gaps), about 2·log2(n) loads.
+   */
+  highestList?(issuer: string): Promise<number | null>;
 }
 
 /** A revoked credential stays revoked: any later change is refused. */
@@ -116,7 +123,7 @@ export function createStatusListService(options: {
   const signedIat = new Map<string, number>();
   const reportedFuture = new Set<string>();
   const signing = new Map<string, Promise<string>>();
-  // The list new credentials go to, per issuer; starts at 1 after a restart and moves up as lists fill.
+  // The list new credentials go to, per issuer; after a start the highest stored list, then moves up as lists fill.
   const current = new Map<string, number>();
 
   const check = (issuer: string, n: number) => {
@@ -135,6 +142,32 @@ export function createStatusListService(options: {
     const created = await storage.load(issuer, n);
     if (!created) throw new Error('status list storage did not keep a new list');
     return created;
+  }
+
+  /** The highest existing list of the issuer (1 when none exists). */
+  async function highestList(issuer: string): Promise<number> {
+    if (storage.highestList) {
+      const n = await storage.highestList(issuer);
+      if (n === null) return 1;
+      if (!Number.isSafeInteger(n) || n < 1 || n > MAX_LIST_NUMBER) throw new Error('status list storage: highestList returned no list number');
+      return n;
+    }
+    // Lists exist without gaps from 1: gallop up to a missing one, then bisect between the last found and it.
+    const exists = async (n: number) => n <= MAX_LIST_NUMBER && (await storage.load(issuer, n)) !== null;
+    if (!(await exists(1))) return 1;
+    let found = 1;
+    let step = 1;
+    while (await exists(found + step)) {
+      found += step;
+      step *= 2;
+    }
+    let missing = found + step;
+    while (missing - found > 1) {
+      const mid = Math.floor((found + missing) / 2);
+      if (await exists(mid)) found = mid;
+      else missing = mid;
+    }
+    return found;
   }
 
   async function allocateIn(issuer: string, n: number): Promise<number | null> {
@@ -199,8 +232,12 @@ export function createStatusListService(options: {
       return held ? { iat: held.iat, exp: held.iat + LIFETIME_SECONDS, signerNotAfter: held.signerNotAfter } : null;
     },
     async allocate(issuer) {
-      const n = current.get(issuer) ?? 1;
-      check(issuer, n);
+      check(issuer, 1);
+      let n = current.get(issuer);
+      if (n === undefined) {
+        n = await highestList(issuer);
+        current.set(issuer, n);
+      }
       for (const list of n < MAX_LIST_NUMBER ? [n, n + 1] : [n]) {
         const idx = await allocateIn(issuer, list);
         if (idx !== null) {
@@ -285,6 +322,15 @@ export function createMemoryStatusListStorage(): StatusListStorage & { reservedC
     async isReserved(issuer, n, idx) {
       await tick();
       return set(`${issuer}/${n}`).has(idx);
+    },
+    async highestList(issuer) {
+      await tick();
+      let max: number | null = null;
+      for (const key of lists.keys()) {
+        const slash = key.lastIndexOf('/');
+        if (key.slice(0, slash) === issuer) max = Math.max(max ?? 0, Number(key.slice(slash + 1)));
+      }
+      return max;
     },
     reservedCount: (issuer, n) => reserved.get(`${issuer}/${n}`)?.size ?? 0,
   };

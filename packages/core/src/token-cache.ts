@@ -9,6 +9,7 @@
 //   when it is the identical token; with `seen`, the last accepted iat survives a restart;
 // - concurrent reads of one key share one in-flight load; at most maxEntries keys are held, and an
 //   unexpired entry is never evicted to make room (the new token is then used but not cached).
+import { utf8Encode } from './encoding.js';
 import type { Clock, HttpFetch } from './interfaces.js';
 import { CLOCK_SKEW_MS } from './x509/chain.js';
 
@@ -54,7 +55,8 @@ export async function fetchToken(httpFetch: HttpFetch, url: string, maxBytes: nu
   const res = await httpFetch(url, { method: 'GET', headers: { accept }, timeoutMs: FETCH_TIMEOUT_MS, maxBytes });
   if (res.status !== 200) return null;
   const body = await res.text();
-  return typeof body === 'string' && body.length <= maxBytes ? body : null;
+  // Bytes, not UTF-16 units: a text of n units can be up to 3n bytes.
+  return typeof body === 'string' && body.length <= maxBytes && utf8Encode(body).length <= maxBytes ? body : null;
 }
 
 export async function readSeen(seen: SeenStore | undefined, key: string): Promise<number | null> {
@@ -83,6 +85,8 @@ export function createTokenCache<T>(o: {
   maxAgeSeconds?: number;
   maxEntries: number;
   seen?: SeenStore;
+  /** The URL whose `iat:<url>` record in `seen` belongs to `key`; default the key itself. */
+  seenUrl?: (key: string) => string;
 }): TokenCache<T> {
   if (o.maxAgeSeconds !== undefined && !(Number.isSafeInteger(o.maxAgeSeconds) && o.maxAgeSeconds >= 0)) {
     throw new TypeError('maxAgeSeconds must be a non-negative integer');
@@ -115,7 +119,8 @@ export function createTokenCache<T>(o: {
   }
 
   async function reload(key: string): Promise<Held<T> | null> {
-    const floor = await readSeen(o.seen, `iat:${key}`);
+    const seenKey = `iat:${o.seenUrl ? o.seenUrl(key) : key}`;
+    const floor = await readSeen(o.seen, seenKey);
     let loaded: CachedToken<T> | null;
     try {
       loaded = await o.load(key, o.clock.now());
@@ -126,7 +131,7 @@ export function createTokenCache<T>(o: {
     if (!loaded || !accepts(current, loaded, floor)) return current ?? null;
     const entry: Held<T> = { ...loaded, fetchedAtMs: nowMs() };
     store(key, entry);
-    if (floor === null || loaded.iat > floor) await writeSeen(o.seen, `iat:${key}`, loaded.iat);
+    if (floor === null || loaded.iat > floor) await writeSeen(o.seen, seenKey, loaded.iat);
     return entry;
   }
 

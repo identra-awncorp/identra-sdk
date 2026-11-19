@@ -84,6 +84,22 @@ export function parseSdJwt(compact: unknown): ParseSdJwtResult {
 }
 
 const RESERVED_KEYS = ['_sd', '_sd_alg', '...'];
+/** Names that would reach an object's prototype machinery when a verifier or consumer copies claims. */
+export const PROTOTYPE_NAMES: readonly string[] = Object.freeze(['__proto__', 'constructor', 'prototype']);
+/** Nesting levels allowed in the payload and in each disclosure array (`{}` and `[]` are one level). */
+export const MAX_JSON_DEPTH = 32;
+
+/** True when `root` nests arrays / objects more than `max` levels deep. Iterative: depth is attacker-chosen. */
+export function jsonDepthExceeds(root: unknown, max: number): boolean {
+  const stack: [unknown, number][] = [[root, 0]];
+  while (stack.length > 0) {
+    const [v, depth] = stack.pop()!;
+    if (typeof v !== 'object' || v === null) continue;
+    if (depth >= max) return true;
+    for (const e of Array.isArray(v) ? v : Object.values(v)) stack.push([e, depth + 1]);
+  }
+  return false;
+}
 const DIGEST = /^[A-Za-z0-9_-]{43}$/;
 
 /** True when any object reachable from `roots` (the roots included) has a key `_sd`, `_sd_alg` or `...`. Iterative: depth is attacker-chosen. */

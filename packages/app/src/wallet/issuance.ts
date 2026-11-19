@@ -3,7 +3,10 @@
 // accept: token (PIN) -> c_nonce -> new wallet key -> proof -> encrypted credential request ->
 // the credential is verified as the wallet would verify it to present it -> vault. Any failure after
 // the key was created deletes the key again, and nothing is saved.
-import { decodeCredentialUnverified, DIPLOMA_CLAIMS, jwkThumbprint, VCT, verifyStoredCredential, type Check, type EcPublicJwk, type HttpFetch } from '@identra/sdk-core';
+import {
+  decodeCredentialUnverified, DIPLOMA_CLAIMS, isStatusListUri, jwkThumbprint, STATUS_LIST_ENTRIES, VCT, verifyStoredCredential, type CredentialVerificationResult,
+  type EcPublicJwk, type HttpFetch,
+} from '@identra/sdk-core';
 import { generateSecretKey, P256, uncompressedPointToJwk } from '../crypto/noble.js';
 import { Fail, keyFailureCode, WalletErrorCodes as C, type WalletFailure } from './errors.js';
 import { guardFetch, httpsOrigin, PROTOCOL_MAX_BYTES, PROTOCOL_TIMEOUT_MS } from './fetch.js';
@@ -154,14 +157,22 @@ function checkMetadata(session: IssuerSession, origin: string, supportedVcts: re
 /**
  * True when every failing check is only a list that could not be read: issuer_trust with
  * TRUST_LIST_UNAVAILABLE (and status SKIPPED because of it), or status with STATUS_UNAVAILABLE.
- * Chain, signature, validity, type and disclosures must all have passed.
+ * Chain, signature, validity, type and disclosures must all have passed, and the credential must
+ * carry a well-formed status reference (`<iss>/status/<n>`, idx inside the list): a missing or
+ * malformed one is not a list that was unreachable, and trying again would never settle it.
  */
-export function onlyListsUnavailable(checks: Check[]): boolean {
+export function onlyListsUnavailable(result: Pick<CredentialVerificationResult, 'checks' | 'credential'>): boolean {
+  const c = result.credential;
+  if (!c?.status || !isStatusListUri(c.status.uri, c.iss) || c.status.idx >= STATUS_LIST_ENTRIES) return false;
+  const { checks } = result;
   const trustListDown = checks.some((c) => c.id === 'issuer_trust' && c.code === 'TRUST_LIST_UNAVAILABLE');
   return checks.every(
     (c) => c.ok || (c.id === 'issuer_trust' && c.code === 'TRUST_LIST_UNAVAILABLE') || (c.id === 'status' && (c.code === 'STATUS_UNAVAILABLE' || (c.code === 'SKIPPED' && trustListDown))),
   );
 }
+
+/** No answer, or the issuer's 503 (a temporary failure before it spent anything): the same request may be sent again. */
+const retryLater = (f: { code: string; httpStatus: number | null }) => f.code === 'NETWORK_ERROR' || f.httpStatus === 503;
 
 function failure(e: unknown): WalletFailure {
   if (e instanceof Fail) return { ok: false, code: e.code, ...(e.checks ? { checks: e.checks } : {}) };
@@ -326,8 +337,8 @@ export function createIssuance(ctx: WalletContext) {
         state.token = { value: t.accessToken, expiresAt: ctx.clock.now().getTime() + (t.expiresIn ?? DEFAULT_TOKEN_SECONDS) * 1000 };
       } catch (e) {
         const f = failureOf(e);
-        // Unanswered: the code may still be unredeemed. Anything else from the issuer is final.
-        return f.oauthError === 'invalid_grant' ? wrongPinOrExpired(state, deps.fetch) : { ok: false, code: f.code, retryable: f.code === 'NETWORK_ERROR' };
+        // Unanswered, or 503 (the issuer spent nothing): the code may still be unredeemed. Anything else is final.
+        return f.oauthError === 'invalid_grant' ? wrongPinOrExpired(state, deps.fetch) : { ok: false, code: f.code, retryable: retryLater(f) };
       }
     }
     const accessToken = state.token!.value;
@@ -356,8 +367,9 @@ export function createIssuance(ctx: WalletContext) {
         credentials = await requestCredential(state.session, { configurationId: state.configurationId, accessToken, proof, responseKey }, deps);
         state.token = null;
       } catch (e) {
-        // No answer at all: the same token may be tried again. Any answer from the issuer is definitive.
-        if (failureOf(e).code !== 'NETWORK_ERROR') state.token = null;
+        // No answer at all, or 503 (the issuer did not spend the token): the same token may be tried
+        // again. Any other answer from the issuer is definitive.
+        if (!retryLater(failureOf(e))) state.token = null;
         throw new Fail(failureOf(e).code);
       }
       if (!Array.isArray(credentials) || credentials.length !== 1 || !isObject(credentials[0]) || typeof credentials[0]['credential'] !== 'string') throw new Fail(C.ISSUER_ERROR);
@@ -370,7 +382,7 @@ export function createIssuance(ctx: WalletContext) {
       });
       const credential = result.credential;
       // A credential that verified except for a list that could not be read is kept as `unknown`.
-      const listsDown = !result.ok && credential !== undefined && onlyListsUnavailable(result.checks);
+      const listsDown = !result.ok && onlyListsUnavailable(result);
       if (!credential || (!result.ok && !listsDown)) throw new Fail(C.CREDENTIAL_INVALID, result.checks);
       if (credential.iss !== state.issuerUri) throw new Fail(C.ISSUER_MISMATCH);
       if (credential.vct !== state.vct) throw new Fail(C.ISSUER_ERROR);

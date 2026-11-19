@@ -69,6 +69,8 @@ async function readCapped(res: Response, max: number): Promise<string> {
   return new TextDecoder().decode(bytes);
 }
 
+const STATUS_LIST_PATH = /^\/issuers\/[a-z0-9-]{1,64}\/status\/[1-9][0-9]{0,8}$/;
+
 /**
  * The HttpFetch contract on the browser fetch: `timeoutMs` covers the whole exchange including the
  * body, bodies above PRODUCT_RESPONSE_MAX_BYTES are refused, no redirect, no cookies, no referrer,
@@ -126,9 +128,12 @@ export function createProductVerifier(options: {
   // Identifiers stay canonical; only the network access goes to apiBaseUrl (validated here).
   const http = createMappedFetch(browserHttpFetch(fetchFn), { [canonical]: options.apiBaseUrl });
   // Trust list and status lists come only from the canonical API, whatever a trusted certificate's
-  // SAN (and so a credential's iss and status uri) says: nothing else is ever requested.
+  // SAN (and so a credential's iss and status uri) says: exactly these two forms, nothing else (no
+  // `..`, `%2e%2e`, query or other path a URL parser could resolve elsewhere) is ever requested.
   const lists: HttpFetch = (url, init) =>
-    url === `${canonical}/trust-list` || url.startsWith(`${canonical}/issuers/`) ? http(url, init) : Promise.reject(new Error('not a canonical API URL'));
+    url === `${canonical}/trust-list` || (url.startsWith(`${canonical}/`) && STATUS_LIST_PATH.test(url.slice(canonical.length)))
+      ? http(url, init)
+      : Promise.reject(new Error('not a canonical API URL'));
   const verifier = webCryptoVerifier;
   const chainValidator = createCertificateChainValidator({ trustedRoots: options.rootCertificates, verifier, hasher: webCryptoHasher });
   const trustRegistry = createSignedTrustListRegistry({ url: `${canonical}/trust-list`, fetch: lists, verifier, chainValidator, clock });

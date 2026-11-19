@@ -4,7 +4,7 @@
   "description": "Platform-neutral Identra core: interfaces, JWS, X.509 chain validation, did:jwk.",
   "license": "UNLICENSED",
   "type": "module",
-  "sideEffects": false,
+  "sideEffects": ["./dist/zod-config.js"],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -17,6 +17,16 @@
       "types": "./dist/webcrypto/index.d.ts",
       "import": "./dist/webcrypto/index.js",
       "default": "./dist/webcrypto/index.js"
+    },
+    "./zod-config": {
+      "types": "./dist/zod-config.d.ts",
+      "import": "./dist/zod-config.js",
+      "default": "./dist/zod-config.js"
+    },
+    "./text": {
+      "types": "./dist/text.d.ts",
+      "import": "./dist/text.js",
+      "default": "./dist/text.js"
     }
   },
   "files": [
@@ -26,6 +36,7 @@
     "@owf/token-status-list": "0.8.0",
     "@sd-jwt/core": "0.25.0",
     "@sd-jwt/sd-jwt-vc": "0.25.0",
-    "micro-key-producer": "0.10.2"
+    "micro-key-producer": "0.10.2",
+    "zod": "4.6.7"
   }
 }

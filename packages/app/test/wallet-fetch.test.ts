@@ -24,6 +24,9 @@ test('a redirect and an oversized body (declared or actual) are ISSUER_ERROR; a 
   assert.equal(await code(guarded(answer(302, '', { location: 'https://evil.example/' }))('https://a.example/x')), 'ISSUER_ERROR');
   assert.equal(await code(guarded(answer(200, 'small', { 'content-length': '11' }))('https://a.example/x')), 'ISSUER_ERROR');
   assert.equal(await code(guarded(answer(200, '12345678901'))('https://a.example/x')), 'ISSUER_ERROR');
+  // F3-4: bytes, not UTF-16 units: 4 characters of 3 UTF-8 bytes each are 12 bytes; 10 ASCII bytes pass.
+  assert.equal(await code(guarded(answer(200, 'ỨỨỨỨ'))('https://a.example/x')), 'ISSUER_ERROR');
+  assert.equal(await code(guarded(answer(200, '1234567890'))('https://a.example/x')), 'resolved');
   assert.equal(await code(guarded(async () => Promise.reject(new TypeError('fetch failed')))('https://a.example/x')), 'NETWORK_ERROR');
   const brokenBody: HttpFetch = async () => ({ status: 200, headers: { get: () => null }, text: () => Promise.reject(new Error('reset')) });
   assert.equal(await code(guarded(brokenBody)('https://a.example/x')), 'NETWORK_ERROR');

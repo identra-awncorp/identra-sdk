@@ -161,8 +161,13 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
     if (!r.ok || !claims) return { ok: false, checks: [...checks(r.checks), { id: 'query', ok: false, code: 'SKIPPED' }], verifiedAt };
     const index = satisfiedClaimSet(queries[request.scenario]!, { vct: r.credential!.vct, claims });
     if (index === null) return { ok: false, checks: [...checks(r.checks), { id: 'query', ok: false, code: 'QUERY_NOT_SATISFIED' }], verifiedAt };
-    // Only the claims of the satisfied claim set are kept; any other disclosed claim is dropped.
-    const kept = Object.fromEntries(config.scenarios[request.scenario]!.claimSets[index]!.filter((n) => typeof claims[n] === 'string').map((n) => [n, claims[n] as string]));
+    // Only the claims of the satisfied claim set are kept; any other disclosed claim is dropped. Each
+    // of them must be a non-empty string: a set that would be stored with a claim missing is not satisfied.
+    const names = config.scenarios[request.scenario]!.claimSets[index]!;
+    if (!names.every((n) => typeof claims[n] === 'string' && claims[n] !== '')) {
+      return { ok: false, checks: [...checks(r.checks), { id: 'query', ok: false, code: 'QUERY_NOT_SATISFIED' }], verifiedAt };
+    }
+    const kept = Object.fromEntries(names.map((n) => [n, claims[n] as string]));
     return { ok: true, checks: [...checks(r.checks), { id: 'query', ok: true, code: null }], claims: kept, issuer: { ...r.credential!.issuer! }, verifiedAt };
   }
 
@@ -181,10 +186,16 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
       if (left > 0) await store.put(key('open', requestId), '1', left).catch(() => {});
       throw e;
     }
-    const session = await read<SessionRecord>(key('session', request.id));
-    if (session) await store.put(key('session', request.id), JSON.stringify(session), SESSION_KEEP_SECONDS);
-    await store.take(key('key', requestId));
-    await store.take(key('request', requestId));
+    // The result is written: a failing cleanup must not turn it into an error for the wallet. The
+    // records it would have removed expire by their TTL (the session 30 minutes after creation).
+    try {
+      const session = await read<SessionRecord>(key('session', request.id));
+      if (session) await store.put(key('session', request.id), JSON.stringify(session), SESSION_KEEP_SECONDS);
+      await store.take(key('key', requestId));
+      await store.take(key('request', requestId));
+    } catch {
+      // swallowed, see above
+    }
     return true;
   }
 

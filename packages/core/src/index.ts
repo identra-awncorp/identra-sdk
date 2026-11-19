@@ -59,6 +59,7 @@ export { createMappedFetch } from './mapped-fetch.js';
 // Product lifecycle chain (GĐ6b, docs/architecture.md section 10).
 export { formatDigitalLinkPath, formatProductCode, gs1CheckDigit, parseDigitalLinkPath, parseProductCode, type ProductCode } from './product/gs1.js';
 export { parseUtcInstant } from './sd-jwt/credential-types.js';
+export { UNSAFE_DISPLAY_TEXT } from './text.js';
 export {
   PRODUCT_CHAIN_LIMITS,
   productEventHash,

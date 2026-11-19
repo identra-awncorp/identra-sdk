@@ -84,6 +84,11 @@ const PLATFORM_PATTERNS: Record<string, RegExp> = {
   'Reflect.construct': /\bReflect\.construct\b/,
   'import(': /\bimport\(/,
   fetch: /\bfetch\(/,
+  // Code from strings (a CSP without 'unsafe-eval' refuses it): direct, called without new, or aliased.
+  'new Function': /\bnew Function\b/,
+  'Function(': /(?<![.\w]|new )Function\(/,
+  '= Function': /=\s*Function\s*;/,
+  eval: /(?<![.\w])eval\(/,
 };
 const THIRD_PARTY_PLATFORM_ACCESS: Record<string, number> = {
   'Math.random @ zod': 1, // zod's random-id helper; not reached by sdk-core
@@ -95,6 +100,11 @@ const THIRD_PARTY_PLATFORM_ACCESS: Record<string, number> = {
   // Network paths of SdJwtVcInstance.verify (status list, type metadata): sdk-core never calls verify.
   'fetch @ @owf/identity-common': 2,
   'fetch @ @sd-jwt/sd-jwt-vc': 2,
+  // cbor-x (in @owf/cose): a probe at import and record readers; not on any sdk-core path (no CBOR is decoded).
+  'new Function @ cbor-x': 2,
+  // zod's parser compiler and its probe: never run, sdk-core sets zod's `jitless` before any schema
+  // is built (src/zod-config.ts; zod-jitless.test.ts counts the Function calls at run time).
+  '= Function @ zod': 3,
 };
 
 test('no platform access from our modules in the core bundle; third-party occurrences are exactly the known ones', async () => {

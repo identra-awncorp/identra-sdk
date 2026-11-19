@@ -48,7 +48,7 @@ describe('answers', () => {
     assert.equal(w.calls.length, 0);
   });
   test('HTTP 404 / 500 / timeout / oversize / not a token, without a held copy: unavailable after one fetch each', async () => {
-    const answers: Route[] = [{ status: 404, body: '' }, { status: 500, body: await token() }, new Error('timeout after 5000 ms'), ok('a'.repeat(128 * 1024 + 1)), ok('nonsense'), { status: 201, body: await token() }];
+    const answers: Route[] = [{ status: 404, body: '' }, { status: 500, body: await token() }, new Error('timeout after 5000 ms'), ok('a'.repeat(128 * 1024 + 1)), ok('ứ'.repeat(50_000)), ok('nonsense'), { status: 201, body: await token() }];
     for (const a of answers) {
       const w = world({ [URI]: a });
       assert.equal(await w.check(), 'unavailable');
@@ -209,6 +209,18 @@ describe('ADR-0019 caps and rollback rules', () => {
     clock.advance(-120);
     await w.check();
     assert.equal(w.calls.length, 2);
+  });
+  test('a list signed by another trusted organisation at this URI is neither cached nor recorded in seen', async () => {
+    const store = new Map<string, number>();
+    const seen: SeenStore = { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v) };
+    const ahead = new Date(NOW.getTime() + 60_000);
+    const w = world({ [URI]: ok(await token({}, { signer: (await otherOrgStatus()).signer, at: ahead })) }, { seen });
+    assert.equal(await w.check(), 'unavailable');
+    assert.deepEqual([...store], [], 'nothing recorded for the other organisation\'s list');
+    w.routes[URI] = ok(await token({ 42: 1 }, { at: NOW }));
+    w.clock.advance(1);
+    assert.equal(await w.check(), 'revoked', 'the issuer\'s own (older-iat) list is accepted at once');
+    assert.deepEqual([...store], [[`iat:${URI}`, NOW_S]]);
   });
   test('seen: the last accepted iat survives a restart', async () => {
     const store = new Map<string, number>();

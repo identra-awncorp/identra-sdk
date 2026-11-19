@@ -3,6 +3,7 @@
 // validates the metadata and the offer, parses (and decrypts) credential requests and encrypts
 // credential responses. It never signs or verifies anything here: access tokens and proofs are
 // checked by our own code (access-token.ts, proof.ts).
+import '@identra/sdk-core/zod-config'; // before the libraries: see sdk-core zod-config.ts
 import { Oauth2AuthorizationServer, Oauth2ServerErrorResponseError, preAuthorizedCodeGrantIdentifier } from '@openid4vc/oauth2';
 import { Openid4vciIssuer, Openid4vciVersion, type CredentialOfferObject, type IssuerMetadataResult } from '@openid4vc/openid4vci';
 import { CompactEncrypt, compactDecrypt, decodeProtectedHeader, importJWK } from 'jose';

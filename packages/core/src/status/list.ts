@@ -3,6 +3,7 @@
 // section 4.1: index 0 in the least significant bits of byte 0) and the ZLIB (de)compression; this
 // module adds what the library lacks: the fixed size, the 0-2 value range and bounded inflation.
 // It is the only file that imports the library.
+import '../zod-config.js'; // before the library: see zod-config.ts
 import { StatusList as LibraryStatusList } from '@owf/token-status-list';
 import { base64UrlDecode, base64UrlEncode } from '../encoding.js';
 

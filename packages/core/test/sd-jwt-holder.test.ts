@@ -105,11 +105,18 @@ describe('DISCLOSURE_INVALID, one test per rule', () => {
   });
 });
 
-test('a disclosure named __proto__ stays a data property', async () => {
-  const r = await verifyAny(await craft({ disclosures: [disclosure('__proto__', { polluted: true })] }), verifyOptions());
-  assert.equal(r.ok, true);
-  assert.deepEqual(Object.getOwnPropertyDescriptor(r.credential!.claims!, '__proto__')?.value, { polluted: true });
-  assert.equal(Object.getPrototypeOf(r.credential!.claims!), Object.prototype);
+test('F1-1: disclosures named __proto__, constructor or prototype, and disclosures nested deeper than 32 levels, are DISCLOSURE_INVALID', async () => {
+  for (const name of ['__proto__', 'constructor', 'prototype']) {
+    const c = await holderCode(await craft({ disclosures: [disclosure(name, { polluted: true })] }), false);
+    assert.deepEqual([c.code, c.detail], [ErrorCodes.DISCLOSURE_INVALID, 'disclosure uses a reserved name'], name);
+  }
+  const nested = (levels: number) => JSON.parse('['.repeat(levels) + ']'.repeat(levels)) as unknown;
+  // The disclosure array is level 1, so its value may nest 31 levels.
+  assert.equal((await holderCode(await craft({ disclosures: [disclosure('ho_ten', nested(31))] }), false)).code, null);
+  for (const levels of [32, 4000]) {
+    const c = await holderCode(await craft({ disclosures: [disclosure('ho_ten', nested(levels))] }), false);
+    assert.deepEqual([c.code, c.detail], [ErrorCodes.DISCLOSURE_INVALID, 'disclosure nests deeper than 32 levels'], String(levels));
+  }
 });
 
 describe('KB_INVALID, NONCE_MISMATCH, AUD_MISMATCH', () => {

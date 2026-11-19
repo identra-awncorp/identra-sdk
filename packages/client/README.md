@@ -1,8 +1,9 @@
 # @identra/sdk-client
 
 Browser client for Identra verifier sessions (identra-server `docs/vc-api.md` sections 2 and 6): create a
-session, show its QR payload, follow it to the validated result. No runtime dependencies; `Check`,
-`CheckId` and `ErrorCode` are type-only imports from `@identra/sdk-core`.
+session, show its QR payload, follow it to the validated result. The only runtime import is
+`UNSAFE_DISPLAY_TEXT` from `@identra/sdk-core/text` (a one-line module); `Check`, `CheckId` and
+`ErrorCode` are type-only imports from `@identra/sdk-core`.
 
 ```ts
 import { createVerifierClient, isValidVerifierQr } from '@identra/sdk-client';
@@ -25,8 +26,9 @@ const final = await client.watchSession(created.id, {
 - **Timeouts and retries.** Each request times out after 10 s (`requestTimeoutMs`). Network errors,
   timeouts, 5xx and 429 are retried with backoff, never sooner than a 429's `Retry-After` and never after
   expiry; 404 and other 4xx reject (`not_found` means the session is gone: show it as expired).
-- **Validation.** Responses are validated before use: the closed status list; `result` only when final
+- **Validation.** Responses are validated before use: the session `id` is the one requested; the closed status list; `result` only when final
   and `verified` ⇔ `result.ok`; a success lists all nine presentation checks, passed, with an issuer and
-  string claims; a failure has neither. Text with control, bidirectional-override or zero-width characters
-  is rejected. Errors carry `kind`, `status`, the section 2 `code` and `retryAfterSeconds`; messages never
+  string claims; a failure has neither. Text with any character of `UNSAFE_DISPLAY_TEXT` (controls,
+  bidirectional marks, overrides and isolates, zero-width characters, line and paragraph separators, the
+  BOM, the soft hyphen, tag characters) is rejected. Errors carry `kind`, `status`, the section 2 `code` and `retryAfterSeconds`; messages never
   carry response text.

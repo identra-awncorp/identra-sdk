@@ -3,6 +3,7 @@
 // send; every decision is taken by the caller on the plain JSON this file hands back. Crypto goes
 // through the callbacks below: the noble JWE, the injected Hasher and RandomSource, the wallet key's
 // Signer, and for request objects the caller's own JWS check.
+import '@identra/sdk-core/zod-config'; // before the libraries: see sdk-core zod-config.ts
 import { Openid4vciClient, type CredentialOfferObject, type IssuerMetadataResult } from '@openid4vc/openid4vci';
 import { Openid4vpClient } from '@openid4vc/openid4vp';
 import { DcqlQuery } from 'dcql';
@@ -191,9 +192,11 @@ export function failureOf(e: unknown): { code: WalletFetchErrorCode; oauthError:
   let httpStatus: number | null = null;
   for (let x: unknown = e, depth = 0; x instanceof Error && depth < 8; x = x.cause, depth++) {
     if (x instanceof WalletFetchError) return { code: x.code, oauthError: null, httpStatus: null };
-    const { errorResponse, response } = x as { errorResponse?: { error?: unknown }; response?: { status?: unknown } };
+    const { errorResponse, response } = x as { errorResponse?: { error?: unknown }; response?: { status?: unknown; response?: { status?: unknown } } };
     if (oauthError === null && typeof errorResponse?.error === 'string') oauthError = errorResponse.error;
-    if (httpStatus === null && typeof response?.status === 'number') httpStatus = response.status;
+    // The credential request's error wraps the HTTP response one level deeper.
+    const status = response?.status ?? response?.response?.status;
+    if (httpStatus === null && typeof status === 'number') httpStatus = status;
   }
   return { code: 'ISSUER_ERROR', oauthError, httpStatus };
 }

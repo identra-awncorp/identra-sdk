@@ -2,7 +2,7 @@
 // only, no credentials in the URL, only the URLs `allow` admits, a timeout, no redirect (a 3xx is
 // refused, never followed) and a response size cap. The app's own fetch must not follow redirects
 // either: a followed redirect is invisible here.
-import type { HttpFetch } from '@identra/sdk-core';
+import { utf8Encode, type HttpFetch } from '@identra/sdk-core';
 
 export type WalletFetchErrorCode = 'NETWORK_ERROR' | 'URL_NOT_ALLOWED' | 'ISSUER_ERROR';
 
@@ -74,7 +74,8 @@ export function guardFetch(inner: HttpFetch, o: { allow(url: string, origin: str
         throw new WalletFetchError('NETWORK_ERROR', `${origin} broke off the response`);
       });
       const text = await Promise.race([body, timeout]);
-      if (text.length > maxBytes) throw new WalletFetchError('ISSUER_ERROR', `${origin} sent more than ${maxBytes} bytes`);
+      // Bytes, not UTF-16 units: a text of n units can be up to 3n bytes.
+      if (text.length > maxBytes || utf8Encode(text).length > maxBytes) throw new WalletFetchError('ISSUER_ERROR', `${origin} sent more than ${maxBytes} bytes`);
       return { status: response.status, headers: response.headers, text: async () => text };
     } finally {
       clearTimeout(timer);

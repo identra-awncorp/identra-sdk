@@ -5,7 +5,7 @@
 //   <dir>/root.cert.pem [+ <dir>/root2.cert.pem]
 // Private keys are imported non-extractable and leave this module only as the Signer interface
 // (ADR-0006 section 3). Nothing is logged; error messages name files, never their content.
-import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { base64Decode, createCertificateChainValidator, parseCertificate, type CertificateChainValidator, type CertificateProfile, type EcPublicJwk, type Signer } from '@identra/sdk-core';
 import { webCryptoHasher, webCryptoRandom, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
@@ -28,11 +28,14 @@ const FILES: Record<OrganisationPurpose, string[]> = { vc: ['vc', 'vc-product'],
 const KEY_ALG = { name: 'ECDSA', namedCurve: 'P-256' } as const;
 const SIGN_ALG = { name: 'ECDSA', hash: 'SHA-256' } as const;
 
-/** Opened without following a symlink; type and mode are checked on the open descriptor, which is then read (no TOCTOU). */
+/**
+ * Opened without following a symlink and without blocking (a FIFO would otherwise wait for a writer
+ * and hang start-up); type and mode are checked on the open descriptor, which is then read (no TOCTOU).
+ */
 function readKeyFile(path: string): string {
   let fd: number;
   try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ELOOP') throw new Error(`key store: ${path} is not a regular file`);
     throw e;
@@ -134,6 +137,8 @@ export function createFileKeyStore(dir: string): IssuerKeyStore {
       if (!Object.hasOwn(FILES, purpose)) throw new TypeError('purpose must be vc, status or request');
       return cached(`${organisation}/${purpose}`, async () => {
         const base = join(root, 'orgs', organisation);
+        // The organisation directory itself, not a link to another organisation's (or anyone's) keys.
+        if (lstatSync(base, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error(`key store: ${base} is a symbolic link`);
         const found = FILES[purpose].filter((f) => existsSync(join(base, `${f}.key.pem`)));
         if (found.length !== 1) throw new Error(`key store: expected exactly one ${FILES[purpose].join(' or ')} key for ${organisation}, found ${found.length}`);
         const chainPath = join(base, `${found[0]}.chain.pem`);

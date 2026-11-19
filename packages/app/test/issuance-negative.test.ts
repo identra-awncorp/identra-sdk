@@ -3,7 +3,9 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { CompactEncrypt, compactDecrypt, importJWK } from 'jose';
-import { base64UrlDecode, createMappedFetch, issueCredential, issueDiploma, utf8Decode, utf8Encode, VCT, type EcPublicJwk, type Signer } from '@identra/sdk-core';
+import {
+  base64UrlDecode, base64UrlEncode, createMappedFetch, issueCredential, issueDiploma, signJws, utf8Decode, utf8Encode, VCT, type EcPublicJwk, type Signer,
+} from '@identra/sdk-core';
 import { generateWebCryptoKeyPair, webCryptoHasher, webCryptoRandom } from '@identra/sdk-core/webcrypto';
 import type { ProtocolStateStore } from '@identra/sdk-server';
 import { WalletKeyError } from '@identra/sdk-app';
@@ -50,6 +52,22 @@ const plainDiploma = async (world: World, cnfJwk: EcPublicJwk, disclosable: stri
     signer: await leafSigner('vc'), hasher: webCryptoHasher, random: webCryptoRandom, clock: world.clock, iss: ISS, vct: VCT.diploma,
     cnfJwk, status: await world.statusService.allocate('truong-mau'), claims: { ...DIPLOMA }, disclosable, ...(disclosable.length > 0 ? { sdDigests: 10 } : {}),
   });
+
+/** A diploma signed by the real issuer key whose `status` claim is `status` (none when undefined): what issueCredential refuses to build. */
+async function diplomaWithStatus(world: World, cnfJwk: EcPublicJwk, status: unknown): Promise<string> {
+  const json = (v: unknown) => base64UrlEncode(utf8Encode(JSON.stringify(v)));
+  const disclosures = Object.entries(DIPLOMA).map(([k, v]) => json([base64UrlEncode(webCryptoRandom.bytes(16)), k, v]));
+  const sd = (await Promise.all(disclosures.map(async (d) => base64UrlEncode(await webCryptoHasher.sha256(utf8Encode(d)))))).sort();
+  const payload = { iss: ISS, vct: VCT.diploma, iat: Math.floor(world.clock.now().getTime() / 1000), cnf: { jwk: cnfJwk }, _sd: sd, _sd_alg: 'sha-256', ...(status === undefined ? {} : { status }) };
+  return `${await signJws({ typ: 'dc+sd-jwt' }, utf8Encode(JSON.stringify(payload)), await leafSigner('vc'))}~${disclosures.join('~')}~`;
+}
+const BAD_STATUS: [string, unknown][] = [
+  ['no status claim', undefined],
+  ['status on another host', { status_list: { uri: 'https://elsewhere.example/status/1', idx: 5 } }],
+  ['status uri with a dot segment', { status_list: { uri: `${ISS}/status/../1`, idx: 5 } }],
+  ['idx -1', { status_list: { uri: `${ISS}/status/1`, idx: -1 } }],
+  ['idx past the list', { status_list: { uri: `${ISS}/status/1`, idx: 131_072 } }],
+];
 
 /** Rewrites the JSON a route answers. */
 function rewrite(key: string, edit: (json: Record<string, unknown>) => void) {
@@ -222,16 +240,23 @@ describe('a malicious or failing issuer after the wallet key exists: exact code,
     assert.equal((await world.issuer.offerStatus(offerId))?.status, 'pending');
   });
 
-  test('the state store fails mid-flow on the server: ISSUER_ERROR, nothing recorded', async () => {
-    let failing = false;
-    const store = (s: ProtocolStateStore): ProtocolStateStore => ({ ...s, take: async (k) => (failing && k.includes(':nonce:') ? Promise.reject(new Error('redis down')) : s.take(k)) });
-    const world = await createWorld(listener, { store });
-    const w = world.newWallet();
-    const { offer, txCode } = await resolvedOffer(world, w);
-    failing = true;
-    assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'ISSUER_ERROR', retryable: false, codeRedeemed: true });
-    nothingLeft(w);
-    assert.equal(world.issued.length, 0);
+  test('the state store fails on the server before anything is spent (503): ISSUER_ERROR, retryable, the same offer then completes', async () => {
+    for (const [op, part, codeRedeemed] of [['take', ':nonce:', true], ['take', ':token:', true], ['get', ':code:', false], ['increment', ':attempts:', false]] as const) {
+      let failing = false;
+      const store = (s: ProtocolStateStore): ProtocolStateStore => ({
+        ...s,
+        [op]: async (k: string, t?: number) => (failing && k.includes(part) ? Promise.reject(new Error('redis down')) : op === 'increment' ? s.increment(k, t!) : s[op](k)),
+      });
+      const world = await createWorld(listener, { store });
+      const w = world.newWallet();
+      const { offer, txCode } = await resolvedOffer(world, w);
+      failing = true;
+      assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'ISSUER_ERROR', retryable: true, codeRedeemed }, `${op} ${part}`);
+      nothingLeft(w);
+      assert.equal(world.issued.length, 0);
+      failing = false;
+      assert.equal((await w.wallet.offers.accept(offer, { txCode })).ok, true, `${op} ${part}: retry`);
+    }
   });
 });
 
@@ -281,6 +306,54 @@ describe('GĐ5 review fixes', () => {
     assert.equal((untrusted as { code: string }).code, 'CREDENTIAL_INVALID');
     assert.equal((untrusted as { checks: { id: string; code: string }[] }).checks.find((x) => x.id === 'issuer_trust')?.code, 'ISSUER_NOT_TRUSTED');
     nothingLeft(c);
+  });
+
+  test('F3-1: a missing or malformed status reference is CREDENTIAL_INVALID at receipt (lists reachable or not) and invalid on refresh', async () => {
+    for (const trustDown of [false, true]) {
+      for (const [name, status] of BAD_STATUS) {
+        const world = await createWorld(listener);
+        if (trustDown) listener.routes.delete('GET /trust-list');
+        listener.routes.set(CREDENTIAL, maliciousCredential(world, async (jwk) => [{ credential: await diplomaWithStatus(world, jwk, status) }]));
+        const w = world.newWallet();
+        const { offer, txCode } = await resolvedOffer(world, w);
+        const r = await w.wallet.offers.accept(offer, { txCode });
+        assert.equal(r.ok ? 'stored' : r.code, 'CREDENTIAL_INVALID', `${name}, trust list down: ${trustDown}`);
+        nothingLeft(w);
+      }
+    }
+    const world = await createWorld(listener);
+    const w = world.newWallet();
+    const { publicJwk } = await generateWebCryptoKeyPair();
+    for (const [name, status] of BAD_STATUS) {
+      const id = await w.vault.save({ compact: await diplomaWithStatus(world, publicJwk, status), vct: VCT.diploma, issuer: ISS, keyId: 'k' });
+      const refreshed = await w.wallet.credentials.refreshStatus(id);
+      assert.equal(refreshed.ok && refreshed.status, 'invalid', name);
+    }
+    const good = await w.vault.save({ compact: await diplomaWithStatus(world, publicJwk, { status_list: { uri: `${ISS}/status/1`, idx: 5 } }), vct: VCT.diploma, issuer: ISS, keyId: 'k' });
+    listener.routes.delete('GET /issuers/truong-mau/status/*');
+    const down = await w.wallet.credentials.refreshStatus(good);
+    assert.equal(down.ok && down.status, 'unknown', 'a well-formed reference whose list is unreachable stays unknown');
+  });
+
+  test('F1-2 / F3-2: the issuer name comes only from a passing issuer_trust check (purpose, organisation, vct)', async () => {
+    const world = await createWorld(listener);
+    const trustRoute = listener.routes.get('GET /trust-list')!;
+    listener.routes.delete('GET /trust-list');
+    const w = world.newWallet();
+    const { offer, txCode } = await resolvedOffer(world, w);
+    const a = await w.wallet.offers.accept(offer, { txCode });
+    assert.ok(a.ok);
+    assert.deepEqual([a.status, a.issuerName], ['unknown', null]);
+    const name = async () => { const d = await w.wallet.credentials.get(a.credentialId); assert.ok(d.ok); return d.credential.issuerName; };
+    assert.equal(await name(), null, 'trust list still unreachable');
+    listener.routes.set('GET /trust-list', trustRoute);
+    const seen = listener.requests.length;
+    assert.equal(await name(), 'Trường Mẫu (TEST)');
+    assert.ok(listener.requests.slice(seen).every((p) => !p.includes('/status/')), 'get() never requests a status list');
+    // Still listed with purpose vc and the organisation, but no longer for this vct: no name.
+    world.trust.content = { ...world.trust.content, issuers: world.trust.content.issuers.map((e) => ({ ...e, vct: [VCT.productEvent] })) };
+    world.clock.advance(3601);
+    assert.equal(await name(), null);
   });
 
   test('F7: remove deletes the key first and a retry completes after either step failed', async () => {

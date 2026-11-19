@@ -2,6 +2,7 @@
 // Every response is validated before use; error messages never carry response text or claims.
 // Time decisions (expiry) use the server's clock: each response carries `serverTime` (section 2).
 import type { Check, CheckId, ErrorCode } from '@identra/sdk-core';
+import { UNSAFE_DISPLAY_TEXT } from '@identra/sdk-core/text';
 
 export type { Check, CheckId, ErrorCode };
 
@@ -126,8 +127,6 @@ const CLAIM_KEY = /^[A-Za-z0-9_]{1,64}$/;
 const ORG_ID = /^VATVN-[0-9]{10}(-[0-9]{3})?$/;
 const SESSION_ID = /^[A-Za-z0-9_-]{16,256}$/;
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-/** C0/C1 controls, bidirectional overrides and isolates, zero-width characters and the BOM. */
-const UNSAFE_TEXT = /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/;
 
 export function isTerminalStatus(s: SessionStatus): boolean {
   return s === 'verified' || s === 'failed' || s === 'expired';
@@ -158,7 +157,7 @@ const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !
 const isDate = (v: unknown): v is string => typeof v === 'string' && v.length <= 64 && !Number.isNaN(Date.parse(v));
 const has = (o: Obj, k: string) => Object.prototype.hasOwnProperty.call(o, k);
 const isText = (v: unknown, max: number): v is string =>
-  typeof v === 'string' && v.length > 0 && v.length <= max && !UNSAFE_TEXT.test(v);
+  typeof v === 'string' && v.length > 0 && v.length <= max && !UNSAFE_DISPLAY_TEXT.test(v);
 
 function malformed(path: string): never {
   throw new VerifierClientError('malformed', `malformed session response: ${path}`);
@@ -235,10 +234,11 @@ function parseResult(raw: unknown): SessionResult {
   };
 }
 
-function parseSession(raw: unknown): VerificationSession {
+/** `requestedId`: the session asked for; an answer about any other session is malformed. */
+function parseSession(raw: unknown, requestedId: string): VerificationSession {
   if (!isObj(raw)) malformed('body');
   const { id, status, verifier, expiresAt, serverTime } = raw;
-  if (typeof id !== 'string' || !SESSION_ID.test(id)) malformed('id');
+  if (typeof id !== 'string' || !SESSION_ID.test(id) || id !== requestedId) malformed('id');
   if (typeof status !== 'string' || !STATUSES.includes(status)) malformed('status');
   if (!isObj(verifier) || !isText(verifier['name'], 500)) malformed('verifier');
   if (!isDate(expiresAt)) malformed('expiresAt');
@@ -356,7 +356,7 @@ export function createVerifierClient(options: VerifierClientOptions): VerifierCl
 
   const sessionPath = (id: string) => `/v1/verification/sessions/${encodeURIComponent(id)}`;
   const getSession: VerifierClient['getSession'] = async (id, opts) =>
-    parseSession(await request('GET', sessionPath(id), undefined, opts?.signal));
+    parseSession(await request('GET', sessionPath(id), undefined, opts?.signal), id);
 
   return {
     async createSession(input, opts) {
@@ -382,6 +382,7 @@ export function createVerifierClient(options: VerifierClientOptions): VerifierCl
           // A request never runs past expiry: its timeout is cut to the time left.
           const session = parseSession(
             await request('GET', sessionPath(id), undefined, signal, Math.min(requestTimeoutMs, left)),
+            id,
           );
           signal?.throwIfAborted();
           offset = serverClockOffset(session.serverTime, now());

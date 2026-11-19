@@ -121,6 +121,13 @@ describe('issueCredential refuses programmer errors', () => {
     claims: { ho_ten: 'A', nganh: 'B' },
     disclosable: ['ho_ten'],
   });
+  test('F1-1: a claim value nested deeper than 31 levels, visible or disclosable', async () => {
+    const nested = (levels: number) => JSON.parse('['.repeat(levels) + ']'.repeat(levels)) as unknown;
+    for (const disclosable of [[], ['ho_ten']]) {
+      assert.ok(await issueCredential({ ...(await input()), claims: { ho_ten: nested(31), nganh: 'B' }, disclosable }));
+      await assert.rejects(issueCredential({ ...(await input()), claims: { ho_ten: nested(32), nganh: 'B' }, disclosable }), /ho_ten nests deeper than 31 levels/);
+    }
+  });
   test('a metadata claim made disclosable, iat included', async () => {
     for (const name of ['iat', 'iss', 'vct', 'nbf', 'exp', 'cnf', 'status']) {
       await assert.rejects(issueCredential({ ...(await input()), disclosable: [name] }), TypeError, name);

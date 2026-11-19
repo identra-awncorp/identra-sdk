@@ -200,6 +200,8 @@ describe('verifyStatusListToken: one negative test per rule', async () => {
   test('missing exp, missing iat, bad ttl', async () => {
     await expectReason(await rawJws(header(), payload({ exp: undefined }), signer), 'claims', /exp is missing/);
     await expectReason(await rawJws(header(), payload({ iat: '1' }), signer), 'claims', /iat is missing/);
+    // F2-4: a fractional iat (it could not be kept in `seen`, and two copies could differ by less than a second).
+    for (const iat of [NOW_S - 0.5, NOW_S + 0.001]) await expectReason(await rawJws(header(), payload({ iat }), signer), 'claims', /iat is missing or not an integer/);
     for (const ttl of [0, -1, 1.5, '900']) await expectReason(await rawJws(header(), payload({ ttl }), signer), 'claims', /ttl/);
     assert.equal((await verifyStatusListToken(await rawJws(header(), payload({ ttl: undefined }), signer), opts())).ok, true, 'ttl is optional');
   });

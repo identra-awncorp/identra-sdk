@@ -130,6 +130,17 @@ test('a trusted certificate whose SAN is on another host: its status list is nev
   assert.deepEqual(paths(), [eventsPath(), '/trust-list']);
 });
 
+test('F5-1: a trusted SAN on the API origin with a dot segment or an escaped one reaches no other path', async () => {
+  for (const iss of [`${CANONICAL}/issuers/x/../../v1/admin`, `${CANONICAL}/issuers/x/%2e%2e/%2e%2e/v1/admin`, `${CANONICAL}/issuers/X`, `${CANONICAL}/issuers/a?b`]) {
+    const foreign = await helpers.foreignSanIssuer(iss);
+    const world = await helpers.productWorld({ issuers: [foreign.entry, helpers.trustIssuer('kiem-dinh'), helpers.trustIssuer('phan-phoi')] });
+    const { verifier, paths } = setup(world, [foreign.event]);
+    const view = await verifier.load(GTIN, SERIAL);
+    assert.deepEqual(view.result!.events[0]!.checks.filter((c) => !c.ok).map((c) => `${c.id}:${c.code}`), ['status:STATUS_UNAVAILABLE'], iss);
+    assert.deepEqual(paths(), [eventsPath(), '/trust-list'], iss);
+  }
+});
+
 test('serverTime is a hint only: validated strictly, and a lying one changes no check', async () => {
   const world = await helpers.productWorld();
   const events = await world.chain(3);

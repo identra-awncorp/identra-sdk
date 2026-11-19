@@ -18,6 +18,7 @@ import {
   type DiplomaClaims,
   type ProductEventClaims,
 } from './credential-types.js';
+import { jsonDepthExceeds, MAX_JSON_DEPTH, PROTOTYPE_NAMES } from './compact.js';
 import { libIssue } from './library.js';
 import { parseProductCode } from '../product/gs1.js';
 
@@ -51,8 +52,6 @@ function fail(message: string): never {
   throw new TypeError(message);
 }
 const has = (o: object, name: string): boolean => Object.keys(o).includes(name);
-// Names that would reach an object's prototype machinery when a verifier or consumer copies claims.
-const PROTOTYPE_NAMES = ['__proto__', 'constructor', 'prototype'];
 
 /**
  * A claim value must survive JSON unchanged: null, boolean, string, finite number, arrays and
@@ -85,6 +84,8 @@ function checkJsonValue(name: string, value: unknown): void {
       stack.push((o as Record<string, unknown>)[key]);
     }
   }
+  // One level less than a verifier allows, for the payload object or disclosure array around it.
+  if (jsonDepthExceeds(value, MAX_JSON_DEPTH - 1)) fail(`claim ${name} nests deeper than ${MAX_JSON_DEPTH - 1} levels`);
 }
 const isNumericDate = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 

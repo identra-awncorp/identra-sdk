@@ -159,6 +159,12 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
     await flag('ended', offerId, '1');
   }
 
+  /** A state store failure before anything was spent (code, offer, token): the same request may be sent again. */
+  const unavailable = () => {
+    const r = oauthError(503, 'temporarily_unavailable', 'the service is temporarily unavailable, try again');
+    return { ...r, headers: { ...r.headers, 'Retry-After': '1' } };
+  };
+
   return {
     metadata: () => ok(lib.credentialIssuerMetadata),
     authorizationServerMetadata: () => ok(lib.authorizationServerMetadata),
@@ -212,20 +218,34 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
       if (!CODE.test(code)) return invalidGrant;
 
       const codeKey = await hashedKey('code', code);
-      const offerId = await store.get(codeKey);
-      const record = offerId === null ? null : await read<OfferRecord>(key('offer', offerId));
-      if (offerId === null || !record || record.expiresAt <= clock.now().getTime()) return invalidGrant;
-      // The attempt is counted before the comparison, so concurrent guesses cannot exceed the limit.
-      const attempt = await store.increment(key('attempts', offerId), offerSeconds);
+      let offerId: string | null;
+      let record: OfferRecord | null;
+      let attempt: number;
+      try {
+        offerId = await store.get(codeKey);
+        record = offerId === null ? null : await read<OfferRecord>(key('offer', offerId));
+        if (offerId === null || !record || record.expiresAt <= clock.now().getTime()) return invalidGrant;
+        // The attempt is counted before the comparison, so concurrent guesses cannot exceed the limit.
+        attempt = await store.increment(key('attempts', offerId), offerSeconds);
+      } catch {
+        return unavailable(); // nothing spent: the same code and PIN work on a retry
+      }
       if (attempt > MAX_TX_CODE_ATTEMPTS) return invalidGrant;
       const given = mac(keys.pinKey, txCode);
       if (!/^[0-9]{6}$/.test(txCode) || !timingSafeEqual(given, base64UrlDecode(record.pinMac))) {
         if (attempt === MAX_TX_CODE_ATTEMPTS) await endOffer(offerId);
         return invalidGrant;
       }
-      // Single use: of concurrent requests with the right PIN, only the one that takes the code wins.
-      if ((await store.take(codeKey)) === null) return invalidGrant;
-      await store.take(key('offer', offerId));
+      // Single use: of concurrent requests with the right PIN, only the one that takes the offer wins.
+      // The offer goes first, so a failure before the code is taken leaves no offer whose code is gone.
+      let taken: string | null;
+      try {
+        taken = await store.take(key('offer', offerId));
+      } catch {
+        return unavailable();
+      }
+      if (taken === null) return invalidGrant;
+      await store.take(codeKey);
       const jti = newId();
       const token: TokenRecord = { offerId, subjectRef: record.subjectRef, configurationId: record.configurationId };
       await store.put(await hashedKey('token', jti), JSON.stringify(token), tokenSeconds);
@@ -243,7 +263,12 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
       const now = clock.now();
       const jti = await verifyAccessToken(request.headers['authorization'], { publicJwk: keys.accessToken.publicJwk, verifier, issuerUri, now });
       const tokenKey = jti === null ? null : await hashedKey('token', jti);
-      const token = tokenKey === null ? null : await read<TokenRecord>(tokenKey);
+      let token: TokenRecord | null;
+      try {
+        token = tokenKey === null ? null : await read<TokenRecord>(tokenKey);
+      } catch {
+        return unavailable();
+      }
       const invalidToken = oauthError(401, 'invalid_token', 'the access token is not valid');
       if (tokenKey === null || !token) return invalidToken;
       if (request.body.length > MAX_BODY_BYTES) return oauthError(400, 'invalid_credential_request', 'the request is too large');
@@ -266,9 +291,19 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
       if (parsed.jwtProofs.length !== 1 || parsed.otherProofs) return oauthError(400, 'invalid_proof', 'exactly one jwt proof is required');
       const proof = await verifyProof(parsed.jwtProofs[0], { issuerUri, verifier, now });
       if (!proof.ok) return oauthError(400, 'invalid_proof', 'the proof is not valid');
-      if (!NONCE.test(proof.nonce) || (await store.take(await hashedKey('nonce', proof.nonce))) === null) return oauthError(400, 'invalid_nonce', 'the c_nonce is unknown, expired or used');
-      // One credential per access token: consumed here, before any effect.
-      if ((await store.take(tokenKey)) === null) return invalidToken;
+      if (!NONCE.test(proof.nonce)) return oauthError(400, 'invalid_nonce', 'the c_nonce is unknown, expired or used');
+      // Store failures up to the token take leave the token unused: 503, the wallet may try again.
+      let nonceTaken: string | null;
+      let tokenTaken: string | null = null;
+      try {
+        nonceTaken = await store.take(await hashedKey('nonce', proof.nonce));
+        // One credential per access token: consumed here, before any effect.
+        if (nonceTaken !== null) tokenTaken = await store.take(tokenKey);
+      } catch {
+        return unavailable();
+      }
+      if (nonceTaken === null) return oauthError(400, 'invalid_nonce', 'the c_nonce is unknown, expired or used');
+      if (tokenTaken === null) return invalidToken;
 
       // Order of effects (architecture section 8): a failure from here on throws; the token is spent,
       // an allocated status index stays reserved and unused, and the offer is not marked issued.
