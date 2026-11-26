@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
-  createPresentation, createStatusList, createStatusListChecker, createStatusListToken, decodeJws, ErrorCodes, issueDiploma,
+  base64UrlEncode, createPresentation, createStatusList, createStatusListChecker, createStatusListToken, decodeJws, didJwkResolver, ErrorCodes, issueDiploma,
   issueProductEvent, signJws, utf8Encode, VCT, verifyDidStatusListToken, verifyPresentation, verifyStoredCredential, type CredentialVerificationResult,
 } from '@identra/sdk-core';
 import { webCryptoHasher, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
@@ -56,6 +56,18 @@ describe('did_resolution: checks before any network call', () => {
       assert.equal(w.calls.length, 0, did);
     }
   });
+  test('a DID other than did:certnet is DID_RESOLUTION_FAILED even when the configured resolver knows it and the registry trusts it', async () => {
+    const jwkSigner = await didSigner('placeholder');
+    const did = `did:jwk:${base64UrlEncode(utf8Encode(JSON.stringify(jwkSigner.publicJwk)))}`;
+    const signer = Object.assign(jwkSigner, { kid: `${did}#0` });
+    assert.ok((await didJwkResolver.resolve(did)).didDocument, 'the resolver would give the key');
+    const compact = await crafted({ kid: signer.kid, signer, payload: didPayload({ iss: did }) });
+    let asked = 0;
+    const dpki = { resolver: didJwkResolver, trustRegistry: { lookupIssuer: async () => (asked++, { trusted: true as const }) } };
+    const r = await verifyStoredCredential(compact, verifyOptions({ dpki, statusChecker: fakeStatus() }));
+    assert.deepEqual(codes(r), GATED_FAIL(ErrorCodes.DID_RESOLUTION_FAILED).slice(0, -1));
+    assert.equal(asked, 0);
+  });
   test('the DID path not configured is DID_RESOLUTION_FAILED', async () => {
     const r = await verifyStoredCredential(stored, verifyOptions());
     assert.deepEqual(codes(r), GATED_FAIL(ErrorCodes.DID_RESOLUTION_FAILED));
@@ -95,6 +107,14 @@ describe('did_resolution: the gateway answer', () => {
       didBody({ document: { verificationMethod: [{ ...vm, controller: OTHER_DID }] } }),
       didBody({ document: { verificationMethod: [vm, { ...vm, id: `${OTHER_DID}#key-1` }] } }),
     ]) expect(await withDid(json(body)), 'did_resolution', ErrorCodes.DID_RESOLUTION_FAILED);
+  });
+  test('a resolver of its own that returns the document together with deactivated metadata: DID_RESOLUTION_FAILED', async () => {
+    const w = await dpkiWorld();
+    const live = await w.resolver.resolve(DID);
+    assert.ok(live.didDocument);
+    const resolver = { resolve: async () => ({ ...live, didDocumentMetadata: { deactivated: true } }) };
+    expect(await verifyStoredCredential(stored, { ...w.options, dpki: { ...w.options.dpki!, resolver } }), 'did_resolution', ErrorCodes.DID_RESOLUTION_FAILED);
+    assert.equal(check(await verifyStoredCredential(stored, { ...w.options, dpki: { ...w.options.dpki!, resolver: { resolve: async () => live } } }), 'did_resolution').ok, true, 'the same document, active');
   });
   test('gateway 503, timeout, oversized, non-JSON: DID_RESOLUTION_UNAVAILABLE', async () => {
     for (const route of [{ status: 503, body: '' }, new Error('timeout after 5000 ms'), ok(JSON.stringify({ ...didBody(), pad: 'a'.repeat(70_000) })), ok('<html>')]) {
@@ -142,6 +162,17 @@ describe('issuer_trust on the DID path', () => {
       expect((await withTir(route)).r, 'issuer_trust', ErrorCodes.TRUST_LIST_UNAVAILABLE);
     }
   });
+  test('a registry of its own: only trusted === true trusts; a failure other than TrustListUnavailableError is ISSUER_NOT_TRUSTED', async () => {
+    const w = await dpkiWorld();
+    const withRegistry = (lookupIssuer: () => Promise<unknown>) => verifyStoredCredential(stored, { ...w.options, dpki: { ...w.options.dpki!, trustRegistry: { lookupIssuer } as never } });
+    for (const answer of [{ trusted: 'yes' }, { trusted: 1 }, { trusted: {} }, null, undefined, true]) {
+      expect(await withRegistry(async () => answer), 'issuer_trust', ErrorCodes.ISSUER_NOT_TRUSTED);
+    }
+    for (const error of [new Error('boom'), new TypeError('bad'), 'a string']) {
+      expect(await withRegistry(async () => Promise.reject(error)), 'issuer_trust', ErrorCodes.ISSUER_NOT_TRUSTED);
+    }
+    assert.equal((await withRegistry(async () => ({ trusted: true }))).ok, true);
+  });
   test('a product event on the DID path is ISSUER_NOT_TRUSTED without asking the registry', async () => {
     const event = { ma_san_pham: '(01)09520123456788(21)A1', cong_doan: 'san_xuat', thoi_diem: '2026-05-30T00:00:00Z', dia_diem: 'HN', mo_ta: 'lô 1' };
     const w = await dpkiWorld({ routes: { [tirUrl(DID, VCT.productEvent)]: json(tirBody({ vcTypes: [VCT.productEvent] })) } });
@@ -185,6 +216,15 @@ describe('status on the DID path', () => {
       const w = await dpkiWorld({ status });
       expect(await verifyStoredCredential(await crafted({ payload: didPayload({ status: { status_list: { idx: 7, uri } } }) }), w.options), 'status', ErrorCodes.STATUS_UNAVAILABLE);
       assert.equal(status.calls, 0, uri);
+    }
+  });
+  test('a status URI on an IPv4 literal or a single-label host is STATUS_UNAVAILABLE without asking the checker, and is refused at issuance', async () => {
+    for (const uri of ['https://2130706433/s/status/1', 'https://0x7f000001/s/status/1', 'https://169.254.169.254/latest/status/1', 'https://0/s/status/1', 'https://localhost/s/status/1']) {
+      const status = fakeStatus();
+      const w = await dpkiWorld({ status });
+      expect(await verifyStoredCredential(await crafted({ payload: didPayload({ status: { status_list: { idx: 7, uri } } }) }), w.options), 'status', ErrorCodes.STATUS_UNAVAILABLE);
+      assert.equal(status.calls, 0, uri);
+      await assert.rejects(diploma(issuerSigner, { status: { idx: 1, uri } }), TypeError, uri);
     }
   });
   test('the checker: DID issuers need a didResolver; DID and X.509 lists never share a cache entry', async () => {

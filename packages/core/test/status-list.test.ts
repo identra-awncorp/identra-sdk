@@ -155,6 +155,10 @@ describe('verifyStatusListToken: one negative test per rule', async () => {
     await expectReason(await rawJws(header({ alg: 'HS256' }), payload(), signer), 'alg');
     await expectReason(await rawJws(header({ alg: 'none' }), payload(), signer), 'alg');
   });
+  test('a valid status chain together with a DID kid is malformed (one trust path per token, ADR-0020 section 2)', async () => {
+    await expectReason(await rawJws(header({ kid: 'did:certnet:local:a1b2c3d4e5f67890#key-1' }), payload(), signer), 'malformed', /both x5c and a DID kid/);
+    assert.equal((await verifyStatusListToken(await rawJws(header({ kid: 'key-1' }), payload(), signer), opts())).ok, true, 'a kid that is no DID changes nothing');
+  });
   test('a chain of another PKI', async () => {
     const evil = await issuerSigner('evil-vc', 'evil-issuing');
     await expectReason(await rawJws(header({ x5c: evil.x5c }), payload(), evil), 'chain', /CERT_CHAIN_UNTRUSTED/);

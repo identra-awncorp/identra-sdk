@@ -40,9 +40,10 @@ const SIGN_ALG = { name: 'ECDSA', hash: 'SHA-256' } as const;
 
 /**
  * Opened without following a symlink and without blocking (a FIFO would otherwise wait for a writer
- * and hang start-up); type and mode are checked on the open descriptor, which is then read (no TOCTOU).
+ * and hang start-up); type and, for a private key (`secret`), mode are checked on the open
+ * descriptor, which is then read (no TOCTOU).
  */
-function readKeyFile(path: string): string {
+function readKeyFile(path: string, secret = true): string {
   let fd: number;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -53,7 +54,7 @@ function readKeyFile(path: string): string {
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) throw new Error(`key store: ${path} is not a regular file`);
-    if ((st.mode & 0o077) !== 0) {
+    if (secret && (st.mode & 0o077) !== 0) {
       throw new Error(`key store: ${path} is accessible by group or others (mode ${(st.mode & 0o777).toString(8)}); run chmod 600 on it`);
     }
     return readFileSync(fd, 'utf8');
@@ -99,9 +100,11 @@ function certificatesOf(path: string, count: number): string[] {
  * derived from the private key: the DID document on CertNet is the only place it is published.
  */
 async function loadDidSigner(jsonPath: string, keyPath: string): Promise<Signer> {
+  // A public file (no mode rule), but read like the key files: no symlink, a regular file, no blocking.
+  const text = readKeyFile(jsonPath, false);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(jsonPath, 'utf8'));
+    parsed = JSON.parse(text);
   } catch {
     throw new Error(`key store: ${jsonPath} is not readable JSON`);
   }

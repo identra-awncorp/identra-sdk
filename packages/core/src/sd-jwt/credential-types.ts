@@ -82,15 +82,20 @@ export function isStatusListUri(uri: unknown, iss: string): boolean {
   return typeof uri === 'string' && uri.startsWith(prefix) && STATUS_LIST_NUMBER.test(uri.slice(prefix.length));
 }
 
-// Host: lower-case labels of letters, digits and hyphens joined by dots; a port of 1-5 digits
-// without a leading 0; one or more path segments of unreserved characters, a dot only inside a
-// segment (so no empty, "." or ".." segment); then /status/<n>. No ambiguous repetition (no ReDoS).
+// Host: at least two lower-case labels of letters, digits and hyphens joined by dots, the last one
+// starting with a letter, so that no URL parser reads it as an IPv4 address in any notation
+// (2130706433, 0x7f000001, 169.254.169.254, 0) and no single-label name (localhost, an intranet
+// host) passes; a port of 1-5 digits without a leading 0; one or more path segments of unreserved
+// characters, a dot only inside a segment (so no empty, "." or ".." segment); then /status/<n>.
+// No ambiguous repetition (no ReDoS).
 const DID_STATUS_LIST_URI =
-  /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*(:[1-9][0-9]{0,4})?(\/[A-Za-z0-9_~-]+(\.[A-Za-z0-9_~-]+)*)+\/status\/[1-9][0-9]{0,8}$/;
+  /^https:\/\/([a-z0-9-]+\.)+[a-z][a-z0-9-]*(:[1-9][0-9]{0,4})?(\/[A-Za-z0-9_~-]+(\.[A-Za-z0-9_~-]+)*)+\/status\/[1-9][0-9]{0,8}$/;
 /**
  * The status list URI of a DID issuer, which cannot be `<iss>/status/<n>` (ADR-0020 section 6):
  * `https://<host>[:port]/<path>/status/<n>`, n in 1..999999999, matched as a string against a strict
- * pattern, so query, fragment, userinfo, "..", "%", "\\", whitespace and upper-case hosts cannot pass.
+ * pattern, so query, fragment, userinfo, "..", "%", "\\", whitespace, upper-case hosts, IPv4
+ * literals and single-label hosts cannot pass. A name that resolves to a private address can: the
+ * HttpFetch given to the status checker must refuse those.
  */
 export function isDidStatusListUri(uri: unknown): boolean {
   return typeof uri === 'string' && DID_STATUS_LIST_URI.test(uri);

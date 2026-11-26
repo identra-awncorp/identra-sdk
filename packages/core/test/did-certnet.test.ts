@@ -172,6 +172,35 @@ describe('did:certnet resolver cache', () => {
     assert.deepEqual((await w.resolver.resolve(DID)).didDocument!.assertionMethod, [KID]);
   });
 
+  test('concurrent resolutions of one uncached DID share one request; a shared failure is not cached', async () => {
+    const w = resolverWith({ [didUrl(DID)]: json(didBody()), [didUrl(OTHER_DID)]: json(didBody({ did: OTHER_DID })) });
+    const results = await Promise.all([w.resolver.resolve(DID), w.resolver.resolve(DID), w.resolver.resolve(DID), w.resolver.resolve(OTHER_DID)]);
+    assert.deepEqual(results.map(errorOf), [null, null, null, null]);
+    assert.equal(w.calls.length, 2, 'one request per DID');
+    results[0]!.didDocument!.assertionMethod!.push(`${DID}#evil`);
+    assert.deepEqual(results[1]!.didDocument!.assertionMethod, [KID], 'each caller still gets its own copy');
+    const down = resolverWith({ [didUrl(DID)]: { status: 503, body: '' } });
+    const failed = await Promise.all([down.resolver.resolve(DID), down.resolver.resolve(DID)]);
+    assert.deepEqual(failed.map(errorOf), [DID_CERTNET_ERRORS.unavailable, DID_CERTNET_ERRORS.unavailable]);
+    assert.equal(down.calls.length, 1);
+    down.routes[didUrl(DID)] = json(didBody());
+    assert.equal(errorOf(await down.resolver.resolve(DID)), null);
+    assert.equal(down.calls.length, 2, 'the failure was not cached');
+  });
+
+  test('the least recently used DID is dropped first: one in constant use stays cached', async () => {
+    const THIRD = 'did:certnet:local:third0001';
+    const w = resolverWith({ [didUrl(DID)]: json(didBody()), [didUrl(OTHER_DID)]: json(didBody({ did: OTHER_DID })), [didUrl(THIRD)]: json(didBody({ did: THIRD })) }, { maxEntries: 2 });
+    await w.resolver.resolve(DID);
+    await w.resolver.resolve(OTHER_DID);
+    await w.resolver.resolve(DID); // a hit: DID is now the most recently used
+    await w.resolver.resolve(THIRD); // full: drops OTHER_DID, not DID
+    await w.resolver.resolve(DID);
+    assert.equal(w.calls.length, 3, 'DID still cached');
+    await w.resolver.resolve(OTHER_DID);
+    assert.equal(w.calls.length, 4, 'OTHER_DID was dropped');
+  });
+
   test('at most maxEntries DIDs are held', async () => {
     const w = resolverWith({ [didUrl(DID)]: json(didBody()), [didUrl(OTHER_DID)]: json(didBody({ did: OTHER_DID })) }, { maxEntries: 1 });
     await w.resolver.resolve(DID);
@@ -213,6 +242,16 @@ describe('CertNet trust registry', () => {
     assert.equal((await lookup(tirBody({ validUntil: '2026-06-01T06:58:58.999999999+07:00' }))).trusted, false, 'nanoseconds and offset');
   });
 
+  test('a date-time that names no real instant, or an offset out of range, is no usable answer', async () => {
+    for (const patch of [
+      { validUntil: '2026-02-30T00:00:00Z' }, { validFrom: '2026-01-01T24:00:00Z' }, { validUntil: '2026-12-31T23:59:60Z' }, { validFrom: '0050-01-01T00:00:00Z' },
+      { validFrom: '2026-01-01T00:00:00+24:00' }, { validUntil: '2027-01-01T00:00:00+00:60' }, { validFrom: '2026-01-01T00:00:00-24:00' },
+    ]) {
+      await assert.rejects(lookup(tirBody(patch)), TrustListUnavailableError, JSON.stringify(patch));
+    }
+    assert.equal((await lookup(tirBody({ validFrom: '2026-01-01T00:00:00+23:59', validUntil: '2027-01-01T00:00:00-23:59' }))).trusted, true, 'the largest offsets');
+  });
+
   test('no usable answer rejects with TrustListUnavailableError', async () => {
     const answers: Route[] = [
       { status: 503, body: '' }, { status: 500, body: '' }, { status: 302, body: '' }, { status: 201, body: JSON.stringify(tirBody()) },
@@ -236,6 +275,19 @@ describe('CertNet trust registry', () => {
     assert.equal(w.calls.length, 2);
     await assert.rejects(w.registry.lookupIssuer(DID, VCT.diploma, new Date(NaN)), TypeError);
   });
+});
+
+test('isDidStatusListUri: no IPv4 address in any notation, no single-label host (SSRF)', () => {
+  for (const host of [
+    '2130706433', '0x7f000001', '0X7F000001', '017700000001', '127.0.0.1', '127.1', '169.254.169.254', '10.0.0.1', '0', '0.0.0.0', 'a.1', 'a.0x7f', 'a.b.123',
+    'localhost', 'intranet', 'metadata', 'a.-b', 'a.9b',
+  ]) {
+    assert.equal(isDidStatusListUri(`https://${host}/issuers/x/status/1`), false, host);
+    assert.equal(isDidStatusListUri(`https://${host}:8443/issuers/x/status/1`), false, `${host}:8443`);
+  }
+  for (const host of ['a.vn', 'status.truong-did.example.vn', '1.example', 'xn--bcher-kva.example', 'a-b.c1', '10.0.0.1.nip.io']) {
+    assert.equal(isDidStatusListUri(`https://${host}/issuers/x/status/1`), true, host);
+  }
 });
 
 test('isDidStatusListUri: the strict DID-path status URI form', () => {

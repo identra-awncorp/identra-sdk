@@ -3,7 +3,8 @@
 // a FAKE CertNet gateway (helpers.ts fakeGateway; no gateway exists on this machine). Keys are
 // generated at run time.
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
@@ -97,6 +98,26 @@ describe('key store: DID files', () => {
     const dir = keyDir({ 'did.json': didJson, 'did.key.pem': key });
     chmodSync(join(dir, 'orgs/truong-did/did.key.pem'), 0o644);
     await assert.rejects(createFileKeyStore(dir).didSigner!('truong-did'), /accessible by group or others/);
+  });
+
+  test('did.json is read like the key files: a symlink or a FIFO is refused (no hang); as a public file it may be readable by others', async () => {
+    const key = await pkcs8Pem();
+    const linked = keyDir({ 'did.key.pem': key });
+    writeFileSync(join(linked, 'other.json'), JSON.stringify(didJson));
+    symlinkSync(join(linked, 'other.json'), join(linked, 'orgs/truong-did/did.json'));
+    await assert.rejects(createFileKeyStore(linked).didSigner!('truong-did'), /did\.json is not a regular file/);
+
+    const fifo = keyDir({ 'did.key.pem': key });
+    assert.equal(spawnSync('mkfifo', [join(fifo, 'orgs/truong-did/did.json')]).status, 0);
+    // In a child process: a blocking open of a FIFO would stall the whole process, test runner included.
+    const load = `import('@identra/sdk-server').then((m) => m.createFileKeyStore(${JSON.stringify(fifo)}).didSigner('truong-did')).then(() => console.log('loaded'), (e) => console.log(e.message))`;
+    const r = spawnSync(process.execPath, ['-e', load], { encoding: 'utf8', timeout: 10_000, cwd: new URL('.', import.meta.url).pathname });
+    assert.equal(r.signal, null, 'did not hang');
+    assert.match(r.stdout, /did\.json is not a regular file/);
+
+    const pub = keyDir({ 'did.json': didJson, 'did.key.pem': key });
+    chmodSync(join(pub, 'orgs/truong-did/did.json'), 0o644);
+    assert.equal((await createFileKeyStore(pub).didSigner!('truong-did'))?.kid, `${DID}#key-1`);
   });
 
   test('an organisation with DID files gets no X.509 issuing signer (one path per issuer), but may still hold a request key', async () => {

@@ -115,6 +115,11 @@ describe('trust list token', async () => {
     assert.match(await reason(await rawJws({ alg: 'ES256', typ: 'identra-trust-list+jwt', x5c: vc.x5c }, payload(), vc)), /^chain: .*CERT_CHAIN_MALFORMED/);
     await assert.rejects(createTrustListToken({ ...clone(), signer: vc, now: NOW }), /exactly its own certificate/);
   });
+  test('a valid trust-list certificate together with a DID kid is malformed (one trust path per token, ADR-0020 section 2)', async () => {
+    const h = { alg: 'ES256', typ: 'identra-trust-list+jwt', x5c: signer.x5c };
+    assert.match(await reason(await rawJws({ ...h, kid: 'did:certnet:local:a1b2c3d4e5f67890#key-1' }, payload(), signer)), /^malformed: the header carries both x5c and a DID kid/);
+    assert.equal(await reason(await rawJws({ ...h, kid: 'key-1' }, payload(), signer)), 'ok', 'a kid that is no DID changes nothing');
+  });
   test('two certificates in x5c are refused', async () => {
     const x5c = [b64(leaf('trust-list')), b64(ca('root'))];
     assert.match(await reason(await rawJws({ alg: 'ES256', typ: 'identra-trust-list+jwt', x5c }, payload(), signer)), /^chain: .*CERT_CHAIN_MALFORMED/);

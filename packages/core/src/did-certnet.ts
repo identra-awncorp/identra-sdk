@@ -94,7 +94,9 @@ function fromBody(did: string, body: Record<string, unknown>): DidResolutionResu
  * DidResolver for `did:certnet:<network>:<id>` over `GET <gatewayUrl>/v1/dids/<encoded DID>`. Never
  * throws for bad input. Only DIDs of the configured network are requested. Successful resolutions are
  * cached per DID for `cacheSeconds` (default 60, at most 300; 0 = no cache) as counted by `clock`, a
- * clock that stepped back makes an entry stale; failures are never cached. TypeError for bad options.
+ * clock that stepped back makes an entry stale; failures are never cached; at most `maxEntries` DIDs,
+ * the least recently used dropped first. Concurrent resolutions of one DID share one request.
+ * TypeError for bad options.
  */
 export function createCertNetDidResolver(options: {
   gatewayUrl: string;
@@ -111,8 +113,10 @@ export function createCertNetDidResolver(options: {
     throw new TypeError(`cacheSeconds must be an integer from 0 to ${DID_CERTNET_MAX_CACHE_SECONDS}`);
   }
   if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) throw new TypeError('maxEntries must be a positive integer');
-  // Held as JSON text: every caller gets its own copy.
+  // Held as JSON text: every caller gets its own copy. Map order is use order (LRU).
   const cache = new Map<string, { json: string; atMs: number }>();
+  // Concurrent resolutions of one DID share one gateway request.
+  const inflight = new Map<string, Promise<string>>();
 
   async function fetchResolution(did: string): Promise<DidResolutionResult> {
     const unavailable = (message: string) => failure(DID_CERTNET_ERRORS.unavailable, message);
@@ -144,14 +148,24 @@ export function createCertNetDidResolver(options: {
         if (opts?.versionTime !== undefined) return failure(DID_CERTNET_ERRORS.versionTimeNotSupported, 'resolving at a versionTime is not supported');
         const now = clock.now().getTime();
         const held = cache.get(did);
-        if (held && now - held.atMs >= 0 && now - held.atMs < cacheSeconds * 1000) return JSON.parse(held.json) as DidResolutionResult;
         cache.delete(did);
-        const result = await fetchResolution(did);
-        if (result.didDocument && cacheSeconds > 0) {
-          if (cache.size >= maxEntries) cache.delete(cache.keys().next().value!);
-          cache.set(did, { json: JSON.stringify(result), atMs: now });
+        if (held && now - held.atMs >= 0 && now - held.atMs < cacheSeconds * 1000) {
+          cache.set(did, held); // most recently used: evicted last
+          return JSON.parse(held.json) as DidResolutionResult;
         }
-        return result;
+        let pending = inflight.get(did);
+        if (!pending) {
+          pending = fetchResolution(did).then((result) => {
+            const json = JSON.stringify(result);
+            if (result.didDocument && cacheSeconds > 0) {
+              if (cache.size >= maxEntries) cache.delete(cache.keys().next().value!);
+              cache.set(did, { json, atMs: now });
+            }
+            return json;
+          }).finally(() => inflight.delete(did));
+          inflight.set(did, pending);
+        }
+        return JSON.parse(await pending) as DidResolutionResult;
       } catch {
         return failure(DID_CERTNET_ERRORS.unavailable, 'resolution failed');
       }
