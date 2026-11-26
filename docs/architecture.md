@@ -194,7 +194,8 @@ and the wallet operation codes of section 8 (`OFFER_INVALID`, `URL_NOT_ALLOWED`,
 `CREDENTIAL_INVALID`, `CNF_MISMATCH`, `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`,
 `CREDENTIAL_NOT_FOUND`, `TRUST_PATH_UNSUPPORTED`) and of section 9 (`QUERY_NOT_SATISFIED`, `TOO_MANY_ATTEMPTS`,
 `REQUEST_INVALID`, `REQUEST_EXPIRED`, `VERIFIER_ERROR`, `KEY_INVALIDATED`,
-`USER_CANCELLED`, `DEVICE_LOCKED`; the check id `query`).
+`USER_CANCELLED`, `DEVICE_LOCKED`, and `DID_RESOLUTION_UNAVAILABLE` reused by
+`submit`; the check id `query`).
 
 All codes are exported as one `ErrorCodes` constant object; UI and logs branch
 on codes, never on messages. Library error messages are never inspected:
@@ -855,7 +856,8 @@ credential with a DID `kid` fails `did_resolution` (`CREDENTIAL_INVALID`); and
   `URL_NOT_ALLOWED`, `TX_CODE_WRONG`, `TX_CODE_REQUIRED`, `OFFER_EXPIRED`, `NETWORK_ERROR`,
   `ISSUER_ERROR`, `CREDENTIAL_INVALID`, `ISSUER_MISMATCH`, `CNF_MISMATCH`,
   `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`, `CREDENTIAL_NOT_FOUND`,
-  `TRUST_PATH_UNSUPPORTED`, plus the key and presentation codes of section 9.
+  `TRUST_PATH_UNSUPPORTED`, plus the key and presentation codes of section 9
+  (`DID_RESOLUTION_UNAVAILABLE` among them, from `submit`).
 
 Known limitations:
 
@@ -904,7 +906,8 @@ createPresentationVerifier({
 //                              | { ok: false, reason: 'unknown_scenario' (400) | 'verifier_not_listed' (503) }
 // .requestObject(requestId) → HttpResponse | null                       GET  /oid4vp/request/:requestId
 // .handleResponse(requestId, request) → { response, outcome } | null    POST /oid4vp/response/:requestId
-//    outcome = { sessionId, final, ok?, code? } for the server's log (ids and codes only)
+//    outcome = { sessionId, final, ok?, code? } for the server's log (ids and codes only);
+//    final: false with code DID_RESOLUTION_UNAVAILABLE comes with the 503 below
 //    null = this verifier holds no such request (unknown, expired or final): with several
 //    verifiers try the next; with none left answer 404 / 400 invalid_request
 // .session(id) → SessionResource | null      GET  /v1/verification/sessions/:id
@@ -949,6 +952,19 @@ createPresentationVerifier({
   open; the 10th such response ends it as `failed` with the single check
   `holder_binding` / `TOO_MANY_ATTEMPTS`, so a flood cannot burn CPU
   indefinitely (it can deny that one session, as answering first already could).
+  One refusal is answered differently: refused only because `did_resolution`
+  is `DID_RESOLUTION_UNAVAILABLE` (the gateway gave no usable answer, so the
+  issuer's key and the signature were never checked), the answer is `503`
+  with `Retry-After: 5` and `{ "error": "issuer_registry_unavailable",
+  "error_description": <fixed text> }` (`ISSUER_REGISTRY_UNAVAILABLE`): the
+  session stays open and the same request may be answered again. It counts as
+  an attempt like every refusal: what reaches `did_resolution` is the sender's
+  choice (any `did:certnet` DID), so an exemption would give anyone holding the
+  QR unlimited responses during an outage, each a gateway request; a holder
+  retrying by hand within the 5 minutes stays far below 10, and the 10th ends
+  the session with `400` as above. The answer says only that the verifier could
+  not reach its issuer registry: the sender chose the DID, and whether the
+  request is still open is already public (`requestObject`).
   Otherwise `query` runs: `dcql` evaluates the VERIFIED claims, the first
   satisfied claim set wins (`QUERY_NOT_SATISFIED` otherwise, and also when a claim
   of that set is not a non-empty string); a proven holder
@@ -967,7 +983,8 @@ createPresentationVerifier({
   stays identified by X.509 (`x509_hash:`). Without `dpki` a credential with a DID
   `kid` fails `did_resolution` (`DID_RESOLUTION_FAILED`), a gating step, so the
   response is refused and the session stays open; a gateway with no usable answer
-  (`DID_RESOLUTION_UNAVAILABLE`) is refused the same way, never accepted.
+  (`DID_RESOLUTION_UNAVAILABLE`) is refused the same way, never accepted, with
+  the `503` above.
 - `session(id)`: `status` = `verified` / `failed` from the result, else `expired`
   after 5 minutes, else `request_retrieved` / `pending`; `result` absent until
   final; `verifier.name`; `expiresAt` with `serverTime`. Deleted 30 minutes after
@@ -1037,7 +1054,9 @@ wallet.presentations.decline(request) → { ok: true } | WalletFailure   // loca
 - A resolved request is answered at most once: `submit` forgets it right before
   the response is sent, so a second `submit` (even with another claim set) or a
   later `decline` is `REQUEST_INVALID`; a failure before sending (cancelled
-  prompt, untrusted verifier refused, storage) leaves it usable.
+  prompt, untrusted verifier refused, storage) leaves it usable, and so does
+  `DID_RESOLUTION_UNAVAILABLE` (below): the verifier checked nothing and kept
+  its session open, so the same request may be submitted again until it expires.
 - `submit`: `allowUntrusted: true` required for an untrusted verifier
   (`VERIFIER_NOT_TRUSTED`); request not expired on the wallet clock
   (`REQUEST_EXPIRED`); `createPresentation` with exactly the chosen claim set's
@@ -1045,8 +1064,10 @@ wallet.presentations.decline(request) → { ok: true } | WalletFailure   // loca
   credential's own key (where the platform prompts: `USER_CANCELLED`,
   `KEY_INVALIDATED`, `DEVICE_LOCKED`, `KEY_NOT_FOUND`, `STORAGE_ERROR`); JWE
   (noble, ECDH-ES, the verifier's `kid`) of `{ vp_token: { <id>: [presentation] },
-  state }`; POST `response=<jwe>` form-encoded to `response_uri`; 200 → ok,
-  anything else `VERIFIER_ERROR`. No other network call: the credential's status
+  state }`; POST `response=<jwe>` form-encoded to `response_uri`; 200 → ok;
+  `503` whose JSON body has `error` `issuer_registry_unavailable` →
+  `DID_RESOLUTION_UNAVAILABLE` (the verifier could not check now: try again in a
+  moment); anything else (another 503, any other status) `VERIFIER_ERROR`. No other network call: the credential's status
   is not refreshed first. The verifier's verdict is not returned to the wallet
   (cross-device: the website shows it).
 

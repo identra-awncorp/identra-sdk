@@ -38,6 +38,7 @@ export {
   SESSION_KEEP_SECONDS,
   SESSION_SECONDS,
   TRUST_RECHECK_SECONDS,
+  ISSUER_REGISTRY_UNAVAILABLE,
   type CreatedSession,
   type CreateSessionResult,
   type HandledResponse,

@@ -16,6 +16,8 @@ export const SESSION_KEEP_SECONDS = 1800;
 export const MAX_RESPONSE_ATTEMPTS = 10;
 /** How often createSession re-checks that this verifier is still in the trust list. */
 export const TRUST_RECHECK_SECONDS = 3600;
+/** OAuth `error` of the 503 answering a response refused only because the issuer's DID could not be resolved now (DID_RESOLUTION_UNAVAILABLE). */
+export const ISSUER_REGISTRY_UNAVAILABLE = 'issuer_registry_unavailable';
 const ID = /^[A-Za-z0-9_-]{22}$/;
 const MAX_RESPONSE_BYTES = 65536;
 
@@ -77,7 +79,9 @@ export type CreateSessionResult = { ok: true; session: CreatedSession } | { ok: 
  * response (`final: false`) carries why: `MALFORMED` for transport, encryption, `state` or shape,
  * the holder-binding code (KB_INVALID, NONCE_MISMATCH, AUD_MISMATCH, …), or the code of the
  * gating step that failed before holder binding could run (MALFORMED, CERT_*, …); none when another
- * response finalised the session first. Log `sessionId` as a prefix only: it reads the result.
+ * response finalised the session first. `final: false` with DID_RESOLUTION_UNAVAILABLE is the one
+ * "could not check now" refusal: its response is 503 ISSUER_REGISTRY_UNAVAILABLE, every other
+ * refusal's 400 invalid_request. Log `sessionId` as a prefix only: it reads the result.
  */
 export interface ResponseOutcome { sessionId: string; final: boolean; ok?: boolean; code?: ErrorCode }
 export interface HandledResponse { response: HttpResponse; outcome: ResponseOutcome }
@@ -150,6 +154,11 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
     return v === null ? null : (JSON.parse(v) as T);
   };
   const invalid = () => oauthError(400, 'invalid_request', 'the response is not acceptable');
+  /** The issuer's key could not be looked up (DID_RESOLUTION_UNAVAILABLE): nothing was checked, the same request may be answered again. */
+  const issuerRegistryUnavailable = (): HttpResponse => {
+    const r = oauthError(503, ISSUER_REGISTRY_UNAVAILABLE, 'the verifier could not reach its issuer registry; try again shortly');
+    return { ...r, headers: { ...r.headers, 'Retry-After': '5' } };
+  };
 
   /**
    * verifyPresentation, then the query on the verified claims; the result to store, or the
@@ -209,14 +218,21 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
     return true;
   }
 
-  /** A response that did not finalise: 400; the tenth such response finalises the session as TOO_MANY_ATTEMPTS. */
+  /**
+   * A response that did not finalise: 400, or 503 ISSUER_REGISTRY_UNAVAILABLE when it was refused
+   * only because the issuer's DID could not be resolved now. Every one counts, that one too: what
+   * reaches did_resolution is chosen by the sender (any did:certnet DID), so an exemption would let
+   * anyone with the QR send without limit during an outage, each costing a gateway request. The
+   * tenth finalises the session as TOO_MANY_ATTEMPTS (400: retrying can no longer help).
+   */
   async function refused(requestId: string, request: RequestRecord, now: Date, code: ErrorCode): Promise<HandledResponse> {
     const attempts = await store.increment(key('attempts', requestId), SESSION_SECONDS);
     if (attempts >= MAX_RESPONSE_ATTEMPTS) {
       const ended = await finalise(requestId, request, { ok: false, checks: [{ id: 'holder_binding', ok: false, code: 'TOO_MANY_ATTEMPTS' }], verifiedAt: now.toISOString() });
       if (ended) return { response: invalid(), outcome: { sessionId: request.id, final: true, ok: false, code: 'TOO_MANY_ATTEMPTS' } };
     }
-    return { response: invalid(), outcome: { sessionId: request.id, final: false, code } };
+    const response = code === 'DID_RESOLUTION_UNAVAILABLE' ? issuerRegistryUnavailable() : invalid();
+    return { response, outcome: { sessionId: request.id, final: false, code } };
   }
 
   return {

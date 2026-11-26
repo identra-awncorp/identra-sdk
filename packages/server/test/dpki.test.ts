@@ -15,7 +15,7 @@ import {
 import { createWebCryptoSigner, generateWebCryptoKeyPair, webCryptoHasher, webCryptoRandom, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import {
   createCredentialIssuer, createFileKeyStore, createMemoryStateStore, createMemoryStatusListStorage, createPresentationVerifier, createStatusListService, generateIssuerKeys,
-  type HttpResponse, type IssuerKeyStore,
+  ISSUER_REGISTRY_UNAVAILABLE, MAX_RESPONSE_ATTEMPTS, type HttpResponse, type IssuerKeyStore,
 } from '@identra/sdk-server';
 import { DID, fakeClock, fakeGateway, newDidSigner } from './helpers.js';
 
@@ -249,20 +249,30 @@ describe('verifier with the DID path', () => {
     });
     const holder = await createWebCryptoSigner(await generateWebCryptoKeyPair());
     const credential = await issueDiploma({ signer: issuerSigner, hasher: webCryptoHasher, random: webCryptoRandom, clock, iss: DID, cnfJwk: holder.publicJwk, status: { uri: status.uri, idx: status.idx }, claims: DIPLOMA });
-    /** A session answered with the credential presented by its holder; the outcome and the session after it. */
-    const presentOnce = async () => {
+    /** A new session; `send` answers it with `compact` (default: the credential) presented by its holder, or with `vp` as the credential list. */
+    const open = async () => {
       const r = await verifier.createSession({ scenario: 'ung-tuyen' });
       assert.ok(r.ok);
       const jwt = (await verifier.requestObject(r.session.requestId))!.body;
       const p = JSON.parse(utf8Decode(base64UrlDecode(jwt.split('.')[1]!))) as { nonce: string; state: string; client_metadata: { jwks: { keys: JWK[] } } };
-      const presentation = await createPresentation({ compact: credential, disclose: ['ho_ten', 'nganh'], holderSigner: holder, audience: verifier.clientId, nonce: p.nonce, now: clock.now(), hasher: webCryptoHasher });
-      const { kty, crv, x, y, kid } = p.client_metadata.jwks.keys[0]!;
-      const jwe = await new CompactEncrypt(utf8Encode(JSON.stringify({ vp_token: { credential: [presentation] }, state: p.state })))
-        .setProtectedHeader({ alg: 'ECDH-ES', enc: 'A256GCM', ...(kid ? { kid } : {}) }).encrypt(await importJWK({ kty, crv, x, y } as JWK, 'ECDH-ES'));
-      const handled = await verifier.handleResponse(r.session.requestId, { headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `response=${jwe}` });
-      return { outcome: handled!.outcome, session: await verifier.session(r.session.id) };
+      const send = async (o: { compact?: string; vp?: string[] } = {}) => {
+        const presentation = o.vp ? null : await createPresentation({ compact: o.compact ?? credential, disclose: ['ho_ten', 'nganh'], holderSigner: holder, audience: verifier.clientId, nonce: p.nonce, now: clock.now(), hasher: webCryptoHasher });
+        const { kty, crv, x, y, kid } = p.client_metadata.jwks.keys[0]!;
+        const jwe = await new CompactEncrypt(utf8Encode(JSON.stringify({ vp_token: { credential: o.vp ?? [presentation] }, state: p.state })))
+          .setProtectedHeader({ alg: 'ECDH-ES', enc: 'A256GCM', ...(kid ? { kid } : {}) }).encrypt(await importJWK({ kty, crv, x, y } as JWK, 'ECDH-ES'));
+        return (await verifier.handleResponse(r.session.requestId, { headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `response=${jwe}` }))!;
+      };
+      return { id: r.session.id, send, session: () => verifier.session(r.session.id) };
     };
-    return { gateway, verifier, presentOnce, statusService, status };
+    /** A session answered with the credential presented by its holder; the outcome and the session after it. */
+    const presentOnce = async () => {
+      const s = await open();
+      const handled = await s.send();
+      return { outcome: handled.outcome, response: handled.response, session: await s.session() };
+    };
+    /** A diploma of `signer` (default: the registered issuer) for the same holder and status entry. */
+    const diplomaOf = (signer: Signer) => issueDiploma({ signer, hasher: webCryptoHasher, random: webCryptoRandom, clock, iss: signer.kid!.split('#')[0]!, cnfJwk: holder.publicJwk, status: { uri: status.uri, idx: status.idx }, claims: DIPLOMA });
+    return { gateway, verifier, open, presentOnce, diplomaOf, statusService, status };
   }
 
   test('accepts a DID-issued presentation and reports trustPath did, the issuer DID and no name', async () => {
@@ -283,9 +293,52 @@ describe('verifier with the DID path', () => {
 
   test('without dpki a DID-issued presentation is refused (DID_RESOLUTION_FAILED) and never finalises the session', async () => {
     const w = await verifierWorld({ dpki: false });
-    const { outcome, session } = await w.presentOnce();
+    const { outcome, response, session } = await w.presentOnce();
     assert.deepEqual([outcome.final, outcome.code, session!.status], [false, 'DID_RESOLUTION_FAILED', 'request_retrieved']);
+    assert.deepEqual([response.status, body(response)], [400, { error: 'invalid_request', error_description: 'the response is not acceptable' }]);
     assert.deepEqual(w.gateway.state.calls, [], 'no gateway request');
+  });
+
+  test('gateway down: 503 issuer_registry_unavailable, the session stays open and the same session verifies once the gateway is back', async () => {
+    const w = await verifierWorld();
+    const s = await w.open();
+    w.gateway.state.down = true;
+    const down = await s.send();
+    assert.deepEqual(down.outcome, { sessionId: s.id, final: false, code: 'DID_RESOLUTION_UNAVAILABLE' });
+    assert.deepEqual([down.response.status, down.response.headers['Retry-After'], body(down.response)], [
+      503, '5', { error: ISSUER_REGISTRY_UNAVAILABLE, error_description: 'the verifier could not reach its issuer registry; try again shortly' },
+    ]);
+    assert.equal(ISSUER_REGISTRY_UNAVAILABLE, 'issuer_registry_unavailable', 'the wallet matches this exact string');
+    assert.deepEqual([(await s.session())!.status, 'result' in (await s.session())!], ['request_retrieved', false]);
+    // Garbage is still the plain 400, outage or not.
+    const garbage = await s.send({ vp: ['garbage'] });
+    assert.deepEqual([garbage.response.status, garbage.outcome], [400, { sessionId: s.id, final: false, code: 'MALFORMED' }]);
+    w.gateway.state.down = false;
+    const back = await s.send();
+    assert.deepEqual([back.response.status, back.outcome], [200, { sessionId: s.id, final: true, ok: true }]);
+    assert.equal((await s.session())!.status, 'verified');
+  });
+
+  test('definitive refusals keep their 400: a signature by another key of the DID, an unknown DID (DID_RESOLUTION_FAILED)', async () => {
+    const w = await verifierWorld();
+    for (const [signer, code] of [[await newDidSigner(), 'SIGNATURE_INVALID'], [await newDidSigner('did:certnet:local:khongco0001'), 'DID_RESOLUTION_FAILED']] as const) {
+      const s = await w.open();
+      const { response, outcome } = await s.send({ compact: await w.diplomaOf(signer) });
+      assert.deepEqual([response.status, body(response).error, outcome], [400, 'invalid_request', { sessionId: s.id, final: false, code }], code);
+      assert.equal((await s.session())!.status, 'request_retrieved', code);
+    }
+  });
+
+  test(`the attempt limit holds during an outage: the ${MAX_RESPONSE_ATTEMPTS}th unavailable answer ends the session (TOO_MANY_ATTEMPTS, 400)`, async () => {
+    const w = await verifierWorld();
+    const s = await w.open();
+    w.gateway.state.down = true;
+    for (let i = 1; i < MAX_RESPONSE_ATTEMPTS; i++) assert.equal((await s.send()).response.status, 503, `attempt ${i}`);
+    const last = await s.send();
+    assert.deepEqual([last.response.status, last.outcome], [400, { sessionId: s.id, final: true, ok: false, code: 'TOO_MANY_ATTEMPTS' }]);
+    assert.deepEqual([(await s.session())!.status, (await s.session())!.result!.checks], ['failed', [{ id: 'holder_binding', ok: false, code: 'TOO_MANY_ATTEMPTS' }]]);
+    w.gateway.state.down = false;
+    assert.equal(await s.send(), null, 'final: the genuine response comes too late');
   });
 
   test('issuer rejected by the trust registry fails at issuer_trust', async () => {

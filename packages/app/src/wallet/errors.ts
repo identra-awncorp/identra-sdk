@@ -1,5 +1,5 @@
 // The closed list of codes a wallet operation fails with (docs/architecture.md section 8). They are
-// entries of the SDK catalogue ErrorCodes; ISSUER_MISMATCH is the existing verification code.
+// entries of the SDK catalogue ErrorCodes; ISSUER_MISMATCH and DID_RESOLUTION_UNAVAILABLE are existing verification codes.
 import { ErrorCodes, type Check } from '@identra/sdk-core';
 import { CredentialVaultError } from '../credential-vault.js';
 import { isSecretStorageError, WalletKeyError } from '../key-store.js';
@@ -52,6 +52,12 @@ export const WalletErrorCodes = Object.freeze({
   CERT_KEY_NOT_ALLOWED: ErrorCodes.CERT_KEY_NOT_ALLOWED,
   /** The verifier answered the response with something other than 200. */
   VERIFIER_ERROR: ErrorCodes.VERIFIER_ERROR,
+  /**
+   * submit: the verifier could not reach its issuer registry to check the presentation (its 503
+   * `issuer_registry_unavailable`); it checked nothing and the same request may be submitted again
+   * while it is valid.
+   */
+  DID_RESOLUTION_UNAVAILABLE: ErrorCodes.DID_RESOLUTION_UNAVAILABLE,
   // the credential's wallet key (key store, SecretStorageError)
   KEY_NOT_FOUND: ErrorCodes.KEY_NOT_FOUND,
   /** The platform invalidated the key (Android after a biometric change): the credential must be issued again. */

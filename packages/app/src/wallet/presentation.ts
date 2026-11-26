@@ -65,6 +65,14 @@ const requests = new WeakMap<ResolvedPresentation, RequestState>();
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const fail = (code: WalletErrorCode): WalletFailure => ({ ok: false, code });
+/** The OAuth `error` of a JSON error body, or null. */
+function oauthErrorOf(body: string): unknown {
+  try {
+    return (JSON.parse(body) as { error?: unknown } | null)?.error ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /** `client_id` and `request_uri` of a QR text that carries exactly those two parameters. */
 function parseQr(qrText: unknown): { clientId: string; requestUri: string; origin: string } {
@@ -284,7 +292,8 @@ export function createPresentations(ctx: WalletContext) {
   /**
    * A resolved request is answered at most once: it is forgotten right before the response is sent,
    * so a second submit (or a decline afterwards) is REQUEST_INVALID. A failure before sending
-   * (biometric prompt cancelled, untrusted verifier refused, storage) leaves it usable.
+   * (biometric prompt cancelled, untrusted verifier refused, storage) leaves it usable, and so does
+   * DID_RESOLUTION_UNAVAILABLE: the verifier could not check now and kept the session open.
    */
   async function submit(resolved: ResolvedPresentation, choice: { credentialId: string; claimSetIndex: number; allowUntrusted?: boolean }): Promise<{ ok: true } | WalletFailure> {
     const s = requests.get(resolved);
@@ -322,7 +331,14 @@ export function createPresentations(ctx: WalletContext) {
       const r = await depsFor(s.origin).fetch(s.responseUri, {
         method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `response=${encodeURIComponent(jwe)}`, maxBytes: 16_384,
       });
-      return r.status === 200 ? { ok: true } : fail(C.VERIFIER_ERROR);
+      if (r.status === 200) return { ok: true };
+      // The verifier could not look the issuer up now (sdk-server ISSUER_REGISTRY_UNAVAILABLE): it
+      // checked nothing and kept the session open, so the same request may be submitted again.
+      if (r.status === 503 && oauthErrorOf(await r.text()) === 'issuer_registry_unavailable') {
+        requests.set(resolved, s);
+        return fail(C.DID_RESOLUTION_UNAVAILABLE);
+      }
+      return fail(C.VERIFIER_ERROR);
     } catch (e) {
       const code: ErrorCode = e instanceof WalletFetchError && e.code !== 'ISSUER_ERROR' ? e.code : C.VERIFIER_ERROR;
       return fail(code as WalletErrorCode);

@@ -28,7 +28,9 @@ wallet used in Node end-to-end tests. Pure JavaScript on `@noble/curves`, `@nobl
   same resolved offer (the PIN is not needed again); call `offers.discard(offer)` when the user gives up.
   The `credentials` table's CHECK constraint gained `invalid`: recreate an existing table;
   `wallet.presentations.resolve` / `submit` / `decline` answer an OpenID4VP 1.0 request
-  (section 9). Failures are `{ ok: false, code }` with a code of `WalletErrorCodes`.
+  (section 9). Failures are `{ ok: false, code }` with a code of `WalletErrorCodes`. `submit` failing
+  with `DID_RESOLUTION_UNAVAILABLE` (the verifier could not reach its issuer registry now) leaves the
+  request usable: offer "try again in a moment" and call `submit` again on it until it expires.
 
 ## What the app provides
 

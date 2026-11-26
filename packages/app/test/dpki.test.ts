@@ -177,6 +177,42 @@ describe('not checked yet versus refused', () => {
     assert.deepEqual([w2.rows.size, w2.secrets.size], [0, 0]);
   });
 
+  test('the verifier cannot reach the gateway: submit is DID_RESOLUTION_UNAVAILABLE, the request stays usable, and the same request verifies once it is back', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const credentialId = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const session = await newSession(verifier);
+    const request = await w.wallet.presentations.resolve(session.qr);
+    assert.ok(request.ok);
+    world.gateway.state.down = true;
+    const seen = listener.log.length;
+    for (let i = 0; i < 2; i++) {
+      assert.deepEqual(await w.wallet.presentations.submit(request.request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'DID_RESOLUTION_UNAVAILABLE' });
+    }
+    assert.deepEqual(listener.log.slice(seen).filter((l) => l.path.startsWith('/oid4vp/response/')).map((l) => l.status), [503, 503]);
+    assert.equal((await verifier.session(session.id))?.status, 'request_retrieved');
+    world.gateway.state.down = false;
+    assert.deepEqual(await w.wallet.presentations.submit(request.request, { credentialId, claimSetIndex: 1 }), { ok: true });
+    assert.equal((await verifier.session(session.id))?.status, 'verified');
+    assert.deepEqual(await w.wallet.presentations.submit(request.request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'REQUEST_INVALID' }, 'answered: forgotten');
+  });
+
+  test('only a 503 with issuer_registry_unavailable is that failure: other answers stay VERIFIER_ERROR and the request is forgotten', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const credentialId = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const json = (error: string) => JSON.stringify({ error, error_description: 'x' });
+    for (const [status, body] of [[503, json('temporarily_unavailable')], [503, ''], [503, 'issuer_registry_unavailable'], [500, json('issuer_registry_unavailable')], [400, json('issuer_registry_unavailable')]] as const) {
+      listener.routes.set('POST /oid4vp/response/*', async () => ({ status, headers: { 'Content-Type': 'application/json' }, body }));
+      const request = await w.wallet.presentations.resolve((await newSession(verifier)).qr);
+      assert.ok(request.ok);
+      assert.deepEqual(await w.wallet.presentations.submit(request.request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'VERIFIER_ERROR' }, `${status} ${body}`);
+      assert.deepEqual(await w.wallet.presentations.submit(request.request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'REQUEST_INVALID' }, `${status} ${body}`);
+    }
+  });
+
   test('DID unresolvable for a credential the metadata did not announce: refused at once, nothing kept', async () => {
     const world = await createWorld(listener, { did: {} });
     patchMetadata('truong-did', (m) => delete m['identra_issuer_did']);
