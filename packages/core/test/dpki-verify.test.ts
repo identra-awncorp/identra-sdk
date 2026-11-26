@@ -81,6 +81,19 @@ describe('did_resolution: checks before any network call', () => {
     assert.equal(r.checks.some((c) => c.id === 'certificate_chain'), false);
     assert.equal(w.calls.length, 0);
   });
+  test('no x5c and a kid that is not a DID URL (or no string at all) is the X.509 path: CERT_CHAIN_MALFORMED at certificate_chain, with and without dpki, no request', async () => {
+    for (const kid of ['key-1', '', 'DID:certnet:local:a1b2c3d4e5f67890#key-1', 42, null]) {
+      const w = await dpkiWorld();
+      const compact = await crafted({ kid });
+      for (const options of [w.options, verifyOptions()]) {
+        const r = await verifyStoredCredential(compact, options);
+        expect(r, 'certificate_chain', ErrorCodes.CERT_CHAIN_MALFORMED);
+        assert.equal(r.checks.some((c) => c.id === 'did_resolution'), false, String(kid));
+        assert.deepEqual(codes(r).slice(0, 4), [['structure', null], ['algorithm', null], ['certificate_chain', ErrorCodes.CERT_CHAIN_MALFORMED], ['signature', 'SKIPPED']], String(kid));
+      }
+      assert.equal(w.calls.length, 0, String(kid));
+    }
+  });
   test('both x5c and a DID kid is MALFORMED at structure, and the skipped list names certificate_chain', async () => {
     const w = await dpkiWorld();
     const r = await verifyStoredCredential(await crafted({ header: { x5c: x5c('vc') } }), w.options);
@@ -160,6 +173,14 @@ describe('issuer_trust on the DID path', () => {
   test('an answer about another DID, 503, timeout: TRUST_LIST_UNAVAILABLE', async () => {
     for (const route of [json(tirBody({ issuerDid: OTHER_DID })), { status: 503, body: '' }, new Error('timeout after 5000 ms')]) {
       expect((await withTir(route)).r, 'issuer_trust', ErrorCodes.TRUST_LIST_UNAVAILABLE);
+    }
+  });
+  test('an oversized or non-JSON answer: TRUST_LIST_UNAVAILABLE, no claims, no status request', async () => {
+    for (const route of [ok(JSON.stringify({ ...tirBody(), pad: 'a'.repeat(70_000) })), ok('<html>'), ok('')]) {
+      const { r, w } = await withTir(route);
+      expect(r, 'issuer_trust', ErrorCodes.TRUST_LIST_UNAVAILABLE);
+      assert.equal(check(r, 'status').code, ErrorCodes.SKIPPED);
+      assert.equal(w.callsTo(DID_STATUS.uri), 0);
     }
   });
   test('a registry of its own: only trusted === true trusts; a failure other than TrustListUnavailableError is ISSUER_NOT_TRUSTED', async () => {

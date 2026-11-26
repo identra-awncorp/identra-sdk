@@ -39,8 +39,9 @@ wallet used in Node end-to-end tests. Pure JavaScript on `@noble/curves`, `@nobl
   from the delivery, every `resolve` of the same QR by this wallet instance (a remounted screen, the
   "open request" button again, a `decline` then a re-scan) returns
   `pinned: { credentialId, claimSetIndex, sends }` (else `pinned: null`): show the locked retry
-  screen with only that choice. At most `MAX_PRESENTATION_SENDS` (3) sends per request in all; after
-  that the verifier's 503 is `VERIFIER_ERROR` and `resolve` of that QR is `REQUEST_INVALID`. At most
+  screen with only that choice. At most `MAX_PRESENTATION_SENDS` (3) sends per request in all, so only
+  the 503s that answer the first two say "try again" (`DID_RESOLUTION_UNAVAILABLE`); the 503 that
+  answers the third send is already `VERIFIER_ERROR`, and `resolve` of that QR is then `REQUEST_INVALID`. At most
   `MAX_PRESENTATION_PINS` (32) pins are held at once. The memory is in the wallet instance only:
   after a restart the same QR resolves unpinned; to keep the lock across restarts, use the sharing
   history record (QR `request_uri`, verifier, credential, claim set, time). The same 503 for an

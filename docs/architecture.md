@@ -767,9 +767,12 @@ credential with a DID `kid` fails `did_resolution` (`CREDENTIAL_INVALID`); and
   `verifyStoredCredential` passes completely, or fails ONLY
   because the trust list (`issuer_trust` `TRUST_LIST_UNAVAILABLE`, `status`
   `SKIPPED`) or the status list (`STATUS_UNAVAILABLE`) could not be read, and the
-  credential carries a well-formed status reference (`<iss>/status/<n>`, `idx`
-  inside the list) — then the credential is kept with status `unknown` and
-  `refreshStatus` settles it later; `issuerName` is then null when the trust list
+  credential carries a well-formed status reference (`<iss>/status/<n>` on the
+  X.509 path; on the DID path `https://<host>/<path>/status/<n>`, bound to the
+  credential issuer by the issuer rule below, see section 11; `idx` inside the
+  list; on the DID path the CertNet trust registry counts as "the trust list" in
+  this rule, as in `refreshStatus`) — then the credential is kept with status
+  `unknown` and `refreshStatus` settles it later; `issuerName` is then null when the trust list
   was the one missing (`CREDENTIAL_INVALID` with `checks` for anything else, an
   untrusted issuer and a missing or malformed status reference included) → the
   issuer (`ISSUER_MISMATCH`): without `identra_issuer_did` in the metadata the
@@ -1460,6 +1463,25 @@ Known limitations:
   those. The Identra server answers only its own lists, in process; the wallet's
   guarded fetch refuses IP literals and single-label hosts, and receipt binds the
   status URI to the credential issuer URL.
+- The same rule refuses internal names only by a list of last labels
+  (`INTERNAL_TLDS`), so other internal names (`*.consul`, a split-horizon name
+  under a public suffix) pass the rule itself. What bounds it is not the rule:
+  `sdk-server` takes the status checker, and so the `fetch` that decides which
+  hosts are reachable, from the deployment (`verification.statusChecker`; this
+  repository does not restrict it, section 7 says the Identra deployment serves
+  only its own lists); and the wallet at receipt (`matchesDeclaredIssuer`,
+  `issuance.ts`) accepts a DID credential only when its status URI is exactly
+  `<credential_issuer>/status/<n>`, an origin the wallet already reached for the
+  offer, so a credential cannot make it fetch a list from another host.
+- The presentation pin (section 9) is keyed on the literal string
+  `<client_id> <request_uri>`. It protects the re-opening of the same request
+  after the verifier's 503 `issuer_registry_unavailable`, not against a verifier
+  that asks again: another spelling of the URI, or a new QR, is another request
+  and gets a new, fully warned consent. A fixed `request_uri` that a verifier
+  reuses for new sessions, once pinned, stays locked to the first choice (and
+  `resolve` is `REQUEST_INVALID` if the request no longer offers it) for 600 s
+  from the first delivery, not extended. At most `MAX_PRESENTATION_PINS` (32) pins are held per
+  wallet; once full, that 503 is `VERIFIER_ERROR` and the request is not kept.
 - During a gateway outage, anyone holding only a photographed QR code can tell
   whether this verifier resolved a given issuer DID in the last 60 s: a
   presentation naming that DID (it need not verify) is answered 503
