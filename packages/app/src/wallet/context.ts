@@ -1,5 +1,5 @@
 // What every part of the wallet object works with; built once by createWallet.
-import type { CertificateChainValidator, Clock, Hasher, HttpFetch, RandomSource, StatusChecker, TrustRegistry, Verifier, VerifyCredentialOptions } from '@identra/sdk-core';
+import type { CertificateChainValidator, CertNetNetwork, Clock, Hasher, HttpFetch, RandomSource, StatusChecker, TrustRegistry, Verifier, VerifyCredentialOptions } from '@identra/sdk-core';
 import type { CredentialVault } from '../credential-vault.js';
 import type { WalletKeyStore } from '../key-store.js';
 
@@ -18,6 +18,8 @@ export interface WalletContext {
   statusChecker: StatusChecker;
   /** The DID trust path (ADR-0020), or null: DID-issued credentials are then refused. */
   dpki: VerifyCredentialOptions['dpki'] | null;
+  /** `dpki.network` when the app gave it: a declared DID of another network is refused at resolve. */
+  didNetwork: CertNetNetwork | null;
   supportedVcts: readonly string[];
   /** When set, the only origins whose offers and presentation requests the wallet opens. */
   allowedOrigins: readonly string[] | null;

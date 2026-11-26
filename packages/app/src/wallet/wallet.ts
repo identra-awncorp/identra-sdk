@@ -2,7 +2,7 @@
 // It builds the chain validator, the trust registry and the status checker once.
 import {
   createCertificateChainValidator, createSignedTrustListRegistry, createStatusListChecker, TRUST_LIST_TOKEN_MAX_BYTES, VCT,
-  type Clock, type DidResolver, type DidTrustRegistry, type Hasher, type HttpFetch, type RandomSource, type SeenStore, type Verifier,
+  type CertNetNetwork, type Clock, type DidResolver, type DidTrustRegistry, type Hasher, type HttpFetch, type RandomSource, type SeenStore, type Verifier,
 } from '@identra/sdk-core';
 import type { CredentialVault } from '../credential-vault.js';
 import { nobleHasher, nobleVerifier } from '../crypto/noble.js';
@@ -39,9 +39,11 @@ export interface WalletConfig {
   /**
    * The DID trust path (ADR-0020): createCertNetDidResolver and createCertNetTrustRegistry, built by
    * the app from the deployment's gateway URL and network with the app's fetch; the gateway is reached
-   * only through them. Unset: credentials of DID issuers are refused.
+   * only through them. Unset: credentials of DID issuers are refused. `network`, optional: the
+   * network the resolver was built for; when given, an offer declaring a DID of another network is
+   * TRUST_PATH_UNSUPPORTED at resolve, before the PIN is used (without it that DID fails at accept).
    */
-  dpki?: { resolver: DidResolver; trustRegistry: DidTrustRegistry };
+  dpki?: { resolver: DidResolver; trustRegistry: DidTrustRegistry; network?: CertNetNetwork };
 }
 
 /**
@@ -69,12 +71,15 @@ export function createWallet(config: WalletConfig) {
   });
   const chainValidator = createCertificateChainValidator({ trustedRoots, verifier, hasher });
   const trustRegistry = createSignedTrustListRegistry({ url: trustListUrl, fetch: listsFetch, verifier, chainValidator, clock, ...(seen ? { seen } : {}) });
-  const dpki = config.dpki ?? null;
-  if (dpki && (typeof dpki.resolver?.resolve !== 'function' || typeof dpki.trustRegistry?.lookupIssuer !== 'function')) throw new TypeError('dpki needs a resolver and a trustRegistry');
+  const given = config.dpki ?? null;
+  if (given && (typeof given.resolver?.resolve !== 'function' || typeof given.trustRegistry?.lookupIssuer !== 'function')) throw new TypeError('dpki needs a resolver and a trustRegistry');
+  const didNetwork = given?.network ?? null;
+  if (didNetwork !== null && !['local', 'testnet', 'mainnet'].includes(didNetwork)) throw new TypeError('dpki.network must be local, testnet or mainnet');
+  const dpki = given ? { resolver: given.resolver, trustRegistry: given.trustRegistry } : null;
   const statusChecker = createStatusListChecker({
     fetch: listsFetch, verifier, chainValidator, trustRegistry, clock, ...(seen ? { seen } : {}), ...(dpki ? { didResolver: dpki.resolver } : {}),
   });
-  const ctx: WalletContext = { keyStore, vault, fetch, random, clock, verifier, hasher, chainValidator, trustRegistry, statusChecker, dpki, supportedVcts, allowedOrigins };
+  const ctx: WalletContext = { keyStore, vault, fetch, random, clock, verifier, hasher, chainValidator, trustRegistry, statusChecker, dpki, didNetwork, supportedVcts, allowedOrigins };
 
   return {
     offers: createIssuance(ctx),

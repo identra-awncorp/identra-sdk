@@ -29,8 +29,14 @@ wallet used in Node end-to-end tests. Pure JavaScript on `@noble/curves`, `@nobl
   The `credentials` table's CHECK constraint gained `invalid`: recreate an existing table;
   `wallet.presentations.resolve` / `submit` / `decline` answer an OpenID4VP 1.0 request
   (section 9). Failures are `{ ok: false, code }` with a code of `WalletErrorCodes`. `submit` failing
-  with `DID_RESOLUTION_UNAVAILABLE` (the verifier could not reach its issuer registry now) leaves the
-  request usable: offer "try again in a moment" and call `submit` again on it until it expires.
+  with `{ ok: false, code: 'DID_RESOLUTION_UNAVAILABLE', delivered: true }` (only for a credential of
+  the DID path in a wallet with `dpki`: the verifier could not reach its issuer registry now) means
+  the verifier RECEIVED the presentation: record it in the sharing history. The request stays usable,
+  pinned to that choice: offer "try again in a moment" and call `submit` again with the SAME
+  `credentialId` and `claimSetIndex` (a fresh presentation of the same claims is signed and sent);
+  any other choice is `REQUEST_INVALID` and forgets the request without sending anything. After
+  `MAX_PRESENTATION_SENDS` (3) sends the verifier's 503 is `VERIFIER_ERROR` and the request is gone.
+  The same 503 for an X.509 credential, or in a wallet without `dpki`, is `VERIFIER_ERROR`.
 
 ## What the app provides
 
@@ -60,8 +66,10 @@ to `createWallet`, built by the app from the deployment's gateway URL and networ
 `createCertNetDidResolver({ gatewayUrl, network, fetch, clock })` and
 `createCertNetTrustRegistry({ gatewayUrl, network, fetch })` of `@identra/sdk-core` (the same
 `HttpFetch` rules apply; the gateway must allow CORS on its two read routes for the web wallet).
-Without it, offers of DID issuers are refused at `resolve` with `TRUST_PATH_UNSUPPORTED` (a
-malformed `identra_issuer_did` is `OFFER_INVALID`), and `refreshStatus` of a DID credential stored
+Pass `dpki.network` too (the network the resolver was built for): an offer declaring a DID of another
+network is then `TRUST_PATH_UNSUPPORTED` at `resolve`, before the PIN is used.
+Without `dpki`, offers of DID issuers are refused at `resolve` with `TRUST_PATH_UNSUPPORTED` (a
+malformed `identra_issuer_did`, or one longer than `MAX_DID_LENGTH` = 128 characters, is `OFFER_INVALID`), and `refreshStatus` of a DID credential stored
 earlier is `unknown`. `ResolvedOffer.issuerDid` is the DID the issuer's metadata declares, not yet
 verified, or null for an X.509 issuer: show it instead of the self-declared display name. A credential of that path is stored with
 `issuer_did`: add the nullable column to an existing table (`ALTER TABLE credentials ADD COLUMN

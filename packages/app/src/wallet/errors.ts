@@ -30,7 +30,7 @@ export const WalletErrorCodes = Object.freeze({
   /** The key store or the vault failed. */
   STORAGE_ERROR: ErrorCodes.STORAGE_ERROR,
   CREDENTIAL_NOT_FOUND: ErrorCodes.CREDENTIAL_NOT_FOUND,
-  /** resolve: the metadata declares `identra_issuer_did` (a well-formed DID) and the wallet was created without `dpki`. */
+  /** resolve: the metadata declares `identra_issuer_did` (a well-formed DID) and the wallet was created without `dpki`, or the DID is of another network than `dpki.network`. */
   TRUST_PATH_UNSUPPORTED: ErrorCodes.TRUST_PATH_UNSUPPORTED,
   // presentation (architecture section 9)
   /** The request object or the QR code is not one this wallet accepts. */
@@ -53,9 +53,10 @@ export const WalletErrorCodes = Object.freeze({
   /** The verifier answered the response with something other than 200. */
   VERIFIER_ERROR: ErrorCodes.VERIFIER_ERROR,
   /**
-   * submit: the verifier could not reach its issuer registry to check the presentation (its 503
-   * `issuer_registry_unavailable`); it checked nothing and the same request may be submitted again
-   * while it is valid.
+   * submit, with `delivered: true`: the verifier received the presentation of a DID-path credential
+   * but could not reach its issuer registry to check it (its 503 `issuer_registry_unavailable`); it
+   * checked nothing and the same request may be submitted again, with the same choice, while it is
+   * valid (presentation.ts MAX_PRESENTATION_SENDS).
    */
   DID_RESOLUTION_UNAVAILABLE: ErrorCodes.DID_RESOLUTION_UNAVAILABLE,
   // the credential's wallet key (key store, SecretStorageError)

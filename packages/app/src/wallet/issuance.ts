@@ -17,6 +17,12 @@ import { verifyOptionsOf, type WalletContext } from './context.js';
 /** Claims a credential type must disclose to the holder; only holder-bound types can be received. */
 export const REQUIRED_CLAIMS: Readonly<Record<string, readonly string[]>> = Object.freeze({ [VCT.diploma]: DIPLOMA_CLAIMS });
 
+/**
+ * The longest DID the wallet accepts from an issuer (`identra_issuer_did`; a credential's `iss` must
+ * then be that DID). CertNet states no maximum for the method-specific id; `did:certnet:testnet:`
+ * is 20 characters and the ids seen are far shorter than the remaining 108.
+ */
+export const MAX_DID_LENGTH = 128;
 const PRE_AUTHORIZED_GRANT = 'urn:ietf:params:oauth:grant-type:pre-authorized_code';
 const OFFER_SCHEME = 'openid-credential-offer://?';
 
@@ -168,7 +174,7 @@ function checkMetadata(session: IssuerSession, origin: string, supportedVcts: re
   if (binding !== undefined && !strings(binding).includes('jwk')) throw new Fail(C.OFFER_INVALID);
   const meta = supported['credential_metadata'];
   const issuerDid = ci['identra_issuer_did'];
-  if (issuerDid !== undefined && !isCertNetDid(issuerDid)) throw new Fail(C.OFFER_INVALID);
+  if (issuerDid !== undefined && (!isCertNetDid(issuerDid) || issuerDid.length > MAX_DID_LENGTH)) throw new Fail(C.OFFER_INVALID);
   return { configurationId, vct: supported['vct'], display: displayOf(isObject(meta) ? meta['display'] : supported['display']), issuerDid: issuerDid ?? null };
 }
 
@@ -198,6 +204,21 @@ export function onlyListsUnavailable(result: Pick<CredentialVerificationResult, 
  */
 export const didUnresolved = (result: Pick<CredentialVerificationResult, 'checks'>): boolean =>
   result.checks.some((c) => c.id === 'did_resolution' && c.code === 'DID_RESOLUTION_UNAVAILABLE');
+
+/**
+ * The receipt rule (ADR-0020 decision 7): the issuer declared a DID -> the DID path with exactly that
+ * `iss`, and its status list `<credential_issuer>/status/<n>` (as `<iss>/status/<n>` binds it on the
+ * X.509 path); no DID declared -> the X.509 path with `iss` = the credential issuer URL. Applied to
+ * the unverified payload before verification (`trustPath` not known yet), so nothing is fetched for
+ * a credential that would be refused anyway, and to the verified credential afterwards.
+ */
+export function matchesDeclaredIssuer(
+  c: { trustPath?: 'x509' | 'did'; iss: unknown; statusUri: unknown },
+  declared: { issuerUri: string; issuerDid: string | null },
+): boolean {
+  if (declared.issuerDid !== null) return (c.trustPath ?? 'did') === 'did' && c.iss === declared.issuerDid && isStatusListUri(c.statusUri, declared.issuerUri);
+  return (c.trustPath ?? 'x509') === 'x509' && c.iss === declared.issuerUri;
+}
 
 /** No answer, or the issuer's 503 (a temporary failure before it spent anything): the same request may be sent again. */
 const retryLater = (f: { code: string; httpStatus: number | null }) => f.code === 'NETWORK_ERROR' || f.httpStatus === 503;
@@ -309,7 +330,7 @@ export function createIssuance(ctx: WalletContext) {
       const session = await library(() => resolveMetadata(offer, deps));
       const { configurationId, vct, display, issuerDid } = checkMetadata(session, origin, ctx.supportedVcts);
       // A DID issuer's credential could never be accepted without the DID path: refused before the PIN is spent.
-      if (issuerDid !== null && !ctx.dpki) throw new Fail(C.TRUST_PATH_UNSUPPORTED);
+      if (issuerDid !== null && (!ctx.dpki || (ctx.didNetwork !== null && !isCertNetDid(issuerDid, ctx.didNetwork)))) throw new Fail(C.TRUST_PATH_UNSUPPORTED);
       const grant = (offer['grants'] as Record<string, Record<string, unknown>>)[PRE_AUTHORIZED_GRANT]!;
       const tx = grant['tx_code'];
       const state: OfferState = {
@@ -429,6 +450,14 @@ export function createIssuance(ctx: WalletContext) {
     state.unverified = null;
     try {
       const { compact, keyId, publicJwk } = u;
+      let claimed: Record<string, unknown> | null = null;
+      try {
+        claimed = decodeCredentialUnverified(compact).payload;
+      } catch {
+        // not decodable: verification below says why
+      }
+      const claimedStatus = claimed && isObject(claimed['status']) && isObject(claimed['status']['status_list']) ? claimed['status']['status_list']['uri'] : undefined;
+      if (claimed && !matchesDeclaredIssuer({ iss: claimed['iss'], statusUri: claimedStatus }, state)) throw new Fail(C.ISSUER_MISMATCH);
       // Exactly what the wallet will rely on when it presents the credential (ADR-0007).
       const result = await verifyStoredCredential(compact, verifyOptionsOf(ctx));
       if (didUnresolved(result)) {
@@ -441,13 +470,8 @@ export function createIssuance(ctx: WalletContext) {
       // A credential that verified except for a list that could not be read is kept as `unknown`.
       const listsDown = !result.ok && onlyListsUnavailable(result);
       if (!credential || (!result.ok && !listsDown)) throw new Fail(C.CREDENTIAL_INVALID, result.checks);
-      // ADR-0020 decision 7: the issuer declared a DID -> the DID path with exactly that `iss`, and its
-      // status list under the credential issuer URL (as `<iss>/status/<n>` binds it on the X.509 path);
-      // no DID declared -> the X.509 path with `iss` = the credential issuer URL.
-      if (state.issuerDid !== null) {
-        if (credential.trustPath !== 'did' || credential.iss !== state.issuerDid) throw new Fail(C.ISSUER_MISMATCH);
-        if (!credential.status || !isStatusListUri(credential.status.uri, state.issuerUri)) throw new Fail(C.ISSUER_MISMATCH);
-      } else if (credential.trustPath !== 'x509' || credential.iss !== state.issuerUri) throw new Fail(C.ISSUER_MISMATCH);
+      // The receipt rule again, on what verification established: this is the check that counts.
+      if (!matchesDeclaredIssuer({ trustPath: credential.trustPath, iss: credential.iss, statusUri: credential.status?.uri }, state)) throw new Fail(C.ISSUER_MISMATCH);
       if (credential.vct !== state.vct) throw new Fail(C.ISSUER_ERROR);
       if (!credential.cnfJwk || (await jwkThumbprint(credential.cnfJwk, ctx.hasher)) !== (await jwkThumbprint(publicJwk, ctx.hasher))) throw new Fail(C.CNF_MISMATCH);
       // Every claim of the type must be its own disclosure and absent from the plain payload, or the

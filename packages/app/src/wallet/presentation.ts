@@ -21,6 +21,14 @@ const CLIENT_ID = /^x509_hash:[A-Za-z0-9_-]{43}$/;
 const SKEW_SECONDS = 60;
 const MAX_REQUEST_SECONDS = 600;
 const SIOP_AUDIENCE = 'https://self-issued.me/v2';
+/**
+ * A request is sent to the verifier at most this many times: the first submit plus at most two
+ * retries after the verifier's 503 `issuer_registry_unavailable`. Each send hands the verifier a
+ * readable, freshly signed presentation of the same claims; a real outage of its CertNet gateway is
+ * either over within the request's minutes or not worth more prompts, and a verifier that keeps
+ * answering 503 must not be able to collect fresh signatures at will.
+ */
+export const MAX_PRESENTATION_SENDS = 3;
 
 export type VerifierIdentity = { trusted: true; ten: string; maToChuc: string } | { trusted: false };
 
@@ -60,8 +68,12 @@ interface RequestState {
   claimSets: string[][];
   expiresAt: number;
   offered: Map<string, number[]>;
+  /** Set once the verifier answered the 503 above: what was sent, the only choice a retry may send again. */
+  sent?: { credentialId: string; claimSetIndex: number; count: number };
 }
 const requests = new WeakMap<ResolvedPresentation, RequestState>();
+/** Requests whose response is being POSTed; submit or decline meanwhile removes the entry, so the request is not kept for a retry. */
+const sending = new WeakMap<ResolvedPresentation, RequestState>();
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const fail = (code: WalletErrorCode): WalletFailure => ({ ok: false, code });
@@ -293,12 +305,26 @@ export function createPresentations(ctx: WalletContext) {
    * A resolved request is answered at most once: it is forgotten right before the response is sent,
    * so a second submit (or a decline afterwards) is REQUEST_INVALID. A failure before sending
    * (biometric prompt cancelled, untrusted verifier refused, storage) leaves it usable, and so does
-   * DID_RESOLUTION_UNAVAILABLE: the verifier could not check now and kept the session open.
+   * DID_RESOLUTION_UNAVAILABLE with `delivered: true`: the verifier received the presentation but
+   * could not check a DID-path credential now and kept the session open. The request is then pinned
+   * to what was sent: a retry re-signs a fresh presentation of the same credential and claim set;
+   * any other choice is REQUEST_INVALID, forgets the request and sends nothing. At most
+   * MAX_PRESENTATION_SENDS sends per request.
    */
-  async function submit(resolved: ResolvedPresentation, choice: { credentialId: string; claimSetIndex: number; allowUntrusted?: boolean }): Promise<{ ok: true } | WalletFailure> {
+  async function submit(
+    resolved: ResolvedPresentation,
+    choice: { credentialId: string; claimSetIndex: number; allowUntrusted?: boolean },
+  ): Promise<{ ok: true } | (WalletFailure & { delivered?: true })> {
     const s = requests.get(resolved);
-    if (!s) return fail(C.REQUEST_INVALID);
+    if (!s) {
+      sending.delete(resolved); // touched while in flight: not kept for a retry
+      return fail(C.REQUEST_INVALID);
+    }
     if (!s.offered.get(choice.credentialId)?.includes(choice.claimSetIndex)) throw new TypeError('credentialId and claimSetIndex must be one of the offered matches');
+    if (s.sent && (s.sent.credentialId !== choice.credentialId || s.sent.claimSetIndex !== choice.claimSetIndex)) {
+      requests.delete(resolved);
+      return fail(C.REQUEST_INVALID);
+    }
     if (!s.trusted && choice.allowUntrusted !== true) return fail(C.VERIFIER_NOT_TRUSTED);
     if (ctx.clock.now().getTime() >= s.expiresAt) return fail(C.REQUEST_EXPIRED);
     let row;
@@ -327,27 +353,41 @@ export function createPresentations(ctx: WalletContext) {
     const header = s.encryptionJwk.kid !== undefined ? { kid: s.encryptionJwk.kid } : {};
     const jwe = encryptJwe({ recipientPublicJwk: s.encryptionJwk, enc: s.enc, plaintext: utf8Encode(JSON.stringify(payload)), random: ctx.random, header });
     if (!requests.delete(resolved)) return fail(C.REQUEST_INVALID); // a concurrent submit got here first
+    sending.set(resolved, s);
+    const sends = (s.sent?.count ?? 0) + 1;
     try {
       const r = await depsFor(s.origin).fetch(s.responseUri, {
         method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `response=${encodeURIComponent(jwe)}`, maxBytes: 16_384,
       });
       if (r.status === 200) return { ok: true };
       // The verifier could not look the issuer up now (sdk-server ISSUER_REGISTRY_UNAVAILABLE): it
-      // checked nothing and kept the session open, so the same request may be submitted again.
-      if (r.status === 503 && oauthErrorOf(await r.text()) === 'issuer_registry_unavailable') {
+      // checked nothing and kept the session open. Only a DID-path credential in a wallet with the
+      // DID path can be "not checked because of CertNet"; for anything else this answer is the
+      // verifier's error like any other 503. Kept only when nothing touched the request meanwhile.
+      if (r.status === 503 && oauthErrorOf(await r.text()) === 'issuer_registry_unavailable' && ctx.dpki && trustPathOf(row).trustPath === 'did' &&
+        sends < MAX_PRESENTATION_SENDS && sending.get(resolved) === s) {
+        s.sent = { credentialId: choice.credentialId, claimSetIndex: choice.claimSetIndex, count: sends };
         requests.set(resolved, s);
-        return fail(C.DID_RESOLUTION_UNAVAILABLE);
+        return { ok: false, code: C.DID_RESOLUTION_UNAVAILABLE, delivered: true };
       }
       return fail(C.VERIFIER_ERROR);
     } catch (e) {
       const code: ErrorCode = e instanceof WalletFetchError && e.code !== 'ISSUER_ERROR' ? e.code : C.VERIFIER_ERROR;
       return fail(code as WalletErrorCode);
+    } finally {
+      sending.delete(resolved);
     }
   }
 
-  /** Forgets the request; REQUEST_INVALID when it was already answered or declined. No network call: an OpenID4VP error response is optional and not sent. */
+  /**
+   * Forgets the request; REQUEST_INVALID when it was already answered or declined, or is being sent
+   * (it is then not kept for a retry, whatever the verifier answers). No network call: an OpenID4VP
+   * error response is optional and not sent.
+   */
   function decline(resolved: ResolvedPresentation): { ok: true } | WalletFailure {
-    return requests.delete(resolved) ? { ok: true } : fail(C.REQUEST_INVALID);
+    if (requests.delete(resolved)) return { ok: true };
+    sending.delete(resolved);
+    return fail(C.REQUEST_INVALID);
   }
 
   return { resolve, submit, decline };

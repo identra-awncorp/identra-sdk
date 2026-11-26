@@ -693,7 +693,7 @@ request may be sent again, and the wallet then keeps its token and reports
 createWallet({ keyStore, vault, fetch, random, clock, trustedRoots, trustListUrl,
                supportedVcts? /* [diploma] */, seen?, verifier? /* noble */, hasher? /* noble */,
                allowedOrigins? /* exact origins of offers and presentation requests */,
-               dpki? /* { resolver, trustRegistry }: the DID trust path, section 11 */ })
+               dpki? /* { resolver, trustRegistry, network? }: the DID trust path, section 11 */ })
 wallet.offers.resolve(qrText) → { ok: true, offer: ResolvedOffer /* incl. issuerOrigin, issuerDid: string | null, readonly codeRedeemed */ } | WalletFailure
 wallet.offers.accept(offer, { txCode }) → { ok: true, credentialId, vct, issuerName: string | null, issuerDid? /* DID path only */, status: 'valid' | 'unknown' }
                                         | { ok: false, code, checks?, retryable: boolean, codeRedeemed: boolean }
@@ -731,7 +731,10 @@ fetches never admit it.
 The DID trust path (section 11) is on only with `dpki: { resolver, trustRegistry }`
 (`createCertNetDidResolver`, `createCertNetTrustRegistry`, built by the app from the
 deployment's gateway URL and network); the status checker then gets the resolver
-too. Without it: an offer whose metadata names a well-formed `identra_issuer_did`
+too. `dpki.network` (`local` / `testnet` / `mainnet`, optional, `TypeError`
+otherwise) is the network the app built them for: with it, an offer declaring a
+DID of another network is `TRUST_PATH_UNSUPPORTED` at `resolve` (without it, as
+before: that DID fails at `accept`). Without it: an offer whose metadata names a well-formed `identra_issuer_did`
 is `TRUST_PATH_UNSUPPORTED` at `resolve` (before the PIN is spent and before any
 key is created; a malformed one stays `OFFER_INVALID`), so a UI can tell "this
 wallet cannot receive from this kind of issuer" from a bad QR code; any
@@ -746,7 +749,8 @@ credential with a DID `kid` fails `did_resolution` (`CREDENTIAL_INVALID`); and
   one configuration, pre-authorized grant, request and response encryption with
   ECDH-ES, `dc+sd-jwt`, a supported `vct`, `jwt` proofs with ES256, `jwk`
   binding (`OFFER_INVALID`); `identra_issuer_did`, when present, a `did:certnet` DID
-  (`OFFER_INVALID`; well-formed but no `dpki`: `TRUST_PATH_UNSUPPORTED`). No key is
+  of at most 128 characters (`MAX_DID_LENGTH`; `OFFER_INVALID`; well-formed but no
+  `dpki`, or of another network than `dpki.network`: `TRUST_PATH_UNSUPPORTED`). No key is
   created and nothing is stored. `offer.issuerDid` is that declared DID, or null
   for an X.509 issuer: NOT verified at this point (no gateway request; `accept`
   binds the credential to it). A UI shows it instead of the self-declared
@@ -757,7 +761,10 @@ credential with a DID `kid` fails `did_resolution` (`CREDENTIAL_INVALID`); and
   credential) → proof → credential request asking for a response encrypted to an
   ephemeral key from `RandomSource` (the library encrypts the request to the
   issuer and refuses a plain response) → exactly one credential string
-  (`ISSUER_ERROR`) → `verifyStoredCredential` passes completely, or fails ONLY
+  (`ISSUER_ERROR`) → the issuer rule below on the decoded, not yet verified
+  payload (`iss`, and on the DID path the status URI): a credential it refuses is
+  `ISSUER_MISMATCH` before any gateway or status list request →
+  `verifyStoredCredential` passes completely, or fails ONLY
   because the trust list (`issuer_trust` `TRUST_LIST_UNAVAILABLE`, `status`
   `SKIPPED`) or the status list (`STATUS_UNAVAILABLE`) could not be read, and the
   credential carries a well-formed status reference (`<iss>/status/<n>`, `idx`
@@ -769,7 +776,8 @@ credential with a DID `kid` fails `did_resolution` (`CREDENTIAL_INVALID`); and
   credential is on the X.509 path with `iss` = the offer's `credential_issuer`;
   with it, on the DID path with `iss` = that DID and its status URI exactly
   `<credential_issuer>/status/<n>` (the binding `<iss>/status/<n>` gives the X.509
-  path); any other combination is `ISSUER_MISMATCH` → `vct` = the
+  path); any other combination is `ISSUER_MISMATCH` (checked again on the verified
+  credential, where `trustPath` is known; `matchesDeclaredIssuer`) → `vct` = the
   configuration's → `cnf.jwk` thumbprint = the new key's (`CNF_MISMATCH`) → every
   claim of the type (`REQUIRED_CLAIMS`) is exactly one disclosure with a non-empty
   string value and absent from the plain payload, so it can be withheld
@@ -1002,7 +1010,8 @@ wallet.presentations.resolve(qrText) → { ok: true, request: ResolvedPresentati
 // ResolvedPresentation = { clientId, verifier: { trusted: true, ten, maToChuc } | { trusted: false },
 //   warning?: 'VERIFIER_NOT_TRUSTED', purpose?, expiresAt,
 //   matches: [{ credentialId, vct, issuerName, trustPath, issuerDid, claimSets: [{ index, claims: string[] }] }] }
-wallet.presentations.submit(request, { credentialId, claimSetIndex, allowUntrusted? }) → { ok: true } | WalletFailure
+wallet.presentations.submit(request, { credentialId, claimSetIndex, allowUntrusted? })
+  → { ok: true } | WalletFailure | { ok: false, code: 'DID_RESOLUTION_UNAVAILABLE', delivered: true }
 wallet.presentations.decline(request) → { ok: true } | WalletFailure   // local only, no network call
 ```
 
@@ -1056,7 +1065,15 @@ wallet.presentations.decline(request) → { ok: true } | WalletFailure   // loca
   later `decline` is `REQUEST_INVALID`; a failure before sending (cancelled
   prompt, untrusted verifier refused, storage) leaves it usable, and so does
   `DID_RESOLUTION_UNAVAILABLE` (below): the verifier checked nothing and kept
-  its session open, so the same request may be submitted again until it expires.
+  its session open, so the same request may be submitted again until it expires,
+  pinned to what was sent: the retry signs a FRESH presentation (new KB-JWT `iat`,
+  same `nonce` and `aud`) of the SAME credential and the SAME claim set, nothing
+  more; a `submit` of that request with another credential or claim set is
+  `REQUEST_INVALID`, sends nothing and forgets the request. At most
+  `MAX_PRESENTATION_SENDS` (3) sends per request: the 503 answering the last one
+  is `VERIFIER_ERROR` and the request is forgotten. A `decline` (or another
+  `submit`) while the POST is in flight is `REQUEST_INVALID` and makes the
+  request not come back, whatever the verifier answers.
 - `submit`: `allowUntrusted: true` required for an untrusted verifier
   (`VERIFIER_NOT_TRUSTED`); request not expired on the wallet clock
   (`REQUEST_EXPIRED`); `createPresentation` with exactly the chosen claim set's
@@ -1065,9 +1082,15 @@ wallet.presentations.decline(request) → { ok: true } | WalletFailure   // loca
   `KEY_INVALIDATED`, `DEVICE_LOCKED`, `KEY_NOT_FOUND`, `STORAGE_ERROR`); JWE
   (noble, ECDH-ES, the verifier's `kid`) of `{ vp_token: { <id>: [presentation] },
   state }`; POST `response=<jwe>` form-encoded to `response_uri`; 200 → ok;
-  `503` whose JSON body has `error` `issuer_registry_unavailable` →
-  `DID_RESOLUTION_UNAVAILABLE` (the verifier could not check now: try again in a
-  moment); anything else (another 503, any other status) `VERIFIER_ERROR`. No other network call: the credential's status
+  `503` whose JSON body has `error` `issuer_registry_unavailable`, for a
+  credential of the DID path (row `issuer_did` set) in a wallet with `dpki`, →
+  `{ ok: false, code: 'DID_RESOLUTION_UNAVAILABLE', delivered: true }` (the
+  verifier received a readable presentation but could not check it now: try
+  again in a moment; `delivered` tells the app to record it in the sharing
+  history; no other result has the field); the same 503 for an X.509 credential
+  or in a wallet without `dpki` cannot be about CertNet and is the verifier's
+  error; it and anything else (another 503, any other status) is `VERIFIER_ERROR`
+  and the request is forgotten (the POST may still have reached the verifier). No other network call: the credential's status
   is not refreshed first. The verifier's verdict is not returned to the wallet
   (cross-device: the website shows it).
 
@@ -1086,6 +1109,9 @@ Known limitations:
   `credential_sets` other than the single-option purpose carrier are refused by
   the wallet (`REQUEST_INVALID`); the Identra scenarios use none.
 - `purpose` is the verifier's own text (sanitised, trusted verifiers only).
+- A verifier that answers `issuer_registry_unavailable` falsely for a DID-path
+  credential gets up to `MAX_PRESENTATION_SENDS` freshly signed presentations of
+  the claims the user chose once; it cannot get more claims or another credential.
 - Presenting the same credential to two verifiers is linkable: both see the same
   issuer signature, status index and `cnf` key (ADR-0001 says so). Batch issuance
   (several credentials with distinct keys and indexes) is planned for later.
@@ -1298,8 +1324,10 @@ means "try later". `resolveDidVerificationKey(kid, resolver)` maps these to the
 codes of the table. A given `versionTime` is that explicit failure, without a
 request (the gateway of 25/11 answers 501). Successful resolutions only are
 cached, per DID, for `cacheSeconds` counted from the fetch by `clock`; a clock
-that stepped back makes the entry stale; at most `maxEntries` DIDs, the oldest
-dropped first; every caller gets its own copy. The credential and its status
+that stepped back makes the entry stale; at most `maxEntries` DIDs, the least
+recently used dropped first (a hit counts as a use); every caller gets its own
+copy. Concurrent resolutions of one DID share one gateway request (its failure
+is not cached). The credential and its status
 list share one resolution.
 
 `issuer_trust` (step 7 of the DID path): a product event is `ISSUER_NOT_TRUSTED`
@@ -1319,8 +1347,11 @@ cached: a withdrawn recognition takes effect at the next check. The result has
 Status (step 8 of the DID path): still a Token Status List served by the issuer.
 
 - The credential's `status.status_list.uri` must match, as a string,
-  `^https://[a-z0-9-]+(\.[a-z0-9-]+)*(:[1-9][0-9]{0,4})?(/[A-Za-z0-9_~-]+(\.[A-Za-z0-9_~-]+)*)+/status/[1-9][0-9]{0,8}$`
-  (`isDidStatusListUri`): lower-case host, optional port, at least one path
+  `^https://([a-z0-9-]+\.)+[a-z][a-z0-9-]*(:[1-9][0-9]{0,4})?(/[A-Za-z0-9_~-]+(\.[A-Za-z0-9_~-]+)*)+/status/[1-9][0-9]{0,8}$`
+  (`isDidStatusListUri`): lower-case host of at least two labels whose last
+  label starts with a letter (so no IPv4 literal in any notation, such as
+  `2130706433`, `0x7f000001` or `169.254.169.254`, no `localhost`, no
+  single-label intranet name), optional port, at least one path
   segment before `/status/<n>`, no query, fragment, userinfo, `%`, `\`,
   whitespace, empty, `.` or `..` segment. Anything else is `STATUS_UNAVAILABLE`
   without a request. The issuer enforces the same form.
@@ -1353,7 +1384,8 @@ Above core (details in sections 7, 8 and 9):
   lists with its DID key; the verifier takes `verification.dpki` and its session
   result says `trustPath` with `issuer` (x509) or `issuerDid` (did).
 - `sdk-app`: `createWallet({ dpki })`; receipt binds a DID credential to the
-  metadata's `identra_issuer_did` and its status list to `<credential_issuer>/status/<n>`;
+  metadata's `identra_issuer_did` (at most 128 characters) and its status list to
+  `<credential_issuer>/status/<n>`, compared on the decoded payload before any request;
   an unresolvable DID is never stored (retryable `NETWORK_ERROR`); records and views
   carry `trustPath` and `issuerDid`.
 - `sdk-client`: parses both result shapes, knows `did_resolution` and
@@ -1380,5 +1412,17 @@ Known limitations:
 - On localnet 25/11 anyone can write the TIR, so "recognised" on this path means
   something only in test environments until CertNet has write permissions.
 - The gateway learns which issuers a verifier checks (by DID, not by credential).
+- The status URI rule is a string rule: it cannot stop a public name that
+  resolves to a private address (`10.0.0.1.nip.io`, a rebinding DNS name). The
+  `HttpFetch` a deployment gives the status checker is responsible for refusing
+  those. The Identra server answers only its own lists, in process; the wallet's
+  guarded fetch refuses IP literals and single-label hosts, and receipt binds the
+  status URI to the credential issuer URL.
+- During a gateway outage, anyone holding only a photographed QR code can tell
+  whether this verifier resolved a given issuer DID in the last 60 s: a
+  presentation naming that DID (it need not verify) is answered 503
+  `issuer_registry_unavailable` when the DID is not in the resolver's cache and
+  400 when it is. Accepted: it says only that some holder of that issuer
+  presented there recently.
 - Wallets and verifiers outside Identra that follow only the SD-JWT VC draft or
   HAIP cannot verify DID-path credentials (ADR-0020, "Kết quả kiểm chuẩn").

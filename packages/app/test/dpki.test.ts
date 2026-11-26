@@ -6,7 +6,8 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { decodeCredentialUnverified, VCT } from '@identra/sdk-core';
-import { buildCatalogue } from '@identra/sdk-app';
+import { buildCatalogue, MAX_DID_LENGTH, MAX_PRESENTATION_SENDS } from '@identra/sdk-app';
+import { matchesDeclaredIssuer, onlyListsUnavailable } from '../dist/wallet/issuance.js';
 import { createWorld, DID, DID_ISS, fakeGateway, ISS, newSession, startListener, type Handler, type Listener, type World } from './helpers/world.js';
 
 let listener: Listener;
@@ -37,6 +38,21 @@ function patchMetadata(name: string, patch: (m: Record<string, unknown>) => void
 }
 
 const codeAt = (checks: { id: string; code: string | null }[] | undefined, id: string) => checks?.find((c) => c.id === id)?.code;
+
+/** The verifier's "could not reach CertNet" answer (sdk-server ISSUER_REGISTRY_UNAVAILABLE). */
+const REGISTRY_DOWN = { status: 503, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'issuer_registry_unavailable', error_description: 'x' }) };
+const UNAVAILABLE = { ok: false, code: 'DID_RESOLUTION_UNAVAILABLE', delivered: true };
+/** A response endpoint that answers every POST with REGISTRY_DOWN (set it after newVerifier mounted the routes); the bodies it received. */
+function answerRegistryDown(): string[] {
+  const posts: string[] = [];
+  listener.routes.set('POST /oid4vp/response/*', async (req) => (posts.push(req.body), REGISTRY_DOWN));
+  return posts;
+}
+async function resolvedRequest(w: TestWallet, verifier: Awaited<ReturnType<World['newVerifier']>>) {
+  const r = await w.wallet.presentations.resolve((await newSession(verifier)).qr);
+  assert.ok(r.ok, JSON.stringify(r));
+  return r.request;
+}
 
 describe('receiving from a DID issuer', () => {
   test('end to end: received, stored with its trust path and DID, shown without a name, re-checked, catalogued by URL, presented, removed', async () => {
@@ -111,6 +127,85 @@ describe('receiving from a DID issuer', () => {
     }
   });
 
+  test('the receipt rule is applied to the decoded credential before verification: nothing is fetched for a credential refused anyway', async () => {
+    const cases: [string, () => Promise<World>][] = [
+      ['status list on another host', () => createWorld(listener, { did: { statusOrigin: 'https://tracker.example.net' } })],
+      ['iss is not the declared DID', async () => {
+        const world = await createWorld(listener, { did: {} });
+        patchMetadata('truong-did', (m) => (m['identra_issuer_did'] = OTHER_DID));
+        return world;
+      }],
+      ['no DID declared, a DID credential', async () => {
+        const world = await createWorld(listener, { did: {} });
+        patchMetadata('truong-did', (m) => delete m['identra_issuer_did']);
+        return world;
+      }],
+    ];
+    for (const [name, make] of cases) {
+      const world = await make();
+      const w = world.newDidWallet();
+      const { offer, txCode } = await resolved(world, w);
+      assert.deepEqual(await w.wallet.offers.accept(offer, { txCode }), { ok: false, code: 'ISSUER_MISMATCH', retryable: false, codeRedeemed: true }, name);
+      assert.deepEqual(world.gateway.state.calls, [], `${name}: no gateway request`);
+      assert.equal(listener.requests.some((r) => r.includes('/status/')), false, `${name}: no status list request`);
+      assert.deepEqual([w.rows.size, w.secrets.size], [0, 0], name);
+    }
+  });
+
+  test('the receipt rule itself, including the parts that the checks before it mask end to end', () => {
+    const statusUri = `${DID_ISS}/status/1`;
+    const didDeclared = { issuerUri: DID_ISS, issuerDid: DID };
+    assert.equal(matchesDeclaredIssuer({ trustPath: 'did', iss: DID, statusUri }, didDeclared), true);
+    assert.equal(matchesDeclaredIssuer({ iss: DID, statusUri }, didDeclared), true, 'before verification');
+    assert.equal(matchesDeclaredIssuer({ trustPath: 'x509', iss: DID, statusUri }, didDeclared), false, 'the X.509 path with the declared DID as iss');
+    for (const iss of [OTHER_DID, DID_ISS, `${DID}#key-1`, undefined]) assert.equal(matchesDeclaredIssuer({ trustPath: 'did', iss, statusUri }, didDeclared), false, String(iss));
+    for (const uri of ['https://status.truong-did.example.vn/issuers/truong-did/status/1', `${DID_ISS}/status/0`, `${DID_ISS}x/status/1`, `${DID_ISS}/status/1?x`, undefined]) {
+      assert.equal(matchesDeclaredIssuer({ trustPath: 'did', iss: DID, statusUri: uri }, didDeclared), false, String(uri));
+      assert.equal(matchesDeclaredIssuer({ iss: DID, statusUri: uri }, didDeclared), false, `before verification: ${String(uri)}`);
+    }
+    const x509Declared = { issuerUri: ISS, issuerDid: null };
+    assert.equal(matchesDeclaredIssuer({ trustPath: 'x509', iss: ISS, statusUri: `${ISS}/status/1` }, x509Declared), true);
+    assert.equal(matchesDeclaredIssuer({ iss: ISS, statusUri: undefined }, x509Declared), true, 'before verification');
+    assert.equal(matchesDeclaredIssuer({ trustPath: 'did', iss: ISS, statusUri: `${ISS}/status/1` }, x509Declared), false, 'the DID path with the issuer URL as iss');
+    assert.equal(matchesDeclaredIssuer({ iss: DID, statusUri: undefined }, x509Declared), false);
+
+    // A DID credential whose only failure is its status list: "not checked yet" only with a status URI of the DID-path form.
+    const checks = [{ id: 'signature', ok: true, code: null }, { id: 'status', ok: false, code: 'STATUS_UNAVAILABLE' }] as never;
+    const listsDown = (uri: string) => onlyListsUnavailable({ checks, credential: { trustPath: 'did', vct: 'x', iss: DID, iat: 0, issuerDid: DID, issuer: null, status: { idx: 1, uri } } });
+    assert.equal(listsDown(statusUri), true);
+    for (const uri of [`${DID}/status/1`, 'https://localhost/issuers/truong-did/status/1', 'https://127.0.0.1/s/status/1', `${DID_ISS}/status/0`]) assert.equal(listsDown(uri), false, uri);
+  });
+
+  test('identra_issuer_did longer than MAX_DID_LENGTH is OFFER_INVALID; with dpki.network, a DID of another network is TRUST_PATH_UNSUPPORTED at resolve', async () => {
+    const prefix = 'did:certnet:local:';
+    const ofLength = (n: number) => prefix + 'a'.repeat(n - prefix.length);
+    assert.equal(MAX_DID_LENGTH, 128);
+    const longest = await createWorld(listener, { did: {} });
+    patchMetadata('truong-did', (m) => (m['identra_issuer_did'] = ofLength(MAX_DID_LENGTH)));
+    assert.equal((await resolved(longest, longest.newDidWallet())).offer.issuerDid, ofLength(MAX_DID_LENGTH));
+    for (const did of [ofLength(MAX_DID_LENGTH + 1), `did:certnet:mainnet:${'A'.repeat(20_000)}`]) {
+      const world = await createWorld(listener, { did: {} });
+      patchMetadata('truong-did', (m) => (m['identra_issuer_did'] = did));
+      for (const w of [world.newDidWallet(), world.newWallet()]) {
+        assert.deepEqual(await w.wallet.offers.resolve((await world.offer()).offerUri), { ok: false, code: 'OFFER_INVALID' }, `${did.length} characters`);
+      }
+      assert.equal(listener.requests.some((r) => r.includes('/token')), false);
+    }
+
+    const world = await createWorld(listener, { did: {} }); // DID is of the network local
+    const onNetwork = (network: string) => world.newDidWallet({ dpki: { ...world.gateway.dpki(world.clock), network: network as 'local' } });
+    assert.equal((await resolved(world, onNetwork('local'))).offer.issuerDid, DID);
+    assert.equal((await resolved(world, world.newDidWallet())).offer.issuerDid, DID, 'no network given: as before');
+    for (const network of ['testnet', 'mainnet']) {
+      const w = onNetwork(network);
+      assert.deepEqual(await w.wallet.offers.resolve((await world.offer()).offerUri), { ok: false, code: 'TRUST_PATH_UNSUPPORTED' }, network);
+      assert.equal(w.secrets.size, 0);
+    }
+    assert.equal(listener.requests.some((r) => r.includes('/token')), false, 'no PIN spent');
+    assert.deepEqual(world.gateway.state.calls, []);
+    assert.throws(() => onNetwork('devnet'), TypeError);
+  });
+
   test('a malformed identra_issuer_did makes the offer invalid before anything is spent, with or without dpki', async () => {
     for (const bad of ['did:web:truong.example.vn', 'did:certnet:local:', 'did:certnet:other:abc', `${DID}#key-1`, 42, null, '']) {
       const world = await createWorld(listener, { did: {} });
@@ -142,7 +237,8 @@ describe('receiving from a DID issuer', () => {
     patchMetadata('truong-did', (m) => delete m['identra_issuer_did']);
     const { offer, txCode } = await resolved(world, plain);
     const r = await plain.wallet.offers.accept(offer, { txCode });
-    assert.deepEqual([r.ok, !r.ok && r.code, !r.ok && codeAt(r.checks, 'did_resolution')], [false, 'CREDENTIAL_INVALID', 'DID_RESOLUTION_FAILED']);
+    // Refused by the receipt rule on the decoded payload, before verification (as with dpki).
+    assert.deepEqual([r.ok, !r.ok && r.code, !r.ok && r.checks], [false, 'ISSUER_MISMATCH', undefined]);
     assert.deepEqual([plain.rows.size, plain.secrets.size], [0, 0]);
     assert.deepEqual(world.gateway.state.calls, []);
   });
@@ -188,7 +284,7 @@ describe('not checked yet versus refused', () => {
     world.gateway.state.down = true;
     const seen = listener.log.length;
     for (let i = 0; i < 2; i++) {
-      assert.deepEqual(await w.wallet.presentations.submit(request.request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'DID_RESOLUTION_UNAVAILABLE' });
+      assert.deepEqual(await w.wallet.presentations.submit(request.request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'DID_RESOLUTION_UNAVAILABLE', delivered: true });
     }
     assert.deepEqual(listener.log.slice(seen).filter((l) => l.path.startsWith('/oid4vp/response/')).map((l) => l.status), [503, 503]);
     assert.equal((await verifier.session(session.id))?.status, 'request_retrieved');
@@ -272,6 +368,102 @@ describe('not checked yet versus refused', () => {
     const r = await w.wallet.offers.accept(offer, { txCode });
     assert.deepEqual([r.ok, !r.ok && r.code, !r.ok && r.retryable, !r.ok && codeAt(r.checks, 'issuer_trust')], [false, 'CREDENTIAL_INVALID', false, 'ISSUER_NOT_TRUSTED']);
     assert.deepEqual([w.rows.size, w.secrets.size], [0, 0]);
+  });
+});
+
+describe('the verifier says it could not reach CertNet (503 issuer_registry_unavailable)', () => {
+  test('an X.509 credential: VERIFIER_ERROR and the request is forgotten, in a wallet with or without dpki; a second submit sends nothing', async () => {
+    const world = await createWorld(listener);
+    for (const w of [world.newWallet(), world.newDidWallet()]) {
+      const credentialId = await world.issueTo(w);
+      const verifier = await world.newVerifier({ dpki: true });
+      const posts = answerRegistryDown();
+      const request = await resolvedRequest(w, verifier);
+      assert.equal(request.matches[0]!.trustPath, 'x509');
+      assert.deepEqual(await w.wallet.presentations.submit(request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'VERIFIER_ERROR' });
+      assert.deepEqual(await w.wallet.presentations.submit(request, { credentialId, claimSetIndex: 0 }), { ok: false, code: 'REQUEST_INVALID' });
+      assert.deepEqual(await w.wallet.presentations.submit(request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'REQUEST_INVALID' });
+      assert.equal(posts.length, 1);
+    }
+  });
+
+  test('a DID credential in a wallet without dpki: VERIFIER_ERROR and the request is forgotten', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const holder = world.newDidWallet();
+    const credentialId = await world.issueTo(holder);
+    const off = world.newWallet('noble', undefined, world.clock, { keyStore: holder.keyStore, vault: holder.vault });
+    const verifier = await world.newVerifier({ dpki: true });
+    const posts = answerRegistryDown();
+    const request = await resolvedRequest(off, verifier);
+    assert.equal(request.matches[0]!.trustPath, 'did');
+    assert.deepEqual(await off.wallet.presentations.submit(request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'VERIFIER_ERROR' });
+    assert.deepEqual(await off.wallet.presentations.submit(request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'REQUEST_INVALID' });
+    assert.equal(posts.length, 1);
+  });
+
+  test('a DID credential with dpki: kept with delivered: true and pinned to what was sent; another claim set or credential is refused and sends nothing', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const first = await world.issueTo(w);
+    const second = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const posts = answerRegistryDown();
+    const sent = { credentialId: first, claimSetIndex: 1 };
+
+    const kept = await resolvedRequest(w, verifier);
+    assert.deepEqual(await w.wallet.presentations.submit(kept, sent), UNAVAILABLE);
+    assert.deepEqual(await w.wallet.presentations.submit(kept, sent), UNAVAILABLE, 'the same selection is sent again');
+    assert.equal(posts.length, 2);
+
+    for (const other of [{ credentialId: first, claimSetIndex: 0 }, { credentialId: second, claimSetIndex: 1 }]) {
+      const request = await resolvedRequest(w, verifier);
+      assert.deepEqual(await w.wallet.presentations.submit(request, sent), UNAVAILABLE);
+      const sentBefore: number = posts.length;
+      assert.deepEqual(await w.wallet.presentations.submit(request, other), { ok: false, code: 'REQUEST_INVALID' }, JSON.stringify(other));
+      assert.deepEqual(await w.wallet.presentations.submit(request, sent), { ok: false, code: 'REQUEST_INVALID' }, 'forgotten');
+      assert.deepEqual(w.wallet.presentations.decline(request), { ok: false, code: 'REQUEST_INVALID' });
+      assert.equal(posts.length, sentBefore, 'nothing sent');
+    }
+    // Still a programming error to name a choice that was never offered.
+    const request = await resolvedRequest(w, verifier);
+    assert.deepEqual(await w.wallet.presentations.submit(request, sent), UNAVAILABLE);
+    await assert.rejects(w.wallet.presentations.submit(request, { credentialId: first, claimSetIndex: 5 }), TypeError);
+  });
+
+  test(`at most MAX_PRESENTATION_SENDS (${MAX_PRESENTATION_SENDS}) sends per request: the last 503 is VERIFIER_ERROR and the request is forgotten`, async () => {
+    assert.equal(MAX_PRESENTATION_SENDS, 3);
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const credentialId = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const posts = answerRegistryDown();
+    const request = await resolvedRequest(w, verifier);
+    for (let i = 1; i < MAX_PRESENTATION_SENDS; i++) assert.deepEqual(await w.wallet.presentations.submit(request, { credentialId, claimSetIndex: 1 }), UNAVAILABLE, `send ${i}`);
+    assert.deepEqual(await w.wallet.presentations.submit(request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'VERIFIER_ERROR' });
+    assert.deepEqual(await w.wallet.presentations.submit(request, { credentialId, claimSetIndex: 1 }), { ok: false, code: 'REQUEST_INVALID' });
+    assert.equal(posts.length, MAX_PRESENTATION_SENDS);
+  });
+
+  test('declined (or submitted again) while the POST is in flight: not put back when the 503 arrives', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const credentialId = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const choice = { credentialId, claimSetIndex: 1 };
+    for (const touch of ['decline', 'submit'] as const) {
+      const request = await resolvedRequest(w, verifier);
+      let during: unknown;
+      let posts = 0;
+      listener.routes.set('POST /oid4vp/response/*', async () => {
+        posts++;
+        during = touch === 'decline' ? w.wallet.presentations.decline(request) : await w.wallet.presentations.submit(request, choice);
+        return REGISTRY_DOWN;
+      });
+      assert.deepEqual(await w.wallet.presentations.submit(request, choice), { ok: false, code: 'VERIFIER_ERROR' }, touch);
+      assert.deepEqual(during, { ok: false, code: 'REQUEST_INVALID' }, touch);
+      assert.deepEqual(await w.wallet.presentations.submit(request, choice), { ok: false, code: 'REQUEST_INVALID' }, `${touch}: not put back`);
+      assert.equal(posts, 1, touch);
+    }
   });
 });
 
