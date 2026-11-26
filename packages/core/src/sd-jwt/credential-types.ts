@@ -82,6 +82,20 @@ export function isStatusListUri(uri: unknown, iss: string): boolean {
   return typeof uri === 'string' && uri.startsWith(prefix) && STATUS_LIST_NUMBER.test(uri.slice(prefix.length));
 }
 
+// Host: lower-case labels of letters, digits and hyphens joined by dots; a port of 1-5 digits
+// without a leading 0; one or more path segments of unreserved characters, a dot only inside a
+// segment (so no empty, "." or ".." segment); then /status/<n>. No ambiguous repetition (no ReDoS).
+const DID_STATUS_LIST_URI =
+  /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*(:[1-9][0-9]{0,4})?(\/[A-Za-z0-9_~-]+(\.[A-Za-z0-9_~-]+)*)+\/status\/[1-9][0-9]{0,8}$/;
+/**
+ * The status list URI of a DID issuer, which cannot be `<iss>/status/<n>` (ADR-0020 section 6):
+ * `https://<host>[:port]/<path>/status/<n>`, n in 1..999999999, matched as a string against a strict
+ * pattern, so query, fragment, userinfo, "..", "%", "\\", whitespace and upper-case hosts cannot pass.
+ */
+export function isDidStatusListUri(uri: unknown): boolean {
+  return typeof uri === 'string' && DID_STATUS_LIST_URI.test(uri);
+}
+
 const ISO_INSTANT = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{1,3})?Z$/;
 /**
  * Milliseconds of an ISO 8601 UTC instant `YYYY-MM-DDTHH:MM:SS[.sss]Z` that names a real date

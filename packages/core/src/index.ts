@@ -6,6 +6,18 @@ export * from './ecdsa-der.js';
 export * from './jwk.js';
 export * from './jws.js';
 export * from './did-jwk.js';
+// The DID trust path (ADR-0020): did:certnet and the CertNet trust registry through the gateway.
+export {
+  CERTNET_RESPONSE_MAX_BYTES,
+  createCertNetDidResolver,
+  DID_CERTNET_CACHE_MAX_ENTRIES,
+  DID_CERTNET_DEFAULT_CACHE_SECONDS,
+  DID_CERTNET_ERRORS,
+  DID_CERTNET_MAX_CACHE_SECONDS,
+  isCertNetDid,
+  type CertNetNetwork,
+} from './did-certnet.js';
+export { createCertNetTrustRegistry } from './trust/certnet.js';
 export { parseCertificate, type ParsedCertificate } from './x509/parse.js';
 export { createCertificateChainValidator, MAX_CERTIFICATE_BYTES, CLOCK_SKEW_MS } from './x509/chain.js';
 export * from './sd-jwt/credential-types.js';
@@ -36,7 +48,9 @@ export {
   createStatusListToken,
   STATUS_LIST_TOKEN_MAX_BYTES,
   STATUS_LIST_TOKEN_TYP,
+  verifyDidStatusListToken,
   verifyStatusListToken,
+  type VerifiedDidStatusListToken,
   type VerifiedStatusListToken,
 } from './status/token.js';
 export { createStatusListChecker, STATUS_CACHE_MAX_URIS, STATUS_LIST_MAX_FRESH_SECONDS } from './status/checker.js';

@@ -1,4 +1,4 @@
-// Fetching and caching shared by the status list checker and the trust list registry
+// Fetching (also used by the CertNet clients) and caching shared by the status list checker and the trust list registry
 // (docs/architecture.md section 5, ADR-0013 section 4, ADR-0015 section 6, ADR-0019):
 // - a held copy is used without a refetch while younger than min(ttl, maxFreshSeconds,
 //   maxAgeSeconds ?? Infinity); maxFreshSeconds is the hard cap of core (900 s status list,
@@ -52,11 +52,19 @@ export interface TokenCache<T> {
  */
 export async function fetchToken(httpFetch: HttpFetch, url: string, maxBytes: number, accept: string): Promise<string | null> {
   if (typeof url !== 'string' || !url.startsWith('https://')) return null;
+  return (await fetchBody(httpFetch, url, maxBytes, accept)).body;
+}
+
+/**
+ * GET `url` with `timeoutMs: 5000` and `maxBytes`: the status, and the body only for a 200 that fits
+ * `maxBytes` (else null; other statuses are not read). Rejects when the fetch rejects.
+ */
+export async function fetchBody(httpFetch: HttpFetch, url: string, maxBytes: number, accept: string): Promise<{ status: number; body: string | null }> {
   const res = await httpFetch(url, { method: 'GET', headers: { accept }, timeoutMs: FETCH_TIMEOUT_MS, maxBytes });
-  if (res.status !== 200) return null;
+  if (res.status !== 200) return { status: res.status, body: null };
   const body = await res.text();
   // Bytes, not UTF-16 units: a text of n units can be up to 3n bytes.
-  return typeof body === 'string' && body.length <= maxBytes && utf8Encode(body).length <= maxBytes ? body : null;
+  return { status: 200, body: typeof body === 'string' && body.length <= maxBytes && utf8Encode(body).length <= maxBytes ? body : null };
 }
 
 export async function readSeen(seen: SeenStore | undefined, key: string): Promise<number | null> {

@@ -28,7 +28,7 @@ describe('positive paths', () => {
     ]);
     assert.equal(r.ok, true);
     assert.deepEqual(r.credential, {
-      vct: VCT.diploma, iss: ISS, fingerprint: VC_FINGERPRINT, issuer: { maToChuc: TRUST_ENTRY.maToChuc, ten: TRUST_ENTRY.ten },
+      trustPath: 'x509', vct: VCT.diploma, iss: ISS, fingerprint: VC_FINGERPRINT, issuer: { maToChuc: TRUST_ENTRY.maToChuc, ten: TRUST_ENTRY.ten },
       iat: Math.floor(NOW_S), status: STATUS, cnfJwk: holder.publicJwk, claims: DIPLOMA,
     });
     assert.equal(r.chainChecks?.length, 6);

@@ -25,7 +25,8 @@ function libHasher(hasher: Hasher) {
 
 /** Issues `payload` with the given top-level claims disclosable and `decoys` decoy digests. */
 export async function libIssue(options: {
-  signer: Signer & { x5c: string[] };
+  /** With `x5c` (header `x5c`) or a DID `kid` (header `kid`), checked by the caller. */
+  signer: Signer;
   hasher: Hasher;
   random: RandomSource;
   payload: Record<string, unknown>;
@@ -42,8 +43,9 @@ export async function libIssue(options: {
     saltGenerator: (length: number) => base64UrlEncode(random.bytes(length)),
   });
   const frame = disclosable.length > 0 ? { _sd: disclosable, _sd_decoy: decoys } : undefined;
-  // Header becomes { typ: 'dc+sd-jwt', x5c, alg: 'ES256' }.
-  return instance.issue(payload as { vct: string; iss: string }, frame as never, { header: { x5c: [...signer.x5c] } });
+  // Header becomes { typ: 'dc+sd-jwt', x5c, alg: 'ES256' } or { typ: 'dc+sd-jwt', kid, alg: 'ES256' }.
+  const header = signer.x5c ? { x5c: [...signer.x5c] } : { kid: signer.kid! };
+  return instance.issue(payload as { vct: string; iss: string }, frame as never, { header });
 }
 
 /** Keeps the named top-level disclosures and appends a KB-JWT signed by `holderSigner`. */

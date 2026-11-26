@@ -20,8 +20,9 @@ export type DecodeJwsResult =
   | { ok: false; code: typeof ErrorCodes.MALFORMED | typeof ErrorCodes.TOO_LARGE; detail: string };
 
 /**
- * Signs `payload` with `signer` and returns the compact JWS. `alg` comes from the signer and
- * `x5c` is added when the signer has one; the caller must not set either.
+ * Signs `payload` with `signer` and returns the compact JWS. `alg` comes from the signer, `x5c` is
+ * added when the signer has one, and so is `kid` when the signer's `kid` is a DID URL (ADR-0020,
+ * never together with `x5c`); the caller must not set any of them.
  */
 export async function signJws(protectedHeader: Record<string, unknown>, payload: Uint8Array, signer: Signer): Promise<string> {
   if ('alg' in protectedHeader || 'x5c' in protectedHeader) {
@@ -29,6 +30,11 @@ export async function signJws(protectedHeader: Record<string, unknown>, payload:
   }
   if (signer.alg !== 'ES256') throw new TypeError('only ES256 signers are supported');
   const header: Record<string, unknown> = { alg: signer.alg, ...protectedHeader };
+  if (typeof signer.kid === 'string' && signer.kid.startsWith('did:')) {
+    if (signer.x5c !== undefined) throw new TypeError('a signer carries x5c or a DID kid, never both');
+    if ('kid' in protectedHeader) throw new TypeError('protectedHeader must not contain kid; a DID kid comes from the signer');
+    header['kid'] = signer.kid;
+  }
   if (signer.x5c) header['x5c'] = [...signer.x5c];
   const input = `${base64UrlEncode(utf8Encode(JSON.stringify(header)))}.${base64UrlEncode(payload)}`;
   const signature = await signer.sign(utf8Encode(input));

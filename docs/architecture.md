@@ -2,7 +2,7 @@
 
 This document is the contract between the four packages and their consumers
 (`identra-server`, `identra-app`, `identra-website`). The decisions behind it are
-the ADRs 0001–0019 kept in the private parent repository; where this file and an
+the ADRs 0001–0020 kept in the private parent repository; where this file and an
 ADR disagree, the ADR wins and this file must be fixed.
 
 All protocol logic lives in this SDK. Consumers only do UI, HTTP, storage and
@@ -12,7 +12,7 @@ call the SDK (ADR-0005).
 
 | Package | Runs on | Contains | Runtime dependencies (pinned exactly) |
 |---|---|---|---|
-| `@identra/sdk-core` | Node, browser, React Native | Interfaces, JWS, X.509 chain validation, SD-JWT VC issue / present / verify, verification policy, status list, trust list, product chain, `did:jwk` | `@sd-jwt/core`, `@sd-jwt/sd-jwt-vc`, `@owf/token-status-list`, `micro-key-producer`, `zod` (only to set its `jitless` configuration) |
+| `@identra/sdk-core` | Node, browser, React Native | Interfaces, JWS, X.509 chain validation, SD-JWT VC issue / present / verify, verification policy, status list, trust list, product chain, `did:jwk`, the DID trust path (`did:certnet` resolver and CertNet trust registry over the injected fetch, section 11) | `@sd-jwt/core`, `@sd-jwt/sd-jwt-vc`, `@owf/token-status-list`, `micro-key-producer`, `zod` (only to set its `jitless` configuration) |
 | `@identra/sdk-core/text` | everywhere | `UNSAFE_DISPLAY_TEXT`, the one character class refused in text shown to a person (also exported by the main entry) | none |
 | `@identra/sdk-core/webcrypto` | Node, browser | `Signer` / `Verifier` / `Hasher` / `RandomSource` on `globalThis.crypto` | none |
 | `@identra/sdk-server` | Node | Key store, OpenID4VCI issuer (section 8), status list and trust list signing (section 7), OpenID4VP verifier (section 9), product-chain append check (section 10) | `@openid4vc/openid4vci`, `@openid4vc/openid4vp`, `@openid4vc/oauth2`, `dcql`, `jose` |
@@ -52,7 +52,8 @@ interface Signer {
   alg: 'ES256';
   publicJwk: EcPublicJwk;
   x5c?: string[];            // [leaf, issuing CA], standard base64 DER; wallets have none
-  kid?: string;
+  kid?: string;              // a DID URL did:certnet:<network>:<id>#<fragment> = DID trust path (section 11): signJws writes it as
+                             // the header kid, and x5c must then be absent; any other value is not written by signJws
   sign(data: Uint8Array): Promise<Uint8Array>;   // 64-byte r||s (JOSE form), never DER
 }
 interface Verifier {
@@ -74,7 +75,8 @@ interface CertificateChainValidator {
 }
 interface StatusChecker {
   // 'unavailable' = no valid list could be obtained or it failed any check (fail-closed, ADR-0013).
-  check(ref: { uri: string; idx: number }, issuer: { maToChuc: string }): Promise<'valid' | 'revoked' | 'suspended' | 'unavailable'>;
+  // issuer: the organisation of an X.509 issuer, or the DID of a DID issuer (section 11).
+  check(ref: { uri: string; idx: number }, issuer: { maToChuc: string } | { did: string }): Promise<'valid' | 'revoked' | 'suspended' | 'unavailable'>;
 }
 interface TrustRegistry {
   // Looks up a leaf-certificate fingerprint (base64url SHA-256 of the DER).
@@ -83,7 +85,12 @@ interface TrustRegistry {
   lookup(fingerprint: string, at?: Date): Promise<TrustEntry | null>;
 }
 interface TrustEntry { maToChuc: string; ten: string; mucDich: 'vc' | 'status' | 'request'; vct?: string[]; congDoan?: string[] }
-interface DidResolver { resolve(did: string, opts?: { versionTime?: string }): Promise<DidResolutionResult> }  // did:jwk only; tests and later did:certnet
+interface DidResolver { resolve(did: string, opts?: { versionTime?: string }): Promise<DidResolutionResult> }  // did:jwk (tests), did:certnet (section 11)
+interface DidTrustRegistry {
+  // Whether `did` is recognised for `vct` at `at` (section 11); never a display name.
+  // Rejects with TrustListUnavailableError when no usable answer was obtained.
+  lookupIssuer(did: string, vct: string, at: Date): Promise<{ trusted: true } | { trusted: false; detail: string }>;
+}
 ```
 
 Two implementations of the crypto interfaces exist and are tested with the same
@@ -134,6 +141,8 @@ type VerifyCredentialOptions = {
   verifier: Verifier; hasher: Hasher; chainValidator: CertificateChainValidator;
   trustRegistry: TrustRegistry; statusChecker: StatusChecker;
   supportedVcts: string[]; now: Date;
+  // The DID trust path (section 11), off unless given; both members together (TypeError otherwise).
+  dpki?: { resolver: DidResolver; trustRegistry: DidTrustRegistry };
 };
 // Anything received from another party: steps 1-9, the KB-JWT is required (step 9 always listed).
 verifyPresentation(compact, options & { presentation: { nonce: string; audience: string } })
@@ -143,30 +152,43 @@ verifyPresentation(compact, options & { presentation: { nonce: string; audience:
 verifyStoredCredential(compact, options)
 // both: Promise<{ ok: boolean; checks: Check[]; chainChecks?: Check[]; credential?: VerifiedCredential }>
 
-interface VerifiedCredential {          // only when steps 1–4 passed
-  vct: string; iss: string; fingerprint: string;
-  issuer: { maToChuc: string; ten: string } | null;   // null unless step 7 passed
+type VerifiedCredential = {             // only when steps 1–4 passed
+  vct: string; iss: string;
   iat: number; nbf?: number; exp?: number; status?: { idx: number; uri: string }; cnfJwk?: EcPublicJwk;
   claims?: Record<string, unknown>;     // subject claims (visible + verified disclosures); only when the WHOLE result is ok
-}
+} & (
+  | { trustPath: 'x509'; fingerprint: string;
+      issuer: { maToChuc: string; ten: string } | null }   // null unless step 7 passed
+  | { trustPath: 'did'; issuerDid: string;                // = iss
+      issuer: null }                                      // no display name on the DID path (section 11)
+);
 ```
+
+Step 3 has two forms (ADR-0020 §2, §4), chosen from the header once step 1 has
+read it: no `x5c` and a `kid` that is a string starting with `did:` is the DID
+path, whose step 3 is `did_resolution` (section 11); anything else is the X.509
+path below, unchanged (no `x5c` and no DID `kid` is still `CERT_CHAIN_MALFORMED`).
+A header with both `x5c` and a DID `kid` is `MALFORMED` at step 1. When step 1
+fails the path is not known and the skipped list names `certificate_chain`; from
+step 2 on it names the step 3 of the path taken. `chainChecks` exists on the
+X.509 path only.
 
 | # | `id` | What | Codes |
 |---|---|---|---|
 | 1 | `structure` | ≤ 16 384 bytes and ≤ 50 disclosures, checked before any decoding (`TOO_LARGE`). ASCII compact `<jwt>~<disclosure>~…~[<kb-jwt>]`; strict JWS; every disclosure is base64url of a JSON array; payload is a JSON object with string `iss` and `vct`, numeric `iat`, numeric `nbf` / `exp` and object `cnf` / `status` when present (shape only, nothing is trusted yet). SD shape of the payload (RFC 9901), with or without disclosures: top-level `_sd`, if present, is an array of unique 43-character base64url digests; `_sd_alg` is exactly `sha-256`, required with `_sd` (allowed alone only as `sha-256`); no key `_sd`, `_sd_alg` or `...` anywhere below the top level. Header `typ` is exactly `dc+sd-jwt`; the payload nests objects / arrays at most 32 levels (the payload itself is level 1). In `verifyStoredCredential` a KB-JWT is `MALFORMED`: a stored credential never has one | `MALFORMED`, `TYP_INVALID`, `TOO_LARGE` |
 | 2 | `algorithm` | Header `alg` is `ES256` | `ALG_NOT_ALLOWED` |
-| 3 | `certificate_chain` | `CertificateChainValidator` (section 4) with profile `vc` and `expectedIssuerUri` = `iss`; the check carries the code of the failing chain step, and `chainChecks` lists the chain steps without details | `CERT_CHAIN_MALFORMED`, `CERT_CHAIN_UNTRUSTED`, `CERT_NOT_YET_VALID`, `CERT_EXPIRED`, `CERT_CONSTRAINT_INVALID`, `CERT_KEY_NOT_ALLOWED`, `ISSUER_MISMATCH` |
-| 4 | `signature` | Issuer signature with the leaf key | `SIGNATURE_INVALID` |
+| 3 | `certificate_chain` (X.509 path) | `CertificateChainValidator` (section 4) with profile `vc` and `expectedIssuerUri` = `iss`; the check carries the code of the failing chain step, and `chainChecks` lists the chain steps without details | `CERT_CHAIN_MALFORMED`, `CERT_CHAIN_UNTRUSTED`, `CERT_NOT_YET_VALID`, `CERT_EXPIRED`, `CERT_CONSTRAINT_INVALID`, `CERT_KEY_NOT_ALLOWED`, `ISSUER_MISMATCH` |
+| 3 | `did_resolution` (DID path) | Section 11, in the order of its table | `KEY_NOT_FOUND`, `ISSUER_MISMATCH`, `DID_RESOLUTION_FAILED`, `DID_RESOLUTION_UNAVAILABLE`, `ALG_NOT_ALLOWED` |
+| 4 | `signature` | Issuer signature with the leaf key (DID path: with the DID key of step 3) | `SIGNATURE_INVALID` |
 | 5 | `validity_time` | `iat` ≤ now + 60 s, `nbf` ≤ now + 60 s, `exp` > now − 60 s | `NOT_YET_VALID`, `EXPIRED` |
 | 6 | `credential_type` | `vct` is in `supportedVcts` | `VCT_UNSUPPORTED` |
-| 7 | `issuer_trust` | `trustRegistry.lookup(fingerprint, now)` returns an entry with `mucDich` `vc`, `maToChuc` equal to the leaf `organizationIdentifier`, `vct` containing the credential `vct`, and for product events `congDoan` containing the event's `cong_doan`. `TrustListUnavailableError` is `TRUST_LIST_UNAVAILABLE`; any other failure (null, mismatch, other exception) is `ISSUER_NOT_TRUSTED` | `ISSUER_NOT_TRUSTED`, `TRUST_LIST_UNAVAILABLE` |
+| 7 | `issuer_trust` | DID path: `dpki.trustRegistry.lookupIssuer(issuerDid, vct, now)` (section 11); the X.509 trust list is not consulted. X.509 path: `trustRegistry.lookup(fingerprint, now)` returns an entry with `mucDich` `vc`, `maToChuc` equal to the leaf `organizationIdentifier`, `vct` containing the credential `vct`, and for product events `congDoan` containing the event's `cong_doan`. `TrustListUnavailableError` is `TRUST_LIST_UNAVAILABLE`; any other failure (null, mismatch, other exception) is `ISSUER_NOT_TRUSTED` | `ISSUER_NOT_TRUSTED`, `TRUST_LIST_UNAVAILABLE` |
 | 8 | `status` | Only when steps 6 and 7 passed, otherwise `SKIPPED` and the `StatusChecker` is not called (no request on behalf of an untrusted issuer, nor for a credential of a type the caller does not support). Rules below, then the checker's answer: `valid` passes, `revoked` / `suspended` map to their codes, anything else or an exception is `STATUS_UNAVAILABLE` | `REVOKED`, `SUSPENDED`, `STATUS_UNAVAILABLE` |
 | 9 | `holder_binding` | Always listed by `verifyPresentation`; listed by `verifyStoredCredential` when the compact carries disclosures. Disclosures (ADR-0008 §6), any failure `DISCLOSURE_INVALID`: a top-level `_sd` exists; each disclosure is `[salt, name, value]` with string salt and name (array-element disclosures are refused); name not `_sd`, `...`, `_sd_alg`, `__proto__`, `constructor`, `prototype` nor a metadata claim (`iss`, `vct`, `iat`, `nbf`, `exp`, `cnf`, `status`); the disclosure array nests at most 32 levels (it is level 1); no duplicate disclosure; digest referenced by the top-level `_sd`; no two disclosures with one name; no clash with a visible payload claim; no `_sd`, `_sd_alg` or `...` key inside a disclosed value. In `verifyPresentation`, the KB-JWT, any failure `KB_INVALID`: present and at most 4 096 bytes; credential has a valid P-256 `cnf.jwk`; header `typ` `kb+jwt` and `alg` `ES256`; signature by `cnf.jwk`; `sd_hash` = base64url(SHA-256(`<jwt>~<disclosures>~`)) recomputed by the verifier; `iat` within [now − 300 s − 60 s, now + 60 s] (both ends inclusive); `exp`, when present, a number > now − 60 s; `nbf`, when present, a number ≤ now + 60 s. Then `nonce` (`NONCE_MISMATCH`), then `aud` (`AUD_MISMATCH`), so an unsigned KB-JWT never yields a mismatch | `DISCLOSURE_INVALID`, `KB_INVALID`, `NONCE_MISMATCH`, `AUD_MISMATCH` |
 | 10 | `product_chain` | Only in `verifyProductChain` (section 10), listed last for every event (alone at index 3 and later); `SKIPPED` when steps 1–4 failed. The event is a product event of the product being viewed, at its stage position, linked by `prev` to the event before it as received, with a `thoi_diem` that is a valid ISO instant, not later than its own `iat` + 60 s and not earlier than the previous valid step; the five claims are strings of 1–500 characters (`MALFORMED` otherwise) | `CHAIN_BROKEN`, `MALFORMED` |
 
 Other codes: `CLIENT_ID_MISMATCH`, `VERIFIER_NOT_TRUSTED` (wallet checking a
-presentation request), `DID_RESOLUTION_FAILED`, `KEY_NOT_FOUND` (`did:jwk`
-helper only; the credential path no longer resolves DIDs, ADR-0015), `SKIPPED`,
+presentation request), `SKIPPED`,
 and the wallet operation codes of section 8 (`OFFER_INVALID`, `URL_NOT_ALLOWED`,
 `TX_CODE_WRONG`, `TX_CODE_REQUIRED`, `OFFER_EXPIRED`, `NETWORK_ERROR`, `ISSUER_ERROR`,
 `CREDENTIAL_INVALID`, `CNF_MISMATCH`, `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`,
@@ -181,7 +203,8 @@ to present only (ADR-0004, "Bổ sung 2026-11-19" point 3).
 
 Status rules enforced by the policy before the `StatusChecker` is called: the
 credential must carry `status.status_list.{uri, idx}` with `idx` a non-negative
-integer, and `uri` must be exactly `<iss>/status/<n>` with `n` matching
+integer, and `uri` must be exactly `<iss>/status/<n>` (on the DID path the form
+of section 11 instead) with `n` matching
 `^[1-9][0-9]{0,8}$` (ADR-0015 §11), compared as strings: no URL parsing and no
 platform `URL`, so `..`, `%2e`, `\`, whitespace, query, fragment, userinfo, port
 and case variants never reach the checker. Anything else is
@@ -202,7 +225,7 @@ library are wrapped in `TypeError` without echoing claim values):
 `createPresentation`, and `decodeCredentialUnverified` (display only, verifies
 nothing). The issuer refuses a signer without `x5c` [leaf, issuing CA], an
 `iss` that is not a SAN URI of the leaf, a status `uri` not of the form
-`<iss>/status/<n>`, any disclosable metadata claim (`iat` included), claim names
+`<iss>/status/<n>` (a DID signer instead: section 11), any disclosable metadata claim (`iat` included), claim names
 `__proto__` / `constructor` / `prototype` / `_sd` / `_sd_alg` / `...` / metadata
 names, values JSON cannot carry unchanged (undefined, functions, symbols,
 bigints, non-finite numbers, non-plain objects, cycles; reserved keys at any
@@ -278,7 +301,10 @@ value as an OpenID4VP `x509_hash`.
   `ma_san_pham` that `parseProductCode` refuses and a `thoi_diem` that is not
   such an instant or is later than the time of issuance + 60 s (section 10).
 - Header of both: `{ alg: 'ES256', typ: 'dc+sd-jwt', x5c: [leaf, issuingCa] }`,
-  no `kid`. `iss` = `https://api-identra.awncorp.vn/issuers/<name>`.
+  no `kid`. `iss` = `https://api-identra.awncorp.vn/issuers/<name>`. A diploma
+  of a DID issuer (section 11) has `{ alg: 'ES256', typ: 'dc+sd-jwt', kid:
+  '<did>#<fragment>' }`, no `x5c`, and `iss` = that DID; product events have no
+  DID form.
 - Metadata claims (`iss`, `vct`, `iat`, `nbf`, `exp`, `cnf`, `status`) are never
   disclosable; a presentation that delivers one through a disclosure is
   `DISCLOSURE_INVALID`.
@@ -294,7 +320,8 @@ value as an OpenID4VP `x509_hash`.
   `ttl` (900), `status_list: { bits: 2, lst }`; `lst` = base64url of the ZLIB
   (RFC 1950) compressed 32 768-byte array of 131 072 entries, entry `i` in bits
   `2·(i mod 4)` and up of byte `⌊i / 4⌋`; values 0 valid, 1 revoked, 2
-  suspended (3 is refused). At most 128 KB.
+  suspended (3 is refused). At most 128 KB. A DID issuer's token has `kid`
+  `<did>#<fragment>` instead of `x5c` (section 11).
 - Trust list token: JWS `typ: identra-trust-list+jwt` with `x5c` of exactly one
   certificate signed directly by a pinned root; payload `iat`, `exp` (24 h),
   `ttl` (3600), `issuers: [{ ma_to_chuc, ten, chung_thu: [{ sha256, muc_dich }],
@@ -394,8 +421,14 @@ empty.
   carry the new certificate's notBefore; the registry remembers
   the largest value of any verified list (and persists it with `seen`) and refuses
   lists of older signer certificates from then on.
-- `createStatusListChecker({ fetch, verifier, chainValidator, trustRegistry, clock, maxAgeSeconds?, seen? })`
-  (`StatusChecker`): refuses a non-https `uri` and an `idx` outside the list without a
+- `verifyDidStatusListToken(token, { uri, did, didResolver, verifier, now })`: the
+  token of a DID issuer (section 11). After `alg`: no `x5c` (`malformed`), `kid` a
+  DID URL (`key`) of exactly `did` (`not_trusted`, before any request), an
+  `assertionMethod` EC P-256 key of that DID (`key`); then signature, times, `sub`
+  and `status_list` as above. There is no trust-list step.
+- `createStatusListChecker({ fetch, verifier, chainValidator, trustRegistry, clock, maxAgeSeconds?, seen?, didResolver? })`
+  (`StatusChecker`; for DID issuers see section 11, and without `didResolver` their
+  answer is `'unavailable'`): refuses a non-https `uri` and an `idx` outside the list without a
   request; the injected fetch decides which hosts are reachable at all (the wallet
   admits only `/status/<n>` URLs, the server answers only its own lists and refuses
   every other status URL itself); `GET` with `timeoutMs: 5000` and `maxBytes`
@@ -1106,3 +1139,126 @@ Known limits:
   then no longer matches, so the blame lands on N + 1 (`CHAIN_BROKEN`).
 - The product entry bundle is 684 KB minified (168 KB gzip), two thirds of it
   `zod` pulled in by `@owf/token-status-list` (ADR-0017).
+
+## 11. DID trust path (ADR-0020)
+
+A second way to recognise an issuer, beside the X.509 path, which keeps its
+behaviour exactly. The issuer is a `did:certnet` DID; its key comes from the
+CertNet gateway (`x/did`) and its recognition from the CertNet trust registry
+(TIR, `x/trust`), both read over the injected `HttpFetch` only (CertNet spec of
+25/11, `4-openapi.yaml`). One issuer uses one path. Identities of the two paths
+(certificate fingerprints, DIDs) are never mapped onto each other: a DID
+credential is shown under its DID, never under a name from the trust list, and
+the name a credential claims for itself is never shown.
+
+The path is a choice of each verifier: `verifyPresentation` /
+`verifyStoredCredential` take it only with the option `dpki: { resolver,
+trustRegistry }`; without it a credential with a DID `kid` fails
+`did_resolution` with `DID_RESOLUTION_FAILED`. The public product page
+(section 10) does not enable it. Gateway URL and network are deployment
+configuration:
+
+- `createCertNetDidResolver({ gatewayUrl, network, fetch, clock, cacheSeconds = 60, maxEntries = 100 })`
+  (`DidResolver`) and `createCertNetTrustRegistry({ gatewayUrl, network, fetch })`
+  (`DidTrustRegistry`). `gatewayUrl` is an `https` origin with an optional path
+  prefix (no query, fragment, userinfo or dot segment; one trailing `/` is
+  dropped); the API is under `<gatewayUrl>/v1`. `network` is `local`, `testnet`
+  or `mainnet`. `cacheSeconds` is an integer 0–300 (0 = no cache). Bad options
+  are `TypeError`.
+- Only DIDs matching `^did:certnet:(local|testnet|mainnet):[A-Za-z0-9_-]+$` of the
+  configured network (`isCertNetDid(did, network?)`) are ever requested; any
+  other is refused without a request.
+- Every request: `GET`, `accept: application/json`, `timeoutMs: 5000`, `maxBytes`
+  65 536 (`CERTNET_RESPONSE_MAX_BYTES`, compared with the UTF-8 byte length);
+  the path parameter is `encodeURIComponent(did)`.
+
+`did_resolution` (step 3 of the DID path), in this order; no request is made
+before the first three rows pass:
+
+| Check | Code |
+|---|---|
+| `dpki` was given | `DID_RESOLUTION_FAILED` |
+| `kid` is `<did>#<fragment>`: one `#`, both parts non-empty | `KEY_NOT_FOUND` |
+| `iss` is exactly the DID of `kid` | `ISSUER_MISMATCH` |
+| The DID is `did:certnet` of the configured network; the gateway answers 200 with a `DidResolutionResult` whose `did` and `document.id` are that DID, every verification method has `id` starting with `<did>#`, `controller` that DID, string `type`, object `publicKeyJwk`, no two share an `id`, `authentication` / `assertionMethod` / `capabilityInvocation` / `@context` are lists of strings when present, and `metadata.deactivated` is not `true`. 404, 410, 422 and a 200 that breaks any of this are definitive | `DID_RESOLUTION_FAILED` |
+| The gateway gave no usable answer: 5xx, any other status (3xx, 501 included), timeout or fetch rejection, oversized or non-JSON body. "Not checked yet", never "forged" | `DID_RESOLUTION_UNAVAILABLE` |
+| A verification method has `id` = `kid`, and `kid` is in `assertionMethod` | `KEY_NOT_FOUND` |
+| Its `publicKeyJwk` is a valid EC P-256 public key (`normalizeEcPublicJwk`: no private member, point on the curve); any other key (Ed25519) | `ALG_NOT_ALLOWED` |
+
+The resolver never throws for bad input. A failure has `didDocument: null` and
+`didResolutionMetadata.error` from `DID_CERTNET_ERRORS`: `invalidDid` (shape,
+network, 422), `notFound` (404), `deactivated` (410 or `metadata.deactivated`),
+`invalidDidDocument` (a 200 outside the contract), `versionTimeNotSupported`, and
+`temporarilyUnavailable` (`DID_RESOLUTION_UNAVAILABLE_ERROR`), the only one that
+means "try later". `resolveDidVerificationKey(kid, resolver)` maps these to the
+codes of the table. A given `versionTime` is that explicit failure, without a
+request (the gateway of 25/11 answers 501). Successful resolutions only are
+cached, per DID, for `cacheSeconds` counted from the fetch by `clock`; a clock
+that stepped back makes the entry stale; at most `maxEntries` DIDs, the oldest
+dropped first; every caller gets its own copy. The credential and its status
+list share one resolution.
+
+`issuer_trust` (step 7 of the DID path): a product event is `ISSUER_NOT_TRUSTED`
+without a request (the TIR has no stages yet). Otherwise `lookupIssuer(did, vct,
+now)` asks `GET <gatewayUrl>/v1/trust-registry/issuers/<did>?vcType=<vct>` (both
+encoded) and trusts only a 200 whose `issuerDid` is `did`, `recognition` is
+`recognized`, `vcTypes` contains exactly the string `vct` (compared here; the
+gateway's soft filter is not relied on) and `now` is within `[validFrom − 60 s,
+validUntil + 60 s]` for each bound present and not null (RFC 3339 date-times).
+404, `rejected`, another type and outside the window: `ISSUER_NOT_TRUSTED`. No
+usable answer (5xx, any other status, timeout, oversized, not JSON, not the
+contract's shape, an unreadable date, another `issuerDid`):
+`TrustListUnavailableError`, so `TRUST_LIST_UNAVAILABLE`. Answers are never
+cached: a withdrawn recognition takes effect at the next check. The result has
+`trustPath: 'did'`, `issuerDid`, `issuer: null` and no `fingerprint`.
+
+Status (step 8 of the DID path): still a Token Status List served by the issuer.
+
+- The credential's `status.status_list.uri` must match, as a string,
+  `^https://[a-z0-9-]+(\.[a-z0-9-]+)*(:[1-9][0-9]{0,4})?(/[A-Za-z0-9_~-]+(\.[A-Za-z0-9_~-]+)*)+/status/[1-9][0-9]{0,8}$`
+  (`isDidStatusListUri`): lower-case host, optional port, at least one path
+  segment before `/status/<n>`, no query, fragment, userinfo, `%`, `\`,
+  whitespace, empty, `.` or `..` segment. Anything else is `STATUS_UNAVAILABLE`
+  without a request. The issuer enforces the same form.
+- The checker is asked with `{ did: iss }`. The token's header has `kid`
+  `<did>#<fragment>` and no `x5c` (a token with both `x5c` and a DID `kid` is
+  `malformed`, on both paths); the DID of `kid` must be the credential issuer's
+  (`not_trusted`), the key an `assertionMethod` EC P-256 key of that DID as the
+  resolver gives it (`key`); then signature, `iat` / `exp` / `ttl`, `sub` = list
+  URI and the list itself exactly as in section 7, with every rule of section 5
+  (caps of ADR-0019, no older `iat`, fail-closed).
+- Lists are cached per (path, issuer organisation or DID, URI), so DID and X.509
+  issuers never share an entry; every answer re-resolves the DID and requires the
+  same key to still be an `assertionMethod` key under that `kid`. A checker without
+  `didResolver`, an issuer given both as `maToChuc` and `did`, or a DID that is not
+  `did:certnet` is `'unavailable'`.
+
+Issuance: a signer carries either `x5c` (unchanged) or a `kid` that is a
+`did:certnet` DID URL, never both (`signJws`, `createStatusListToken`,
+`issueCredential` throw `TypeError`). With a DID signer `iss` must be the DID of
+`kid`, the header has `kid` and no `x5c`, and the status `uri` must have the
+form above. `issueDiploma` takes either signer; `issueProductEvent` refuses a
+DID signer. A DID issuer signs its status lists with the same DID key.
+
+Known limitations:
+
+- Gateway answers (25/11) are unsigned and carry no proof from the chain, so the
+  gateway URL is trusted configuration: whoever controls the gateway a verifier
+  points to, or breaks TLS to it, can return any key and any recognition and so
+  impersonate every DID issuer for that verifier. The X.509 path does not have
+  this weakness (signed trust list, pinned roots).
+- One DID key signs both credentials and status lists: CertNet accepts one
+  verification method at DID creation and cannot add one yet (the X.509 path
+  separates the two certificates, ADR-0015 §6).
+- No key rotation: without `versionTime`, credentials signed with a key the DID
+  no longer has stop verifying once it changes.
+- The status URL is not bound to the DID: a CertNet DID document has no `service`
+  yet, so a DID issuer chooses any URL of the form above, and the list is trusted
+  only for being signed by the issuer's DID key.
+- No issuer display name on the DID path until the TIR has a name field written
+  by the recognising body; interfaces show the shortened DID.
+- On localnet 25/11 anyone can write the TIR, so "recognised" on this path means
+  something only in test environments until CertNet has write permissions.
+- The gateway learns which issuers a verifier checks (by DID, not by credential).
+- Wallets and verifiers outside Identra that follow only the SD-JWT VC draft or
+  HAIP cannot verify DID-path credentials (ADR-0020, "Kết quả kiểm chuẩn").

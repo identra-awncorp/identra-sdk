@@ -1,5 +1,7 @@
 // SD-JWT VC issuance (ADR-0001, ADR-0008, ADR-0015 section 4). Input mistakes are programmer
 // errors and throw TypeError; nothing is signed unless the whole input is valid.
+import { isCertNetDid } from '../did-certnet.js';
+import { splitDidUrl } from '../did-jwk.js';
 import { base64Decode } from '../encoding.js';
 import type { Clock, EcPublicJwk, Hasher, RandomSource, Signer } from '../interfaces.js';
 import { normalizeEcPublicJwk } from '../jwk.js';
@@ -14,6 +16,7 @@ import {
   SD_JWT_LIMITS,
   parseUtcInstant,
   VCT,
+  isDidStatusListUri,
   isStatusListUri,
   type DiplomaClaims,
   type ProductEventClaims,
@@ -23,7 +26,10 @@ import { libIssue } from './library.js';
 import { parseProductCode } from '../product/gs1.js';
 
 export interface IssuerContext {
-  /** ES256 signer whose `x5c` is [leaf, issuing CA] and whose leaf has `iss` as a SAN URI. */
+  /**
+   * ES256 signer whose `x5c` is [leaf, issuing CA] and whose leaf has `iss` as a SAN URI; or (DID
+   * trust path, ADR-0020) one without `x5c` whose `kid` is `<iss>#<fragment>`, `iss` a did:certnet DID.
+   */
   signer: Signer;
   hasher: Hasher;
   random: RandomSource;
@@ -31,14 +37,17 @@ export interface IssuerContext {
 }
 
 export interface IssueCredentialInput extends IssuerContext {
-  /** HTTPS issuer URL. */
+  /** HTTPS issuer URL; the issuer's DID with a DID signer. */
   iss: string;
   vct: string;
   /** NumericDate seconds. */
   nbf?: number;
   exp?: number;
   cnfJwk?: EcPublicJwk;
-  /** `uri` must be `<iss>/status/...` (ADR-0015 section 11). */
+  /**
+   * `uri` must be `<iss>/status/<n>` (ADR-0015 section 11); with a DID signer
+   * `https://<host>[:port]/<path>/status/<n>` (isDidStatusListUri, ADR-0020 section 6).
+   */
   status: { idx: number; uri: string };
   /** Subject claims. */
   claims: Record<string, unknown>;
@@ -89,27 +98,38 @@ function checkJsonValue(name: string, value: unknown): void {
 }
 const isNumericDate = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 
-function checkSigner(signer: Signer, iss: string): Signer & { x5c: string[] } {
+const hasDidKid = (signer: Signer | undefined): boolean => typeof signer?.kid === 'string' && signer.kid.startsWith('did:');
+
+function checkSigner(signer: Signer, iss: string): Signer {
   if (signer?.alg !== 'ES256' || typeof signer.sign !== 'function') fail('signer must be an ES256 Signer');
+  if (hasDidKid(signer)) {
+    if (signer.x5c !== undefined) fail('an issuer signer carries x5c or a DID kid, never both');
+    const did = splitDidUrl(signer.kid)?.did;
+    if (!isCertNetDid(did)) fail('a DID kid must be did:certnet:<network>:<id>#<fragment>');
+    if (iss !== did) fail('iss must be the DID of the signer kid');
+    return signer;
+  }
   const x5c = signer.x5c;
   if (!Array.isArray(x5c) || x5c.length !== 2 || !x5c.every((c) => typeof c === 'string')) {
     fail('issuer signer must carry x5c [leaf, issuing CA]');
   }
   const leaf = parseCertificate(base64Decode(x5c![0]!));
   if (!leaf.sanUris.includes(iss)) fail('iss is not a SAN URI of the signer certificate');
-  return signer as Signer & { x5c: string[] };
+  return signer;
 }
 
 /** Generic issuance; prefer issueDiploma / issueProductEvent. Returns the compact, ending with "~". */
 export async function issueCredential(input: IssueCredentialInput): Promise<string> {
   const { hasher, random, clock, iss, vct, nbf, exp, cnfJwk, status, claims, disclosable, sdDigests } = input;
-  if (typeof iss !== 'string' || !iss.startsWith('https://')) fail('iss must be an https URL');
+  if (!hasDidKid(input.signer) && (typeof iss !== 'string' || !iss.startsWith('https://'))) fail('iss must be an https URL');
   const signer = checkSigner(input.signer, iss);
   if (typeof vct !== 'string' || vct === '') fail('vct must be a non-empty string');
   if (nbf !== undefined && !isNumericDate(nbf)) fail('nbf must be a NumericDate');
   if (exp !== undefined && !isNumericDate(exp)) fail('exp must be a NumericDate');
   if (!Number.isSafeInteger(status?.idx) || status.idx < 0) fail('status.idx must be a non-negative integer');
-  if (!isStatusListUri(status.uri, iss)) fail('status.uri must be exactly <iss>/status/<n>, n in 1..999999999');
+  if (hasDidKid(signer) ? !isDidStatusListUri(status.uri) : !isStatusListUri(status.uri, iss)) {
+    fail(hasDidKid(signer) ? 'status.uri must be https://<host>[:port]/<path>/status/<n>, n in 1..999999999' : 'status.uri must be exactly <iss>/status/<n>, n in 1..999999999');
+  }
   if (typeof claims !== 'object' || claims === null || Array.isArray(claims)) fail('claims must be an object');
   const claimProto = Object.getPrototypeOf(claims);
   if (claimProto !== Object.prototype && claimProto !== null) fail('claims must be a plain object');
@@ -188,6 +208,7 @@ export async function issueProductEvent(
   input: IssuerContext & { iss: string; status: { idx: number; uri: string }; claims: ProductEventClaims },
 ): Promise<string> {
   if ('cnfJwk' in input) fail('a product event has no holder binding (cnfJwk)');
+  if (hasDidKid(input.signer)) fail('a product event is issued on the X.509 trust path only (ADR-0020 section 5)');
   const claims = input.claims;
   exactKeys(claims, PRODUCT_EVENT_CLAIMS, ['prev']);
   for (const name of [...PRODUCT_EVENT_CLAIMS, 'prev'] as const) {

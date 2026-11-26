@@ -1,11 +1,14 @@
 // Status List Token in JWT form (Token Status List section 5.1, ADR-0013 section 3, ADR-0015
 // sections 4 and 6): typ statuslist+jwt, x5c [leaf, issuing CA] of a `status` certificate of the
-// organisation that issued the credential.
+// organisation that issued the credential; for a DID issuer (ADR-0020 section 6) instead `kid`, a
+// DID URL of an assertionMethod key of the issuer's own DID, and no x5c.
+import { isCertNetDid } from '../did-certnet.js';
+import { splitDidUrl } from '../did-jwk.js';
 import { utf8Encode } from '../encoding.js';
-import type { CertificateChainValidator, Signer, TrustRegistry, Verifier } from '../interfaces.js';
+import type { CertificateChainValidator, DidResolver, EcPublicJwk, Signer, TrustRegistry, Verifier } from '../interfaces.js';
 import { signJws } from '../jws.js';
 import { TrustListUnavailableError } from '../results.js';
-import { fail, tokenTimes, verifySignedToken, type TokenFailure } from '../signed-token.js';
+import { fail, tokenTimes, verifyDidSignedToken, verifySignedToken, type TokenFailure, type VerifiedDidSignedToken, type VerifiedSignedToken } from '../signed-token.js';
 import { decodeStatusList, type StatusList } from './list.js';
 
 export const STATUS_LIST_TOKEN_TYP = 'statuslist+jwt';
@@ -33,7 +36,10 @@ export async function createStatusListToken(options: {
   const { list, uri, signer, now, ttlSeconds = 900, lifetimeSeconds = 86_400 } = options;
   if (typeof list?.encode !== 'function') throw new TypeError('list is required');
   if (typeof uri !== 'string' || !uri.startsWith('https://')) throw new TypeError('uri must be an https URL');
-  if (!Array.isArray(signer?.x5c) || signer.x5c.length !== 2) throw new TypeError('the signer needs x5c [leaf, issuing CA] of a status certificate');
+  const didKid = typeof signer?.kid === 'string' && signer.kid.startsWith('did:');
+  if (didKid ? signer.x5c !== undefined || !isCertNetDid(splitDidUrl(signer.kid)?.did) : !Array.isArray(signer?.x5c) || signer.x5c.length !== 2) {
+    throw new TypeError('the signer needs x5c [leaf, issuing CA] of a status certificate, or a did:certnet kid and no x5c');
+  }
   const { iat, exp, ttl } = tokenTimes(now, ttlSeconds, lifetimeSeconds);
   const payload = { sub: uri, iat, exp, ttl, status_list: list.encode() };
   return signJws({ typ: STATUS_LIST_TOKEN_TYP }, utf8Encode(JSON.stringify(payload)), signer);
@@ -79,15 +85,39 @@ export async function verifyStatusListTokenSigned(
   const signer = { fingerprint: r.fingerprint, maToChuc: r.leaf.subject.organizationIdentifier ?? '' };
   const untrusted = await checkStatusListSigner(o.trustRegistry, signer, o.issuerMaToChuc, now);
   if (untrusted) return untrusted;
+  return withList(r, token as string, signer);
+}
+
+/** The decoded list of a verified token. */
+function withList<S>(r: VerifiedSignedToken | VerifiedDidSignedToken, token: string, signer: S): ({ ok: true; list: StatusList; token: string; iat: number; exp: number; ttl?: number; signer: S }) | TokenFailure {
   let list: StatusList;
   try {
     list = decodeStatusList(r.payload['status_list']);
   } catch (e) {
     return fail('claims', (e as Error).message);
   }
-  const result: VerifiedStatusListToken = { ok: true, list, token: token as string, iat: r.iat, exp: r.exp, signer };
-  if (r.ttl !== undefined) result.ttl = r.ttl;
-  return result;
+  return { ok: true, list, token, iat: r.iat, exp: r.exp, ...(r.ttl !== undefined ? { ttl: r.ttl } : {}), signer };
+}
+
+export interface VerifiedDidStatusListToken extends Omit<VerifiedStatusListToken, 'signer'> {
+  /** The DID URL of the signing key and that key. */
+  signer: { kid: string; publicJwk: EcPublicJwk };
+}
+
+/**
+ * The status list of a DID issuer (ADR-0020 section 6): every rule of docs/architecture.md section
+ * 7 for the token and `sub`, with `kid` = `<did>#<fragment>` of the issuer's own DID (`not_trusted`
+ * for another DID) and the key an assertionMethod EC P-256 key of it (`key`), and no x5c.
+ */
+export async function verifyDidStatusListToken(
+  token: unknown,
+  o: { uri: string; did: string; didResolver: DidResolver; verifier: Verifier; now: Date },
+): Promise<VerifiedDidStatusListToken | TokenFailure> {
+  const { did, didResolver, verifier, now } = o;
+  const r = await verifyDidSignedToken(token, { typ: STATUS_LIST_TOKEN_TYP, maxBytes: STATUS_LIST_TOKEN_MAX_BYTES, did, didResolver, verifier, now });
+  if (!r.ok) return r;
+  if (r.payload['sub'] !== o.uri) return fail('claims', 'sub is not the status list uri');
+  return withList(r, token as string, { kid: r.kid, publicJwk: r.publicJwk });
 }
 
 /** Every rule of docs/architecture.md section 7; never throws for bad input. */

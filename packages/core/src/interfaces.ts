@@ -15,6 +15,11 @@ export interface Signer {
   publicJwk: EcPublicJwk;
   /** [leaf, issuing CA], standard base64 DER; wallets have none. */
   x5c?: string[];
+  /**
+   * A value starting with `did:` is the DID URL `did:certnet:<network>:<id>#<fragment>` of the key
+   * (DID trust path, ADR-0020): `signJws` then writes it as the header `kid`, and `x5c` must be absent.
+   * Any other value is not written by `signJws` (callers put such a `kid` in the header themselves).
+   */
   kid?: string;
   /** Returns the 64-byte r||s (JOSE) form, never DER. */
   sign(data: Uint8Array): Promise<Uint8Array>;
@@ -75,8 +80,11 @@ export interface CertificateChainValidator {
 }
 
 export interface StatusChecker {
-  /** 'unavailable' = no valid list could be obtained or it failed any check (fail-closed, ADR-0013). */
-  check(ref: { uri: string; idx: number }, issuer: { maToChuc: string }): Promise<'valid' | 'revoked' | 'suspended' | 'unavailable'>;
+  /**
+   * 'unavailable' = no valid list could be obtained or it failed any check (fail-closed, ADR-0013).
+   * The issuer is the organisation of an X.509 issuer (`maToChuc`) or the DID of a DID issuer (ADR-0020 section 6).
+   */
+  check(ref: { uri: string; idx: number }, issuer: { maToChuc: string } | { did: string }): Promise<'valid' | 'revoked' | 'suspended' | 'unavailable'>;
 }
 
 export interface TrustEntry {
@@ -94,6 +102,17 @@ export interface TrustRegistry {
    * Rejects with TrustListUnavailableError when no valid trust list is held (ADR-0015 section 6).
    */
   lookup(fingerprint: string, at?: Date): Promise<TrustEntry | null>;
+}
+
+/** The answer of a DidTrustRegistry; never a display name (ADR-0020 section 1). */
+export type DidIssuerTrust = { trusted: true } | { trusted: false; /** For logs only. */ detail: string };
+
+export interface DidTrustRegistry {
+  /**
+   * Whether `did` is recognised for issuing credentials of type `vct` at `at` (ADR-0020 section 5).
+   * Rejects with TrustListUnavailableError when no usable answer was obtained.
+   */
+  lookupIssuer(did: string, vct: string, at: Date): Promise<DidIssuerTrust>;
 }
 
 export interface DidVerificationMethod {
@@ -120,7 +139,7 @@ export interface DidResolutionResult {
   didResolutionMetadata: { contentType?: string; error?: string; message?: string };
 }
 
-/** did:jwk only; kept for tests and a later did:certnet (ADR-0015 section 13). */
+/** did:jwk (tests) and did:certnet (the DID trust path, ADR-0020). */
 export interface DidResolver {
   resolve(did: string, opts?: { versionTime?: string }): Promise<DidResolutionResult>;
 }

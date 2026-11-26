@@ -16,6 +16,9 @@ export const ErrorCodes = Object.freeze({
   CERT_CONSTRAINT_INVALID: 'CERT_CONSTRAINT_INVALID',
   CERT_KEY_NOT_ALLOWED: 'CERT_KEY_NOT_ALLOWED',
   ISSUER_MISMATCH: 'ISSUER_MISMATCH',
+  // 3 did_resolution (ADR-0020 section 4); ISSUER_MISMATCH, KEY_NOT_FOUND, DID_RESOLUTION_FAILED and ALG_NOT_ALLOWED are reused
+  /** The CertNet gateway gave no usable answer: "not checked yet", never "forged". */
+  DID_RESOLUTION_UNAVAILABLE: 'DID_RESOLUTION_UNAVAILABLE',
   // 4 signature
   SIGNATURE_INVALID: 'SIGNATURE_INVALID',
   // 5 validity_time
@@ -75,6 +78,8 @@ export type CheckId =
   | 'structure'
   | 'algorithm'
   | 'certificate_chain'
+  /** Step 3 on the DID trust path (ADR-0020 section 4), in place of certificate_chain. */
+  | 'did_resolution'
   | 'signature'
   | 'validity_time'
   | 'credential_type'
@@ -105,7 +110,10 @@ export interface VerificationResult {
   checks: Check[];
 }
 
-/** Thrown by a TrustRegistry when it holds no valid trust list (ADR-0015 section 6). */
+/**
+ * Thrown by a TrustRegistry when it holds no valid trust list (ADR-0015 section 6), and by a
+ * DidTrustRegistry when it got no usable answer (ADR-0020 section 5).
+ */
 export class TrustListUnavailableError extends Error {
   constructor(message = 'no valid trust list is held') {
     super(message);
