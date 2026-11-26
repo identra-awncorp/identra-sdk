@@ -2,16 +2,17 @@
 // resolve: QR text -> offer by reference -> metadata, all on the QR's origin; nothing is created.
 // accept: token (PIN) -> c_nonce -> new wallet key -> proof -> encrypted credential request ->
 // the credential is verified as the wallet would verify it to present it -> vault. Any failure after
-// the key was created deletes the key again, and nothing is saved.
+// the key was created deletes the key again, and nothing is saved; except a credential whose issuer
+// DID could not be resolved (ADR-0020), kept in memory with its key to be verified again by the next accept.
 import {
-  decodeCredentialUnverified, DIPLOMA_CLAIMS, isStatusListUri, jwkThumbprint, STATUS_LIST_ENTRIES, VCT, verifyStoredCredential, type CredentialVerificationResult,
-  type EcPublicJwk, type HttpFetch,
+  decodeCredentialUnverified, DIPLOMA_CLAIMS, isCertNetDid, isDidStatusListUri, isStatusListUri, jwkThumbprint, STATUS_LIST_ENTRIES, VCT, verifyStoredCredential,
+  type CredentialVerificationResult, type EcPublicJwk, type HttpFetch,
 } from '@identra/sdk-core';
 import { generateSecretKey, P256, uncompressedPointToJwk } from '../crypto/noble.js';
 import { Fail, keyFailureCode, WalletErrorCodes as C, type WalletFailure } from './errors.js';
 import { guardFetch, httpsOrigin, PROTOCOL_MAX_BYTES, PROTOCOL_TIMEOUT_MS } from './fetch.js';
 import { createProof, failureOf, requestAccessToken, requestCredential, requestNonce, resolveMetadata, resolveOffer, type IssuerSession, type LibraryDeps } from './library.js';
-import type { WalletContext } from './context.js';
+import { verifyOptionsOf, type WalletContext } from './context.js';
 
 /** Claims a credential type must disclose to the holder; only holder-bound types can be received. */
 export const REQUIRED_CLAIMS: Readonly<Record<string, readonly string[]>> = Object.freeze({ [VCT.diploma]: DIPLOMA_CLAIMS });
@@ -42,17 +43,20 @@ export interface ResolvedOffer {
 /**
  * `status: 'unknown'` when the credential itself verified but the trust list or its status list
  * could not be read at receipt; refreshStatus settles it later. `issuerName` is then null when the
- * trust list was the one missing.
+ * trust list was the one missing. On the DID path (ADR-0020) `issuerDid` is the issuer's DID and
+ * `issuerName` is always null; `issuerDid` is absent on the X.509 path.
  */
 export type AcceptResult =
-  | { ok: true; credentialId: string; vct: string; issuerName: string | null; status: 'valid' | 'unknown' }
+  | { ok: true; credentialId: string; vct: string; issuerName: string | null; issuerDid?: string; status: 'valid' | 'unknown' }
   | AcceptFailure;
 
 /**
  * `retryable`: true when `accept` on the SAME resolved offer can still complete (the PIN was wrong
  * and the offer still exists, the PIN was missing, a token request got no answer, the wallet still
- * holds an unexpired, unused access token, or a received credential waits to be stored); false when
- * a new offer is needed.
+ * holds an unexpired, unused access token, or a received credential waits to be stored or, its
+ * issuer DID not resolved yet, to be verified); false when a new offer is needed.
+ * A received credential whose issuer DID could not be resolved (the CertNet gateway gave no usable
+ * answer) is NETWORK_ERROR with `checks`: it was not stored, and the next accept verifies it again.
  * `codeRedeemed`: the offer's `codeRedeemed` at the end of this call. True: a retry needs no PIN.
  * False: a retry must send the PIN again (TX_CODE_REQUIRED without it). After a token request with
  * no answer (NETWORK_ERROR, codeRedeemed false) the wallet cannot know whether the issuer redeemed
@@ -69,10 +73,14 @@ const DEFAULT_TOKEN_SECONDS = 60;
 /** A token this close to its expiry is not used any more. */
 const TOKEN_MARGIN_MS = 5_000;
 
-interface Received { compact: string; keyId: string; vct: string; iss: string; issuerName: string | null; listsDown: boolean }
+interface Received { compact: string; keyId: string; vct: string; issuerDid: string | null; issuerName: string | null; listsDown: boolean }
+/** A credential the issuer sent, not verified yet, with the wallet key it is bound to. */
+interface Unverified { compact: string; keyId: string; publicJwk: EcPublicJwk }
 
 interface OfferState {
   issuerUri: string;
+  /** `identra_issuer_did` of the metadata (ADR-0020 decision 7): the credential must be of the DID path with this `iss`; null: X.509 with `iss` = issuerUri. */
+  issuerDid: string | null;
   offerUri: string;
   origin: string;
   session: IssuerSession;
@@ -88,6 +96,8 @@ interface OfferState {
   nonce: string | null;
   /** A received and verified credential whose storing failed; its wallet key is kept for it. */
   received: Received | null;
+  /** A received credential whose issuer DID could not be resolved; its wallet key is kept for it. */
+  unverified: Unverified | null;
   /** Calls of accept on one offer run one after the other. */
   queue: Promise<unknown>;
 }
@@ -118,7 +128,7 @@ function sameOrigin(url: unknown, origin: string): void {
 }
 
 /** Everything the wallet relies on in the metadata; anything else is OFFER_INVALID. */
-function checkMetadata(session: IssuerSession, origin: string, supportedVcts: readonly string[]): { configurationId: string; vct: string; display: DisplayEntry[] } {
+function checkMetadata(session: IssuerSession, origin: string, supportedVcts: readonly string[]): { configurationId: string; vct: string; display: DisplayEntry[]; issuerDid: string | null } {
   const { offer, credentialIssuer: ci, authorizationServers } = session;
   const grant = isObject(offer['grants']) ? offer['grants'][PRE_AUTHORIZED_GRANT] : undefined;
   const ids = strings(offer['credential_configuration_ids']);
@@ -151,25 +161,37 @@ function checkMetadata(session: IssuerSession, origin: string, supportedVcts: re
   const binding = supported['cryptographic_binding_methods_supported'];
   if (binding !== undefined && !strings(binding).includes('jwk')) throw new Fail(C.OFFER_INVALID);
   const meta = supported['credential_metadata'];
-  return { configurationId, vct: supported['vct'], display: displayOf(isObject(meta) ? meta['display'] : supported['display']) };
+  const issuerDid = ci['identra_issuer_did'];
+  if (issuerDid !== undefined && !isCertNetDid(issuerDid)) throw new Fail(C.OFFER_INVALID);
+  return { configurationId, vct: supported['vct'], display: displayOf(isObject(meta) ? meta['display'] : supported['display']), issuerDid: issuerDid ?? null };
 }
 
 /**
  * True when every failing check is only a list that could not be read: issuer_trust with
  * TRUST_LIST_UNAVAILABLE (and status SKIPPED because of it), or status with STATUS_UNAVAILABLE.
- * Chain, signature, validity, type and disclosures must all have passed, and the credential must
- * carry a well-formed status reference (`<iss>/status/<n>`, idx inside the list): a missing or
- * malformed one is not a list that was unreachable, and trying again would never settle it.
+ * Chain (or DID resolution), signature, validity, type and disclosures must all have passed, and the
+ * credential must carry a well-formed status reference (`<iss>/status/<n>`, on the DID path
+ * `https://<host>/<path>/status/<n>`; idx inside the list): a missing or malformed one is not a list
+ * that was unreachable, and trying again would never settle it. On the DID path the trust list is
+ * the CertNet trust registry.
  */
 export function onlyListsUnavailable(result: Pick<CredentialVerificationResult, 'checks' | 'credential'>): boolean {
   const c = result.credential;
-  if (!c?.status || !isStatusListUri(c.status.uri, c.iss) || c.status.idx >= STATUS_LIST_ENTRIES) return false;
+  const uriOk = c?.trustPath === 'did' ? isDidStatusListUri(c.status?.uri) : !!c?.status && isStatusListUri(c.status.uri, c.iss);
+  if (!c?.status || !uriOk || c.status.idx >= STATUS_LIST_ENTRIES) return false;
   const { checks } = result;
   const trustListDown = checks.some((c) => c.id === 'issuer_trust' && c.code === 'TRUST_LIST_UNAVAILABLE');
   return checks.every(
     (c) => c.ok || (c.id === 'issuer_trust' && c.code === 'TRUST_LIST_UNAVAILABLE') || (c.id === 'status' && (c.code === 'STATUS_UNAVAILABLE' || (c.code === 'SKIPPED' && trustListDown))),
   );
 }
+
+/**
+ * The issuer DID could not be resolved because the gateway gave no usable answer: the signature was
+ * never checked, so nothing is known about the credential yet (neither valid nor forged).
+ */
+export const didUnresolved = (result: Pick<CredentialVerificationResult, 'checks'>): boolean =>
+  result.checks.some((c) => c.id === 'did_resolution' && c.code === 'DID_RESOLUTION_UNAVAILABLE');
 
 /** No answer, or the issuer's 503 (a temporary failure before it spent anything): the same request may be sent again. */
 const retryLater = (f: { code: string; httpStatus: number | null }) => f.code === 'NETWORK_ERROR' || f.httpStatus === 503;
@@ -227,11 +249,12 @@ export function createIssuance(ctx: WalletContext) {
   async function storeReceived(state: OfferState, r: Received): Promise<AttemptResult> {
     let savedId: string | undefined;
     try {
-      savedId = await storage(() => ctx.vault.save({ compact: r.compact, vct: r.vct, issuer: r.iss, keyId: r.keyId }));
+      // The row's issuer is the credential issuer URL on both paths (re-issuance, catalogue); the DID beside it.
+      savedId = await storage(() => ctx.vault.save({ compact: r.compact, vct: r.vct, issuer: state.issuerUri, ...(r.issuerDid ? { issuerDid: r.issuerDid } : {}), keyId: r.keyId }));
       const id = savedId;
       await storage(() => ctx.vault.setStatus(id, r.listsDown ? 'unavailable' : 'valid', ctx.clock.now()));
       state.received = null;
-      return { ok: true, credentialId: id, vct: r.vct, issuerName: r.issuerName, status: r.listsDown ? 'unknown' : 'valid' };
+      return { ok: true, credentialId: id, vct: r.vct, issuerName: r.issuerName, ...(r.issuerDid ? { issuerDid: r.issuerDid } : {}), status: r.listsDown ? 'unknown' : 'valid' };
     } catch (e) {
       if (savedId !== undefined) {
         const id = savedId;
@@ -257,7 +280,9 @@ export function createIssuance(ctx: WalletContext) {
     offers.delete(offer);
     await state.queue.catch(() => {});
     if (state.received) await ctx.keyStore.delete(state.received.keyId).catch(() => {});
+    if (state.unverified) await ctx.keyStore.delete(state.unverified.keyId).catch(() => {});
     state.received = null;
+    state.unverified = null;
     state.token = null;
   }
 
@@ -276,12 +301,14 @@ export function createIssuance(ctx: WalletContext) {
       }
       sameOrigin(offer['credential_issuer'], origin);
       const session = await library(() => resolveMetadata(offer, deps));
-      const { configurationId, vct, display } = checkMetadata(session, origin, ctx.supportedVcts);
+      const { configurationId, vct, display, issuerDid } = checkMetadata(session, origin, ctx.supportedVcts);
+      // A DID issuer's credential could never be accepted without the DID path: refused before the PIN is spent.
+      if (issuerDid !== null && !ctx.dpki) throw new Fail(C.OFFER_INVALID);
       const grant = (offer['grants'] as Record<string, Record<string, unknown>>)[PRE_AUTHORIZED_GRANT]!;
       const tx = grant['tx_code'];
       const state: OfferState = {
-        issuerUri: offer['credential_issuer'] as string, offerUri, origin, session, configurationId, vct, codeUsed: false, txCodeRequired: isObject(tx),
-        token: null, nonce: null, received: null, queue: Promise.resolve(),
+        issuerUri: offer['credential_issuer'] as string, issuerDid, offerUri, origin, session, configurationId, vct, codeUsed: false, txCodeRequired: isObject(tx),
+        token: null, nonce: null, received: null, unverified: null, queue: Promise.resolve(),
       };
       const resolved: ResolvedOffer = {
         issuerUri: offer['credential_issuer'] as string,
@@ -325,6 +352,7 @@ export function createIssuance(ctx: WalletContext) {
 
   async function attempt(state: OfferState, txCode: string | undefined): Promise<AttemptResult> {
     if (state.received) return storeReceived(state, state.received);
+    if (state.unverified) return receive(state, state.unverified);
     const deps = depsFor(state.origin);
     if (!tokenUsable(state)) {
       state.token = null;
@@ -356,6 +384,8 @@ export function createIssuance(ctx: WalletContext) {
       return fails(e, tokenUsable(state));
     }
     let responseSecret: Uint8Array | undefined;
+    // Once the credential is received, receive() owns the key (and deletes it on a failure).
+    let keyHandedOver = false;
     try {
       responseSecret = generateSecretKey(ctx.random);
       const signer = await keyStoreCall(() => ctx.keyStore.signer(keyId));
@@ -373,18 +403,44 @@ export function createIssuance(ctx: WalletContext) {
         throw new Fail(failureOf(e).code);
       }
       if (!Array.isArray(credentials) || credentials.length !== 1 || !isObject(credentials[0]) || typeof credentials[0]['credential'] !== 'string') throw new Fail(C.ISSUER_ERROR);
-      const compact = credentials[0]['credential'];
+      keyHandedOver = true;
+      return await receive(state, { compact: credentials[0]['credential'], keyId, publicJwk });
+    } catch (e) {
+      if (!keyHandedOver) await ctx.keyStore.delete(keyId).catch(() => {});
+      return fails(e, tokenUsable(state));
+    } finally {
+      responseSecret?.fill(0);
+    }
+  }
 
+  /**
+   * Verifies a received credential, then stores it. Never throws. Its wallet key is deleted on a
+   * failure, except when the issuer DID could not be resolved: the credential is then kept in memory
+   * (not stored) for the next accept to verify again.
+   */
+  async function receive(state: OfferState, u: Unverified): Promise<AttemptResult> {
+    state.unverified = null;
+    try {
+      const { compact, keyId, publicJwk } = u;
       // Exactly what the wallet will rely on when it presents the credential (ADR-0007).
-      const result = await verifyStoredCredential(compact, {
-        verifier: ctx.verifier, hasher: ctx.hasher, chainValidator: ctx.chainValidator, trustRegistry: ctx.trustRegistry,
-        statusChecker: ctx.statusChecker, supportedVcts: ctx.supportedVcts, now: ctx.clock.now(),
-      });
+      const result = await verifyStoredCredential(compact, verifyOptionsOf(ctx));
+      if (didUnresolved(result)) {
+        // Only for the DID this issuer declared; anything else will not become acceptable by waiting.
+        if (state.issuerDid === null || decodeCredentialUnverified(compact).payload['iss'] !== state.issuerDid) throw new Fail(C.ISSUER_MISMATCH);
+        state.unverified = u;
+        return { ok: false, code: C.NETWORK_ERROR, checks: result.checks, retryable: true };
+      }
       const credential = result.credential;
       // A credential that verified except for a list that could not be read is kept as `unknown`.
       const listsDown = !result.ok && onlyListsUnavailable(result);
       if (!credential || (!result.ok && !listsDown)) throw new Fail(C.CREDENTIAL_INVALID, result.checks);
-      if (credential.iss !== state.issuerUri) throw new Fail(C.ISSUER_MISMATCH);
+      // ADR-0020 decision 7: the issuer declared a DID -> the DID path with exactly that `iss`, and its
+      // status list under the credential issuer URL (as `<iss>/status/<n>` binds it on the X.509 path);
+      // no DID declared -> the X.509 path with `iss` = the credential issuer URL.
+      if (state.issuerDid !== null) {
+        if (credential.trustPath !== 'did' || credential.iss !== state.issuerDid) throw new Fail(C.ISSUER_MISMATCH);
+        if (!credential.status || !isStatusListUri(credential.status.uri, state.issuerUri)) throw new Fail(C.ISSUER_MISMATCH);
+      } else if (credential.trustPath !== 'x509' || credential.iss !== state.issuerUri) throw new Fail(C.ISSUER_MISMATCH);
       if (credential.vct !== state.vct) throw new Fail(C.ISSUER_ERROR);
       if (!credential.cnfJwk || (await jwkThumbprint(credential.cnfJwk, ctx.hasher)) !== (await jwkThumbprint(publicJwk, ctx.hasher))) throw new Fail(C.CNF_MISMATCH);
       // Every claim of the type must be its own disclosure and absent from the plain payload, or the
@@ -394,12 +450,11 @@ export function createIssuance(ctx: WalletContext) {
       const disclosedOnce = (n: string) => disclosures.filter((d) => d.name === n && typeof d.value === 'string' && d.value !== '').length === 1;
       if (!required || !required.every((n) => !Object.hasOwn(payload, n) && disclosedOnce(n))) throw new Fail(C.CLAIMS_INCOMPLETE);
 
-      return storeReceived(state, { compact, keyId, vct: credential.vct, iss: credential.iss, issuerName: credential.issuer?.ten ?? null, listsDown });
+      const issuerDid = credential.trustPath === 'did' ? credential.issuerDid : null;
+      return storeReceived(state, { compact, keyId, vct: credential.vct, issuerDid, issuerName: credential.issuer?.ten ?? null, listsDown });
     } catch (e) {
-      await ctx.keyStore.delete(keyId).catch(() => {});
+      await ctx.keyStore.delete(u.keyId).catch(() => {});
       return fails(e, tokenUsable(state));
-    } finally {
-      responseSecret?.fill(0);
     }
   }
 

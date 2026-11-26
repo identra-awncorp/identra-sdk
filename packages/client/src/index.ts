@@ -15,8 +15,16 @@ export interface SessionResult {
   checks: Check[];
   /** Present only when `ok`. */
   claims?: Record<string, ClaimValue>;
-  /** Present only when `ok`. */
+  /**
+   * Present only when `ok`: how the issuer was recognised (ADR-0020). `x509`: through its certificate
+   * and the trust list, with `issuer`. `did`: through CertNet, with `issuerDid` and no name.
+   * A server that does not send it is read as `x509`.
+   */
+  trustPath?: 'x509' | 'did';
+  /** Present only when `ok` on the X.509 path. */
   issuer?: SessionIssuer;
+  /** Present only when `ok` on the DID path: the issuer's `did:certnet` DID (show it shortened; there is no name). */
+  issuerDid?: string;
   verifiedAt: string;
 }
 export interface VerificationSession {
@@ -44,11 +52,24 @@ export const API_ERROR_CODES = [
 ] as const;
 export type ApiErrorCode = (typeof API_ERROR_CODES)[number];
 
-/** The checks a presentation of a credential always lists (SDK architecture section 3, steps 1-9). */
+/** The checks a presentation of a credential always lists (SDK architecture section 3, steps 1-9), X.509 path. */
 export const PRESENTATION_CHECK_IDS = [
   'structure',
   'algorithm',
   'certificate_chain',
+  'signature',
+  'validity_time',
+  'credential_type',
+  'issuer_trust',
+  'status',
+  'holder_binding',
+] as const satisfies readonly CheckId[];
+
+/** The same on the DID trust path (ADR-0020 decision 4): `did_resolution` stands where `certificate_chain` does. */
+export const DID_PRESENTATION_CHECK_IDS = [
+  'structure',
+  'algorithm',
+  'did_resolution',
   'signature',
   'validity_time',
   'credential_type',
@@ -126,6 +147,8 @@ const CLAIM_KEY = /^[A-Za-z0-9_]{1,64}$/;
 // ma_to_chuc of the trust list: VATVN-<10-digit tax code>[-<3-digit branch>] (ADR-0015 section 9).
 const ORG_ID = /^VATVN-[0-9]{10}(-[0-9]{3})?$/;
 const SESSION_ID = /^[A-Za-z0-9_-]{16,256}$/;
+// The did:certnet DIDs the SDK accepts (sdk-core isCertNetDid; not imported, to keep this bundle small).
+const CERTNET_DID = /^did:certnet:(local|testnet|mainnet):[A-Za-z0-9_-]+$/;
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 export function isTerminalStatus(s: SessionStatus): boolean {
@@ -204,7 +227,7 @@ function parseClaims(raw: unknown): Record<string, ClaimValue> {
 
 function parseResult(raw: unknown): SessionResult {
   if (!isObj(raw)) malformed('result');
-  const { ok, checks, claims, issuer, verifiedAt } = raw;
+  const { ok, checks, claims, trustPath, issuer, issuerDid, verifiedAt } = raw;
   if (typeof ok !== 'boolean') malformed('result.ok');
   if (!Array.isArray(checks) || checks.length === 0 || checks.length > 32) malformed('result.checks');
   const parsed = checks.map((c, i) => parseCheck(c, `result.checks[${i}]`));
@@ -216,12 +239,25 @@ function parseResult(raw: unknown): SessionResult {
     if (parsed.every((c) => c.ok)) malformed('result.ok');
     if (has(raw, 'claims')) malformed('result.claims');
     if (has(raw, 'issuer')) malformed('result.issuer');
+    if (has(raw, 'trustPath')) malformed('result.trustPath');
+    if (has(raw, 'issuerDid')) malformed('result.issuerDid');
     return { ok, checks: parsed, verifiedAt };
   }
 
-  // A success must list every presentation check, each passed.
+  // A success must list every presentation check of its trust path, each passed.
   if (parsed.some((c) => !c.ok)) malformed('result.ok');
-  for (const id of PRESENTATION_CHECK_IDS) if (!parsed.some((c) => c.id === id)) malformed('result.checks');
+  if (has(raw, 'trustPath') && trustPath !== 'x509' && trustPath !== 'did') malformed('result.trustPath');
+  const did = trustPath === 'did';
+  for (const id of did ? DID_PRESENTATION_CHECK_IDS : PRESENTATION_CHECK_IDS) if (!parsed.some((c) => c.id === id)) malformed('result.checks');
+  // One path's checks only: a result cannot be recognised both ways.
+  if (parsed.some((c) => c.id === (did ? 'certificate_chain' : 'did_resolution'))) malformed('result.checks');
+  if (did) {
+    // The DID path has no name, so a result naming the issuer is not one the server sends.
+    if (has(raw, 'issuer')) malformed('result.issuer');
+    if (typeof issuerDid !== 'string' || !CERTNET_DID.test(issuerDid)) malformed('result.issuerDid');
+    return { ok, checks: parsed, claims: parseClaims(claims), trustPath: 'did', issuerDid, verifiedAt };
+  }
+  if (has(raw, 'issuerDid')) malformed('result.issuerDid');
   if (!isObj(issuer) || typeof issuer['maToChuc'] !== 'string' || !ORG_ID.test(issuer['maToChuc']) || !isText(issuer['ten'], 500)) {
     malformed('result.issuer');
   }
@@ -229,6 +265,7 @@ function parseResult(raw: unknown): SessionResult {
     ok,
     checks: parsed,
     claims: parseClaims(claims),
+    trustPath: 'x509',
     issuer: { maToChuc: issuer['maToChuc'], ten: issuer['ten'] as string },
     verifiedAt,
   };

@@ -2,7 +2,8 @@
 // random index allocation with rollover to the next list, status changes of allocated indexes only
 // (revoked is final), and the signed Status List Token of an existing list, re-signed when the list
 // changed or the token is an hour old, with an iat strictly greater than the previous one and never
-// more than 5 s ahead of the clock, by a status certificate valid at that moment.
+// more than 5 s ahead of the clock, by a status certificate valid at that moment; the lists of a DID
+// issuer (keyStore.didSigner, ADR-0020 decision 6) by its DID key, which has no validity period.
 import {
   base64Decode, createStatusList, createStatusListToken, parseCertificate, STATUS_LIST_BYTES, STATUS_LIST_ENTRIES, STATUS_VALUE, statusListEntry,
   statusListFromBytes, type Clock, type RandomSource,
@@ -89,8 +90,11 @@ export interface StatusListService {
    */
   token(issuer: string, n: number): Promise<string | null>;
   uri(issuer: string, n: number): string;
-  /** The token held for list n, for monitoring (ADR-0014 section 7): seconds; null when none is held. */
-  current(issuer: string, n: number): { iat: number; exp: number; signerNotAfter: number } | null;
+  /**
+   * The token held for list n, for monitoring (ADR-0014 section 7): seconds; null when none is held.
+   * `signerNotAfter` is null for a DID issuer (no certificate).
+   */
+  current(issuer: string, n: number): { iat: number; exp: number; signerNotAfter: number | null } | null;
 }
 
 /** Why a status list was not (re-)signed; the held token, if any, is served meanwhile. */
@@ -118,7 +122,7 @@ export function createStatusListService(options: {
   onError?: (reason: StatusSigningProblem, issuer: string) => void;
 }): StatusListService {
   const { issuerUri, keyStore, storage, random, clock, onError } = options;
-  const tokens = new Map<string, { token: string; version: number; signedAt: number; iat: number; signerNotAfter: number }>();
+  const tokens = new Map<string, { token: string; version: number; signedAt: number; iat: number; signerNotAfter: number | null }>();
   // The last iat this process signed per list: monotonic even when a stored lastIat is ignored.
   const signedIat = new Map<string, number>();
   const reportedFuture = new Set<string>();
@@ -200,11 +204,16 @@ export function createStatusListService(options: {
       if (held) return held.token;
       throw new Error(`status list ${key}: no token can be served (${why})`);
     };
-    const signer = await keyStore.signer(issuer, 'status');
-    const cert = parseCertificate(base64Decode(signer.x5c![0]!));
-    if (now < cert.notBefore || now > cert.notAfter) {
-      onError?.('signer_expired', issuer);
-      return fallback('signer certificate not valid now');
+    const didSigner = (await keyStore.didSigner?.(issuer)) ?? null;
+    const signer = didSigner ?? (await keyStore.signer(issuer, 'status'));
+    let signerNotAfter: number | null = null;
+    if (!didSigner) {
+      const cert = parseCertificate(base64Decode(signer.x5c![0]!));
+      if (now < cert.notBefore || now > cert.notAfter) {
+        onError?.('signer_expired', issuer);
+        return fallback('signer certificate not valid now');
+      }
+      signerNotAfter = Math.floor(cert.notAfter.getTime() / 1000);
     }
     let storedIat = stored.lastIat ?? 0;
     if (storedIat > nowS + MAX_STORED_LEAD_SECONDS) {
@@ -219,7 +228,7 @@ export function createStatusListService(options: {
     signedIat.set(key, iat);
     await storage.recordIat(issuer, n, iat);
     tokens.delete(key);
-    tokens.set(key, { token, version: stored.version, signedAt: now.getTime(), iat, signerNotAfter: Math.floor(cert.notAfter.getTime() / 1000) });
+    tokens.set(key, { token, version: stored.version, signedAt: now.getTime(), iat, signerNotAfter });
     if (tokens.size > TOKEN_CACHE_MAX) tokens.delete(tokens.keys().next().value!);
     return token;
   }

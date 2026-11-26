@@ -5,7 +5,8 @@
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
 import {
-  base64Decode, base64Encode, base64UrlEncode, createCertificateChainValidator, createMappedFetch, createSignedTrustListRegistry, createStatusListChecker, VCT,
+  base64Decode, base64Encode, base64UrlEncode, createCertificateChainValidator, createCertNetDidResolver, createCertNetTrustRegistry, createMappedFetch, createSignedTrustListRegistry,
+  createStatusListChecker, VCT, type Clock,
   type CertificateChainValidator, type TrustRegistry,
   type DiplomaClaims, type EcPublicJwk, type HttpFetch, type Signer, type TrustListContent,
 } from '@identra/sdk-core';
@@ -172,14 +173,74 @@ export function mountIssuer(routes: Map<string, Handler>, name: string, issuer: 
   routes.set(`POST /issuers/${name}/credential`, (req) => issuer.credential(req));
 }
 
-/** IssuerKeyStore over the test PKI: truong-mau `vc` and `status`, and the trust-list signer. */
-function testKeyStore(): IssuerKeyStore {
+export const DID = 'did:certnet:local:truongdid0001';
+export const DID_ISS = `${ISSUERS}/truong-did`;
+/** A P-256 DID signer generated at run time: `kid` `<did>#key-1`, no x5c. */
+export async function newDidSigner(did = DID): Promise<Signer> {
+  return Object.assign(await createWebCryptoSigner(await generateWebCryptoKeyPair()), { kid: `${did}#key-1` });
+}
+
+/**
+ * A FAKE CertNet gateway (no gateway exists here): the two read routes of the spec of 25/11
+ * (4-openapi.yaml), `GET /v1/dids/{did}` -> DidResolutionResult and `GET /v1/trust-registry/issuers/{did}`
+ * -> TrustLookupResult, as an injected HttpFetch. `down` answers 503 to every request, `tirDown` to the
+ * trust registry only; `recognition` scripts the TIR answer.
+ */
+export function fakeGateway(base = 'https://gateway.certnet.test') {
+  const keys = new Map<string, { kid: string; jwk: object }>();
+  const state = { down: false, tirDown: false, recognition: 'recognized', calls: [] as string[] };
+  const answer = (status: number, body: unknown) => ({ status, headers: { get: () => null }, text: async () => JSON.stringify(body) });
+  const fetch: HttpFetch = async (url) => {
+    state.calls.push(url);
+    if (state.down) return answer(503, { error: 'unavailable' });
+    const u = new URL(url);
+    if (u.origin !== base) throw new Error('host unreachable');
+    const did = decodeURIComponent(u.pathname.split('/').pop()!);
+    const key = keys.get(did);
+    if (u.pathname.startsWith('/v1/dids/')) {
+      if (!key) return answer(404, { error: 'not found' });
+      return answer(200, {
+        did,
+        document: {
+          '@context': ['https://www.w3.org/ns/did/v1'], id: did,
+          verificationMethod: [{ id: key.kid, type: 'JsonWebKey2020', controller: did, publicKeyJwk: key.jwk }],
+          authentication: [key.kid], assertionMethod: [key.kid],
+        },
+        metadata: { deactivated: false },
+        chain: { blockHeight: 12, txHash: null, proof: null },
+      });
+    }
+    if (u.pathname.startsWith('/v1/trust-registry/issuers/')) {
+      if (state.tirDown) return answer(503, { error: 'unavailable' });
+      if (!key) return answer(404, { error: 'not found' });
+      return answer(200, { issuerDid: did, recognition: state.recognition, scopes: ['education'], vcTypes: [VCT.diploma], validFrom: null, validUntil: null, chain: { blockHeight: 12, txHash: null, proof: null } });
+    }
+    return answer(404, { error: 'not found' });
+  };
+  return {
+    base, fetch, state,
+    register(signer: Signer) {
+      keys.set(signer.kid!.split('#')[0]!, { kid: signer.kid!, jwk: signer.publicJwk });
+    },
+    /** What the app builds from the gateway URL and network: a resolver and a trust registry over the gateway. */
+    dpki(clock: Clock) {
+      return {
+        resolver: createCertNetDidResolver({ gatewayUrl: base, network: 'local', fetch, clock }),
+        trustRegistry: createCertNetTrustRegistry({ gatewayUrl: base, network: 'local', fetch }),
+      };
+    },
+  };
+}
+
+/** IssuerKeyStore over the test PKI: truong-mau `vc` and `status`, and the trust-list signer; truong-did a DID issuer when `didSigner` is given. */
+function testKeyStore(didSigner: Signer | null = null): IssuerKeyStore {
   const signers = { vc: leafSigner('vc'), status: leafSigner('status') };
   return {
     async signer(organisation, purpose) {
       if (organisation !== 'truong-mau' || purpose === 'request') throw new Error('no such key in the test key store');
       return signers[purpose];
     },
+    didSigner: async (organisation) => (organisation === 'truong-did' ? didSigner : null),
     trustListSigner: () => createWebCryptoSigner({ privateKey: pem('leaf/trust-list.key.pem'), x5c: [base64Encode(der('leaf/trust-list.cert.pem'))] }),
     trustedRoots: () => [rootDer()],
   };
@@ -222,6 +283,11 @@ export interface WorldOptions {
   issuerName?: string;
   /** Leave the verifier out of the trust list the world serves. */
   untrustedVerifier?: boolean;
+  /**
+   * A DID issuer `truong-did` (ADR-0020) instead of truong-mau: DID signer, lists signed with it, a
+   * fake gateway knowing its DID. `statusOrigin` serves its lists from another origin than the API's.
+   */
+  did?: { statusOrigin?: string };
 }
 
 /** The issuer, its lists and its routes on `listener`; wallets are made with newWallet. */
@@ -229,9 +295,14 @@ export async function createWorld(listener: Listener, o: WorldOptions = {}) {
   listener.routes.clear();
   listener.requests.length = 0;
   const clock = fakeClock();
-  const keyStore = testKeyStore();
+  const didSigner = o.did ? await newDidSigner() : null;
+  const gateway = fakeGateway();
+  if (didSigner) gateway.register(didSigner);
+  const keyStore = testKeyStore(didSigner);
+  const statusOrg = o.did ? 'truong-did' : 'truong-mau';
+  const statusOrigin = o.did?.statusOrigin ?? ORIGIN;
   const statusStorage = createMemoryStatusListStorage();
-  const statusService = createStatusListService({ issuerUri: (n) => `${ISSUERS}/${n}`, keyStore, storage: statusStorage, random: webCryptoRandom, clock });
+  const statusService = createStatusListService({ issuerUri: (n) => (n === 'truong-did' ? `${statusOrigin}/issuers/${n}` : `${ISSUERS}/${n}`), keyStore, storage: statusStorage, random: webCryptoRandom, clock });
   const trust = { content: await trustContent() as TrustListContent };
   const verifierEntry = trust.content.verifiers![0]!;
   if (o.untrustedVerifier) trust.content = { ...trust.content, verifiers: [] };
@@ -239,10 +310,10 @@ export async function createWorld(listener: Listener, o: WorldOptions = {}) {
   const store = (o.store ?? ((s) => s))(createMemoryStateStore(clock));
   const keys = await generateIssuerKeys(webCryptoRandom);
   const issued: IssuedEvent[] = [];
-  const name = o.issuerName ?? 'truong-mau';
+  const name = o.issuerName ?? statusOrg;
   const issuer = createCredentialIssuer({
     issuerUri: `${ISSUERS}/${name}`, display: { vi: 'Trường Mẫu', en: 'Sample University' },
-    signer: await keyStore.signer('truong-mau', 'vc'), allocateStatus: () => statusService.allocate('truong-mau'),
+    signer: didSigner ?? (await keyStore.signer('truong-mau', 'vc')), allocateStatus: () => statusService.allocate(statusOrg),
     hasher: webCryptoHasher, verifier: webCryptoVerifier, random: webCryptoRandom, clock, store, keys,
     credentials: {
       'bang-tot-nghiep-v1': {
@@ -253,24 +324,26 @@ export async function createWorld(listener: Listener, o: WorldOptions = {}) {
   });
   mountIssuer(listener.routes, name, issuer);
   listener.routes.set('GET /trust-list', async () => ({ status: 200, headers: { 'Content-Type': 'application/jwt' }, body: await trustList.token() }));
-  listener.routes.set('GET /issuers/truong-mau/status/*', async (req) => {
-    const token = await statusService.token('truong-mau', Number(req.path.split('/').pop()));
+  listener.routes.set(`GET /issuers/${statusOrg}/status/*`, async (req) => {
+    const token = await statusService.token(statusOrg, Number(req.path.split('/').pop()));
     return token ? { status: 200, headers: { 'Content-Type': 'application/statuslist+jwt' }, body: token } : { status: 404, headers: {}, body: '' };
   });
 
   // The server's own view of the lists: always reloaded (maxAgeSeconds 0), as identra-server verifies.
-  const serverFetch: HttpFetch = listener.localOrigin === IN_PROCESS ? inProcessFetch(listener) : createMappedFetch(nodeHttpFetch, { [ORIGIN]: listener.localOrigin });
+  const origins = { [ORIGIN]: listener.localOrigin, [statusOrigin]: listener.localOrigin };
+  const serverFetch: HttpFetch = listener.localOrigin === IN_PROCESS ? inProcessFetch(listener) : createMappedFetch(nodeHttpFetch, origins);
   const serverValidator = createCertificateChainValidator({ trustedRoots: [rootDer()], verifier: webCryptoVerifier, hasher: webCryptoHasher });
   const serverRegistry = createSignedTrustListRegistry({ url: TRUST_URL, fetch: serverFetch, verifier: webCryptoVerifier, chainValidator: serverValidator, clock, maxAgeSeconds: 0 });
 
   /** The verifier nha-tuyen-dung-mau with the `request` certificate, mounted at the section 6 paths. */
-  async function newVerifier(v: { signer?: Signer; chainValidator?: CertificateChainValidator; trustRegistry?: TrustRegistry; mount?: boolean } = {}) {
+  async function newVerifier(v: { signer?: Signer; chainValidator?: CertificateChainValidator; trustRegistry?: TrustRegistry; mount?: boolean; dpki?: boolean } = {}) {
     const chainValidator = v.chainValidator ?? serverValidator;
     const trustRegistry = v.trustRegistry ?? serverRegistry;
-    const statusChecker = createStatusListChecker({ fetch: serverFetch, verifier: webCryptoVerifier, chainValidator, trustRegistry, clock, maxAgeSeconds: 0 });
+    const dpki = v.dpki ? gateway.dpki(clock) : undefined;
+    const statusChecker = createStatusListChecker({ fetch: serverFetch, verifier: webCryptoVerifier, chainValidator, trustRegistry, clock, maxAgeSeconds: 0, ...(dpki ? { didResolver: dpki.resolver } : {}) });
     const verifier = await createPresentationVerifier({
       apiOrigin: ORIGIN, signer: v.signer ?? (await leafSigner('request')),
-      verification: { verifier: webCryptoVerifier, hasher: webCryptoHasher, chainValidator, trustRegistry, statusChecker, supportedVcts: [VCT.diploma] },
+      verification: { verifier: webCryptoVerifier, hasher: webCryptoHasher, chainValidator, trustRegistry, statusChecker, supportedVcts: [VCT.diploma], ...(dpki ? { dpki } : {}) },
       random: webCryptoRandom, clock, store: createMemoryStateStore(clock), scenarios: { 'ung-tuyen': UNG_TUYEN },
     });
     if (v.mount !== false) mountVerifier(listener.routes, verifier);
@@ -279,7 +352,7 @@ export async function createWorld(listener: Listener, o: WorldOptions = {}) {
 
   function newWallet(
     backend: 'noble' | 'webcrypto' = 'noble',
-    fetch: HttpFetch = createMappedFetch(nodeHttpFetch, { [ORIGIN]: listener.localOrigin }),
+    fetch: HttpFetch = createMappedFetch(nodeHttpFetch, origins),
     walletClock: { now(): Date } = clock,
     extra: Partial<WalletConfig> = {},
   ) {
@@ -310,9 +383,12 @@ export async function createWorld(listener: Listener, o: WorldOptions = {}) {
     return accepted.credentialId;
   }
 
+  /** A wallet (noble) with the DID path on, over the world's fake gateway. */
+  const newDidWallet = (extra: Partial<WalletConfig> = {}) => newWallet('noble', undefined, clock, { dpki: gateway.dpki(clock), ...extra });
+
   return {
-    clock, issuer, keys, store, statusService, statusStorage, issued, trust, verifierEntry, serverFetch, serverRegistry,
-    newWallet, newVerifier, issueTo, offer: () => issuer.createOffer({ subjectRef: 'sv001', configurationId: 'bang-tot-nghiep-v1' }),
+    clock, issuer, keys, store, statusService, statusStorage, issued, trust, verifierEntry, serverFetch, serverRegistry, gateway, didSigner, statusOrg,
+    newWallet, newDidWallet, newVerifier, issueTo, offer: () => issuer.createOffer({ subjectRef: 'sv001', configurationId: 'bang-tot-nghiep-v1' }),
   };
 }
 export type World = Awaited<ReturnType<typeof createWorld>>;

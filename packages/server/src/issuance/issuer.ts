@@ -4,7 +4,7 @@
 // dependency (state store, callbacks, signer) fails.
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import {
-  base64UrlDecode, base64UrlEncode, issueDiploma, jwkThumbprint, normalizeEcPublicJwk, utf8Encode, VCT,
+  base64UrlDecode, base64UrlEncode, isCertNetDid, issueDiploma, jwkThumbprint, normalizeEcPublicJwk, splitDidUrl, utf8Encode, VCT,
   type Clock, type DiplomaClaims, type EcPublicJwk, type Hasher, type RandomSource, type Signer, type Verifier,
 } from '@identra/sdk-core';
 import { ACCESS_TOKEN_SECONDS, signAccessToken, verifyAccessToken } from './access-token.js';
@@ -58,10 +58,17 @@ export interface CredentialHandlers {
 }
 
 export interface CredentialIssuerConfig {
-  /** `https://api-identra.awncorp.vn/issuers/<name>`: identifier, `iss`, and the base of every endpoint. */
+  /**
+   * `https://api-identra.awncorp.vn/issuers/<name>`: identifier, the base of every endpoint, and `iss`
+   * on the X.509 path.
+   */
   issuerUri: string;
   display: Display;
-  /** The issuer's `vc` signer: x5c [leaf, issuing CA], leaf SAN URI = issuerUri. */
+  /**
+   * The issuer's `vc` signer: x5c [leaf, issuing CA], leaf SAN URI = issuerUri; or a DID signer
+   * (ADR-0020: `kid` a did:certnet DID URL, no x5c), whose credentials have `iss` = that DID and whose
+   * metadata names it in `identra_issuer_did`.
+   */
   signer: Signer;
   /** Reserves a fresh status list entry (StatusListService.allocate); an index is never handed out twice. */
   allocateStatus(): Promise<{ uri: string; idx: number }>;
@@ -124,6 +131,9 @@ function drawPin(random: RandomSource): string {
 export function createCredentialIssuer(config: CredentialIssuerConfig): CredentialIssuer {
   const { issuerUri, signer, hasher, verifier, random, clock, store, keys } = config;
   if (typeof issuerUri !== 'string' || !/^https:\/\/[^/?#]+\/[^?#]*[^/?#]$/.test(issuerUri)) throw new TypeError('issuerUri must be an https URL with a path and no trailing slash');
+  // The DID trust path (ADR-0020 decision 7): `iss` is the DID of the signer's kid.
+  const issuerDid = typeof signer?.kid === 'string' && signer.kid.startsWith('did:') ? splitDidUrl(signer.kid)?.did ?? '' : null;
+  if (issuerDid !== null && (!isCertNetDid(issuerDid) || signer.x5c !== undefined)) throw new TypeError('a DID signer needs a kid <did:certnet DID>#<fragment> and no x5c');
   for (const id of Object.keys(config.credentials)) if (!Object.hasOwn(CREDENTIAL_CONFIGURATIONS, id)) throw new TypeError(`unknown credential configuration ${id}`);
   const configurations = Object.fromEntries(Object.keys(config.credentials).map((id) => [id, CREDENTIAL_CONFIGURATIONS[id]!]));
   const lib = createIssuerLibrary({
@@ -166,7 +176,7 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
   };
 
   return {
-    metadata: () => ok(lib.credentialIssuerMetadata),
+    metadata: () => ok(issuerDid === null ? lib.credentialIssuerMetadata : { ...lib.credentialIssuerMetadata, identra_issuer_did: issuerDid }),
     authorizationServerMetadata: () => ok(lib.authorizationServerMetadata),
     jwks: () => ok({ keys: [keys.accessToken.publicJwk] }),
 
@@ -311,7 +321,7 @@ export function createCredentialIssuer(config: CredentialIssuerConfig): Credenti
       if (claims === null) return oauthError(400, 'credential_request_denied', 'no credential is available for this offer');
       const status = await config.allocateStatus();
       const issuedAt = new Date(now.getTime());
-      const compact = await issueDiploma({ signer, hasher, random, clock: { now: () => issuedAt }, iss: issuerUri, cnfJwk: proof.jwk, status, claims });
+      const compact = await issueDiploma({ signer, hasher, random, clock: { now: () => issuedAt }, iss: issuerDid ?? issuerUri, cnfJwk: proof.jwk, status, claims });
       const response = await lib.credentialResponse(compact, encryption);
       const cnfThumbprint = await jwkThumbprint(proof.jwk, hasher);
       const { credentialId } = await config.credentials[token.configurationId]!.onIssued({

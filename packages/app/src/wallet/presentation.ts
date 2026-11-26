@@ -10,7 +10,7 @@ import {
 } from '@identra/sdk-core';
 import { encryptJwe, type JweEnc } from '../jwe.js';
 import type { WalletContext } from './context.js';
-import { issuerNameOf } from './credentials.js';
+import { issuerNameOf, trustPathOf } from './credentials.js';
 import { CredentialVaultError } from '../credential-vault.js';
 import { Fail, keyFailureCode, vaultFailureCode, WalletErrorCodes as C, type WalletErrorCode, type WalletFailure } from './errors.js';
 import { guardFetch, httpsOrigin, PROTOCOL_MAX_BYTES, PROTOCOL_TIMEOUT_MS, WalletFetchError } from './fetch.js';
@@ -27,7 +27,11 @@ export type VerifierIdentity = { trusted: true; ten: string; maToChuc: string } 
 export interface PresentationMatch {
   credentialId: string;
   vct: string;
+  /** From the trust list; null while it cannot be read, and always on the DID path. */
   issuerName: string | null;
+  /** As in CredentialSummary: `did` with the issuer's DID for a credential of the DID trust path (ADR-0020). */
+  trustPath: 'x509' | 'did';
+  issuerDid: string | null;
   /** The claim sets this credential can satisfy, in the verifier's order of preference. */
   claimSets: { index: number; claims: string[] }[];
 }
@@ -187,7 +191,7 @@ export function createPresentations(ctx: WalletContext) {
     } catch (e) {
       throw new Fail(vaultFailureCode(e));
     }
-    const held: { id: string; vct: string; compact: string; claims: Record<string, unknown> }[] = [];
+    const held: { id: string; vct: string; compact: string; claims: Record<string, unknown>; path: ReturnType<typeof trustPathOf> }[] = [];
     for (const row of rows) {
       let compact: string;
       try {
@@ -200,7 +204,7 @@ export function createPresentations(ctx: WalletContext) {
       }
       try {
         const d = decodeCredentialUnverified(compact);
-        held.push({ id: row.id, vct: d.payload['vct'] as string, compact, claims: Object.fromEntries(d.disclosures.map((x) => [x.name, x.value])) });
+        held.push({ id: row.id, vct: d.payload['vct'] as string, compact, claims: Object.fromEntries(d.disclosures.map((x) => [x.name, x.value])), path: trustPathOf(row) });
       } catch {
         // not a compact this wallet stored: skipped
       }
@@ -211,7 +215,7 @@ export function createPresentations(ctx: WalletContext) {
     for (let i = 0; i < held.length; i++) {
       if (satisfied[i]!.length === 0) continue;
       out.push({
-        credentialId: held[i]!.id, vct: held[i]!.vct, issuerName: await issuerNameOf(ctx, held[i]!.compact),
+        credentialId: held[i]!.id, vct: held[i]!.vct, issuerName: await issuerNameOf(ctx, held[i]!.compact), ...held[i]!.path,
         claimSets: satisfied[i]!.map((index) => ({ index, claims: [...claimSets[index]!] })),
       });
     }

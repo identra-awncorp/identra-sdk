@@ -4,7 +4,7 @@
 import { gcm } from '@noble/ciphers/aes.js';
 import { hmac } from '@noble/hashes/hmac.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { base64UrlDecode, base64UrlEncode, concatBytes, utf8Decode, utf8Encode } from '@identra/sdk-core';
+import { base64UrlDecode, base64UrlEncode, concatBytes, isCertNetDid, utf8Decode, utf8Encode } from '@identra/sdk-core';
 import type { Clock, RandomSource } from '@identra/sdk-core';
 import type { SecretStorage, WalletKeyStore } from './key-store.js';
 import { drawRandom } from './random.js';
@@ -16,11 +16,18 @@ import { drawRandom } from './random.js';
  */
 export type StoredCredentialStatus = 'valid' | 'revoked' | 'suspended' | 'unavailable' | 'invalid';
 
-/** One row of the `credentials` table, columns exactly as in ADR-0009 section 3. */
+/** One row of the `credentials` table, columns as in ADR-0009 section 3 plus `issuer_did` (ADR-0020). */
 export interface CredentialRow {
   id: string;
   vct: string;
+  /** The credential issuer URL (OpenID4VCI `credential_issuer`): `iss` on the X.509 path, where to ask again on both. */
   issuer: string;
+  /**
+   * The issuer's did:certnet DID for a credential of the DID trust path; absent or null on the
+   * X.509 path, so rows written before this column existed read as X.509. Bound to the ciphertext
+   * when set: a repository must store it.
+   */
+  issuer_did?: string | null;
   key_id: string;
   /** base64url(version 0x02 || 8-byte key-check value || 12-byte nonce || AES-256-GCM ciphertext || 16-byte tag) */
   ciphertext: string;
@@ -36,6 +43,7 @@ export const CREDENTIALS_TABLE_DDL = `CREATE TABLE IF NOT EXISTS credentials (
   id TEXT PRIMARY KEY NOT NULL,
   vct TEXT NOT NULL,
   issuer TEXT NOT NULL,
+  issuer_did TEXT,
   key_id TEXT NOT NULL,
   ciphertext TEXT NOT NULL,
   status_cache TEXT CHECK (status_cache IN ('valid', 'revoked', 'suspended', 'unavailable', 'invalid')),
@@ -110,7 +118,7 @@ export interface CredentialVault {
    * Encrypts and stores a compact credential; returns the new row id. Creates the data key only
    * when none is stored AND the repository holds no rows; otherwise a missing key is DATA_KEY_MISSING.
    */
-  save(input: { compact: string; vct: string; issuer: string; keyId: string }): Promise<string>;
+  save(input: { compact: string; vct: string; issuer: string; issuerDid?: string; keyId: string }): Promise<string>;
   /** Metadata of every row; never decrypts, never reads the data key. */
   list(): Promise<CredentialMetadata[]>;
   /** Metadata of one row, or null; never decrypts, never reads the data key. */
@@ -157,8 +165,10 @@ function keyCheckValue(dataKey: Uint8Array): Uint8Array {
  * Binds a ciphertext to its row and to its header: moving it to another row, editing these
  * columns, or changing the version or key-check value breaks it.
  */
-function associatedData(header: Uint8Array, row: Pick<CredentialRow, 'id' | 'vct' | 'issuer' | 'key_id'>): Uint8Array {
-  return utf8Encode(JSON.stringify(['identra.credential', base64UrlEncode(header), row.id, row.vct, row.issuer, row.key_id]));
+function associatedData(header: Uint8Array, row: Pick<CredentialRow, 'id' | 'vct' | 'issuer' | 'issuer_did' | 'key_id'>): Uint8Array {
+  // Without an issuer DID the data is exactly that of rows written before the column existed.
+  const did = typeof row.issuer_did === 'string' ? [row.issuer_did] : [];
+  return utf8Encode(JSON.stringify(['identra.credential', base64UrlEncode(header), row.id, row.vct, row.issuer, row.key_id, ...did]));
 }
 
 function equalConstantTime(a: Uint8Array, b: Uint8Array): boolean {
@@ -202,6 +212,7 @@ const metadataOf = (r: CredentialRow): CredentialMetadata => ({
   id: r.id,
   vct: r.vct,
   issuer: r.issuer,
+  ...(typeof r.issuer_did === 'string' ? { issuer_did: r.issuer_did } : {}),
   key_id: r.key_id,
   status_cache: r.status_cache,
   status_checked_at: r.status_checked_at,
@@ -278,11 +289,13 @@ export function createCredentialVault(options: { repository: CredentialRepositor
       const meta = {
         vct: requireString(input.vct, 'vct'),
         issuer: requireString(input.issuer, 'issuer'),
+        ...(input.issuerDid !== undefined ? { issuer_did: input.issuerDid } : {}),
         key_id: requireString(input.keyId, 'keyId'),
       };
+      if (input.issuerDid !== undefined && !isCertNetDid(input.issuerDid)) throw new TypeError('issuerDid must be a did:certnet DID');
       const key = await dataKeyForSave();
       const plaintext = utf8Encode(compact);
-      let row: Pick<CredentialRow, 'id' | 'vct' | 'issuer' | 'key_id' | 'ciphertext'>;
+      let row: Pick<CredentialRow, 'id' | 'vct' | 'issuer' | 'issuer_did' | 'key_id' | 'ciphertext'>;
       try {
         const id = base64UrlEncode(drawRandom(random, 16));
         const header = concatBytes(Uint8Array.of(VERSION), keyCheckValue(key));

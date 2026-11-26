@@ -53,6 +53,17 @@ fetch followed by itself. It never contacts an IP literal, `localhost` or a host
 set `allowedOrigins: ['https://api-identra.awncorp.vn']` in `createWallet` so that QR codes naming
 any other origin are refused before any request.
 
+DID trust path (ADR-0020, docs/architecture.md section 11): pass `dpki: { resolver, trustRegistry }`
+to `createWallet`, built by the app from the deployment's gateway URL and network with
+`createCertNetDidResolver({ gatewayUrl, network, fetch, clock })` and
+`createCertNetTrustRegistry({ gatewayUrl, network, fetch })` of `@identra/sdk-core` (the same
+`HttpFetch` rules apply; the gateway must allow CORS on its two read routes for the web wallet).
+Without it, offers of DID issuers are refused. A credential of that path is stored with
+`issuer_did`: add the nullable column to an existing table (`ALTER TABLE credentials ADD COLUMN
+issuer_did TEXT`) and store it in `insert`; rows without it read as X.509. Views carry `trustPath`
+and `issuerDid`; on the DID path `issuerName` is always null: show the shortened DID, never the
+issuer's web origin as a name.
+
 The data key must not require biometrics: ADR-0009 section 3 asks only that it be readable while
 the device is unlocked, and on Android a biometric re-enrolment permanently invalidates a key
 created with `requireAuthentication`, which would make every credential unreadable. The

@@ -27,7 +27,12 @@ export interface SessionResult {
   checks: Pick<Check, 'id' | 'ok' | 'code'>[];
   /** Only when ok: the claims of the satisfied claim set, all strings. */
   claims?: Record<string, string>;
+  /** Only when ok: how the issuer was recognised (ADR-0020); `issuer` on the X.509 path, `issuerDid` on the DID path. */
+  trustPath?: 'x509' | 'did';
+  /** Only when ok on the X.509 path: the trust-list entry. */
   issuer?: { maToChuc: string; ten: string };
+  /** Only when ok on the DID path: the issuer's did:certnet DID; this path has no display name. */
+  issuerDid?: string;
   verifiedAt: string;
 }
 
@@ -46,7 +51,10 @@ export interface PresentationVerifierConfig {
   apiOrigin: string;
   /** The `request` signer: x5c [leaf, issuing CA]. Its fingerprint is the client_id. */
   signer: Signer;
-  /** How presentations are verified (verifyPresentation); the server's own lists. */
+  /**
+   * How presentations are verified (verifyPresentation); the server's own lists. With `dpki` the DID
+   * trust path is on, and `statusChecker` must then have a `didResolver` (createStatusListChecker).
+   */
   verification: Omit<VerifyCredentialOptions, 'now'>;
   random: RandomSource;
   clock: Clock;
@@ -168,7 +176,9 @@ export async function createPresentationVerifier(config: PresentationVerifierCon
       return { ok: false, checks: [...checks(r.checks), { id: 'query', ok: false, code: 'QUERY_NOT_SATISFIED' }], verifiedAt };
     }
     const kept = Object.fromEntries(names.map((n) => [n, claims[n] as string]));
-    return { ok: true, checks: [...checks(r.checks), { id: 'query', ok: true, code: null }], claims: kept, issuer: { ...r.credential!.issuer! }, verifiedAt };
+    const c = r.credential!;
+    const issuer = c.trustPath === 'did' ? { trustPath: 'did' as const, issuerDid: c.issuerDid } : { trustPath: 'x509' as const, issuer: { ...c.issuer! } };
+    return { ok: true, checks: [...checks(r.checks), { id: 'query', ok: true, code: null }], claims: kept, ...issuer, verifiedAt };
   }
 
   /**

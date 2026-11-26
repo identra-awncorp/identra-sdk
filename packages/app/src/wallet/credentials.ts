@@ -1,8 +1,8 @@
 // The credentials the wallet holds: list (no decryption), display data, status refresh, removal.
 import { decodeCredentialUnverified, verifyStoredCredential, type Check, type StatusChecker } from '@identra/sdk-core';
 import type { CredentialMetadata, StoredCredentialStatus } from '../credential-vault.js';
-import type { WalletContext } from './context.js';
-import { onlyListsUnavailable } from './issuance.js';
+import { verifyOptionsOf, type WalletContext } from './context.js';
+import { didUnresolved, onlyListsUnavailable } from './issuance.js';
 import { vaultFailureCode, WalletErrorCodes as C, type WalletFailure } from './errors.js';
 
 /**
@@ -13,8 +13,11 @@ import { vaultFailureCode, WalletErrorCodes as C, type WalletFailure } from './e
 export type WalletCredentialStatus = 'valid' | 'revoked' | 'suspended' | 'unknown' | 'invalid';
 const toWallet = (s: StoredCredentialStatus | null): WalletCredentialStatus | null => (s === 'unavailable' ? 'unknown' : s);
 const summaryOf = (r: CredentialMetadata): CredentialSummary => ({
-  id: r.id, vct: r.vct, issuerUri: r.issuer, status: toWallet(r.status_cache), statusCheckedAt: r.status_checked_at, createdAt: r.created_at,
+  id: r.id, vct: r.vct, issuerUri: r.issuer, ...trustPathOf(r), status: toWallet(r.status_cache), statusCheckedAt: r.status_checked_at, createdAt: r.created_at,
 });
+/** A row without an issuer DID (every row written before the DID path existed) is X.509. */
+export const trustPathOf = (r: Pick<CredentialMetadata, 'issuer_did'>): { trustPath: 'x509' | 'did'; issuerDid: string | null } =>
+  typeof r.issuer_did === 'string' ? { trustPath: 'did', issuerDid: r.issuer_did } : { trustPath: 'x509', issuerDid: null };
 
 // Asked nothing: a display name needs the issuer_trust check, not the credential's status.
 const noStatusRequest: StatusChecker = { check: async () => 'unavailable' };
@@ -22,14 +25,14 @@ const noStatusRequest: StatusChecker = { check: async () => 'unavailable' };
 /**
  * The trust-list name of a stored credential's issuer, only from a passing issuer_trust check
  * (chain, signature, purpose `vc`, organisation and `vct` of the trust list entry); null otherwise,
- * e.g. while the trust list cannot be read. Never requests a status list.
+ * e.g. while the trust list cannot be read. Never requests a status list. Always null on the DID
+ * path, which has no names (ADR-0020): it is not enabled here, so no gateway request is made.
  */
 export async function issuerNameOf(ctx: WalletContext, compact: string): Promise<string | null> {
   try {
-    const r = await verifyStoredCredential(compact, {
-      verifier: ctx.verifier, hasher: ctx.hasher, chainValidator: ctx.chainValidator, trustRegistry: ctx.trustRegistry,
-      statusChecker: noStatusRequest, supportedVcts: ctx.supportedVcts, now: ctx.clock.now(),
-    });
+    const { dpki, ...options } = verifyOptionsOf(ctx, noStatusRequest);
+    void dpki;
+    const r = await verifyStoredCredential(compact, options);
     return r.checks.some((c) => c.id === 'issuer_trust' && c.ok) ? (r.credential?.issuer?.ten ?? null) : null;
   } catch {
     return null;
@@ -39,7 +42,12 @@ export async function issuerNameOf(ctx: WalletContext, compact: string): Promise
 export interface CredentialSummary {
   id: string;
   vct: string;
+  /** The credential issuer URL the credential came from (and can be asked for again). */
   issuerUri: string;
+  /** How the issuer is recognised: `x509` through its certificate and the trust list, `did` through CertNet (ADR-0020). */
+  trustPath: 'x509' | 'did';
+  /** The issuer's did:certnet DID on the DID path (shown instead of a name, which this path has not); else null. */
+  issuerDid: string | null;
   /** Cached by refreshStatus (and set to valid on receipt). */
   status: WalletCredentialStatus | null;
   statusCheckedAt: string | null;
@@ -47,7 +55,7 @@ export interface CredentialSummary {
 }
 
 export interface CredentialDetails extends CredentialSummary {
-  /** From the trust list; null while it cannot be read. */
+  /** From the trust list; null while it cannot be read, and always on the DID path. */
   issuerName: string | null;
   iat: number;
   /** The disclosed subject claims, as stored. Display only: decoded, not re-verified. */
@@ -98,14 +106,12 @@ export function createCredentials(ctx: WalletContext) {
       const opened = await open(id);
       if (!opened.ok) return opened;
       const before = await ctx.vault.getMeta(id).catch(() => null);
-      const r = await verifyStoredCredential(opened.compact, {
-        verifier: ctx.verifier, hasher: ctx.hasher, chainValidator: ctx.chainValidator, trustRegistry: ctx.trustRegistry,
-        statusChecker: ctx.statusChecker, supportedVcts: ctx.supportedVcts, now: ctx.clock.now(),
-      });
+      const r = await verifyStoredCredential(opened.compact, verifyOptionsOf(ctx));
       const statusCode = r.checks.find((c) => c.id === 'status')?.code;
+      // The gateway not answering (DID_RESOLUTION_UNAVAILABLE) is "not checked yet", like a list that could not be read.
       const status: StoredCredentialStatus = r.ok
         ? 'valid'
-        : statusCode === 'REVOKED' ? 'revoked' : statusCode === 'SUSPENDED' ? 'suspended' : onlyListsUnavailable(r) ? 'unavailable' : 'invalid';
+        : statusCode === 'REVOKED' ? 'revoked' : statusCode === 'SUSPENDED' ? 'suspended' : onlyListsUnavailable(r) || didUnresolved(r) ? 'unavailable' : 'invalid';
       const checkedAt = ctx.clock.now();
       try {
         await ctx.vault.setStatus(id, status, checkedAt);

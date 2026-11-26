@@ -463,6 +463,18 @@ empty.
   the chain must pass the core validator for the purpose's profile against the
   store's own roots at the current time (for `vc`, against the leaf's only SAN URI),
   and the key must match the leaf; keys are imported non-extractable.
+  `didSigner(organisation)` (DID trust path, section 11) reads `orgs/<name>/did.json`
+  (`{ "did": "did:certnet:<network>:<id>", "kid": "<did>#<fragment>" }`, other members
+  ignored; written by the registration script) and `orgs/<name>/did.key.pem`
+  (PKCS#8 P-256, the same file rules as every key file) into a signer with
+  `alg: 'ES256'`, `kid`, `publicJwk` derived from the private key and no `x5c`;
+  null when neither file exists (an X.509 issuer). Refused at load, naming the file
+  and the reason: one of the two files missing, JSON that does not parse, a `did`
+  that is not `did:certnet`, a `kid` that is not `<did>#<fragment>` of that `did`,
+  a key that is not EC P-256. An organisation issues on one path: DID files beside
+  a `vc`, `vc-product` or `status` key make both `didSigner` and `signer(…, 'vc' |
+  'status')` throw (`request` is not issuing and stays allowed). `didSigner` is
+  optional in `IssuerKeyStore`: a key store without it hosts X.509 issuers only.
 - `createStatusListService({ issuerUri, keyStore, storage, random, clock })`:
   `allocate(issuer)` draws random indexes of the issuer's current list (64 draws),
   claims one with `storage.reserve`, which must be atomic (Postgres: unique key
@@ -494,8 +506,11 @@ empty.
   this process keeps its own last `iat` so tokens still never repeat one. Before
   signing, the status certificate must be inside its validity: otherwise
   (`onError('signer_expired', issuer)`) the held token is served until its `exp`,
-  then `token` throws. `current(issuer, n)` gives `{ iat, exp, signerNotAfter }`
-  of the held token, or null (ADR-0014 §7).
+  then `token` throws. The lists of an organisation for which `keyStore.didSigner`
+  gives a signer are signed by that DID key (header `kid`, no `x5c`, ADR-0020 §6),
+  which has no validity period to check; every other rule is the same.
+  `current(issuer, n)` gives `{ iat, exp, signerNotAfter }` of the held token
+  (`signerNotAfter` null for a DID issuer), or null (ADR-0014 §7).
 - `createTrustListService({ source, keyStore, clock, signerNotBefore?, lastToken?, onError?, lastIatStore? })`
   validates the source with the core validator and re-signs when it changed or
   after an hour, with `iat = max(now, lastIat + 1)`; `lastIat` is in memory and,
@@ -574,7 +589,7 @@ base64url(SHA-256(value)).
 ```ts
 generateIssuerKeys(random): Promise<IssuerKeys>   // ES256 access-token key, ECDH P-256 request key, PIN HMAC key: in memory
 createCredentialIssuer({
-  issuerUri, display: { vi, en }, signer /* vc: x5c, SAN = issuerUri */, allocateStatus,
+  issuerUri, display: { vi, en }, signer /* vc: x5c, SAN = issuerUri; or a DID signer */, allocateStatus,
   hasher, verifier, random, clock, store, keys,
   credentials: { 'bang-tot-nghiep-v1': { resolveClaims(subjectRef), onIssued(event) } },
   lifetimes?: { offerSeconds, accessTokenSeconds, nonceSeconds },  // tests: shorter only, defaults are the bounds
@@ -593,6 +608,15 @@ createCredentialIssuer({
 | `token(request)` | `POST /issuers/:name/token` | `HttpResponse` |
 | `nonce()` | `POST /issuers/:name/nonce` | `HttpResponse` |
 | `credential(request)` | `POST /issuers/:name/credential` | `HttpResponse` |
+
+A DID issuer (section 11, ADR-0020 §7): `signer` is a DID signer (`kid` a
+`did:certnet` DID URL, no `x5c`; `keyStore.didSigner`; anything else with a `kid`
+starting `did:` is a `TypeError`). Its credentials have `iss` = the DID of `kid` and
+the header `kid`; the OpenID4VCI identifier (`credential_issuer`, the authorization
+server `issuer`, `aud` of proofs and tokens, every endpoint) stays `issuerUri`, and
+so does the status list URI `<issuerUri>/status/<n>`. The credential issuer metadata
+gains `identra_issuer_did: "<did>"`; an X.509 issuer does not send it. Nothing else
+of the protocol changes.
 
 `HttpRequest` is `{ headers /* lower-case names */, body /* raw text */ }`,
 `HttpResponse` is `{ status, headers, body /* text */ }`, sent unchanged. Bad input
@@ -650,7 +674,7 @@ request may be sent again, and the wallet then keeps its token and reports
   string); `iat` within [now − 360 s, now + 60 s]; non-empty `nonce`.
 - Order of effects after the token is taken: `resolveClaims` (null:
   `credential_request_denied`, nothing allocated) → `allocateStatus` →
-  `issueDiploma` (`iss` = issuerUri, `cnf.jwk` = the proof key) → the response
+  `issueDiploma` (`iss` = issuerUri, or the DID; `cnf.jwk` = the proof key) → the response
   is built (and encrypted) → `onIssued({ offerId, subjectRef, statusUri,
   statusIdx, cnfThumbprint, issuedAt })` → offer status `issued` (a failure here
   is ignored: the credential exists and is recorded) → response. Anything that
@@ -667,12 +691,15 @@ request may be sent again, and the wallet then keeps its token and reports
 ```ts
 createWallet({ keyStore, vault, fetch, random, clock, trustedRoots, trustListUrl,
                supportedVcts? /* [diploma] */, seen?, verifier? /* noble */, hasher? /* noble */,
-               allowedOrigins? /* exact origins of offers and presentation requests */ })
+               allowedOrigins? /* exact origins of offers and presentation requests */,
+               dpki? /* { resolver, trustRegistry }: the DID trust path, section 11 */ })
 wallet.offers.resolve(qrText) → { ok: true, offer: ResolvedOffer /* incl. issuerOrigin, readonly codeRedeemed */ } | WalletFailure
-wallet.offers.accept(offer, { txCode }) → { ok: true, credentialId, vct, issuerName: string | null, status: 'valid' | 'unknown' }
+wallet.offers.accept(offer, { txCode }) → { ok: true, credentialId, vct, issuerName: string | null, issuerDid? /* DID path only */, status: 'valid' | 'unknown' }
                                         | { ok: false, code, checks?, retryable: boolean, codeRedeemed: boolean }
 wallet.offers.discard(offer) → Promise<void>   // forget a held token / pending credential (deletes its key)
 wallet.credentials.list() → CredentialSummary[]            // metadata only, no decryption
+// CredentialSummary = { id, vct, issuerUri, trustPath: 'x509' | 'did', issuerDid: string | null, status, statusCheckedAt, createdAt }
+// CredentialDetails = CredentialSummary & { issuerName /* null on the DID path */, iat, claims }
 wallet.credentials.get(id) → { ok: true, credential: CredentialDetails } | WalletFailure
 wallet.credentials.refreshStatus(id) → { ok: true, status, checks } | WalletFailure
 wallet.credentials.remove(id) → { ok: true } | WalletFailure   // row and key
@@ -694,7 +721,18 @@ without a dot or ending in one; with `allowedOrigins`, offers and presentation
 requests on any other origin are refused before any request. Protocol requests of an offer may reach only the
 origin of its `credential_offer_uri`; list requests only the configured trust
 list URL and URLs ending in `/status/<n>` (which the credential policy has
-already reduced to `<iss>/status/<n>`).
+already reduced to `<iss>/status/<n>`, or on the DID path to
+`https://<host>/<path>/status/<n>`, bound at receipt to the credential issuer URL).
+The CertNet gateway is reached only through the `dpki` resolver and trust
+registry, with the fetch the app built them with; the wallet's own guarded
+fetches never admit it.
+
+The DID trust path (section 11) is on only with `dpki: { resolver, trustRegistry }`
+(`createCertNetDidResolver`, `createCertNetTrustRegistry`, built by the app from the
+deployment's gateway URL and network); the status checker then gets the resolver
+too. Without it the wallet behaves as before: an offer whose metadata names
+`identra_issuer_did` is `OFFER_INVALID` at `resolve` (before the PIN is spent), and
+any credential with a DID `kid` fails `did_resolution` (`CREDENTIAL_INVALID`).
 
 - `resolve`: the QR text must be exactly `openid-credential-offer://?credential_offer_uri=<https URL>`
   (`OFFER_INVALID`; non-https `URL_NOT_ALLOWED`); offer 404 → `OFFER_EXPIRED`;
@@ -702,7 +740,8 @@ already reduced to `<iss>/status/<n>`).
   servers on the offer's origin (`URL_NOT_ALLOWED`); OpenID4VCI 1.0 metadata,
   one configuration, pre-authorized grant, request and response encryption with
   ECDH-ES, `dc+sd-jwt`, a supported `vct`, `jwt` proofs with ES256, `jwk`
-  binding (`OFFER_INVALID`). No key is created and nothing is stored.
+  binding (`OFFER_INVALID`); `identra_issuer_did`, when present, a `did:certnet` DID
+  (`OFFER_INVALID`). No key is created and nothing is stored.
 - `accept`: token with the PIN (`invalid_grant`: the offer is fetched again; still
   there → `TX_CODE_WRONG`, retryable on the same resolved offer; gone →
   `OFFER_EXPIRED`) → `c_nonce` → a NEW key from the key store (one per
@@ -716,7 +755,12 @@ already reduced to `<iss>/status/<n>`).
   inside the list) — then the credential is kept with status `unknown` and
   `refreshStatus` settles it later; `issuerName` is then null when the trust list
   was the one missing (`CREDENTIAL_INVALID` with `checks` for anything else, an
-  untrusted issuer and a missing or malformed status reference included) → `iss` = the offer's issuer (`ISSUER_MISMATCH`) → `vct` = the
+  untrusted issuer and a missing or malformed status reference included) → the
+  issuer (`ISSUER_MISMATCH`): without `identra_issuer_did` in the metadata the
+  credential is on the X.509 path with `iss` = the offer's `credential_issuer`;
+  with it, on the DID path with `iss` = that DID and its status URI exactly
+  `<credential_issuer>/status/<n>` (the binding `<iss>/status/<n>` gives the X.509
+  path); any other combination is `ISSUER_MISMATCH` → `vct` = the
   configuration's → `cnf.jwk` thumbprint = the new key's (`CNF_MISMATCH`) → every
   claim of the type (`REQUIRED_CLAIMS`) is exactly one disclosure with a non-empty
   string value and absent from the plain payload, so it can be withheld
@@ -734,7 +778,14 @@ already reduced to `<iss>/status/<n>`).
   expired token means `OFFER_EXPIRED` without a request. A received, verified
   credential whose storing failed waits in memory with its key for the next
   `accept` (no second credential request); `discard` deletes that key when the
-  user gives up. Calls of `accept` on one offer run one after the other.
+  user gives up. A received credential whose issuer DID could not be resolved
+  (`did_resolution` `DID_RESOLUTION_UNAVAILABLE`: the gateway gave no usable
+  answer, so the signature was never checked) is NOT stored: the attempt is
+  `NETWORK_ERROR` with `checks`, `retryable: true`, and the credential waits in
+  memory with its key; the next `accept` verifies it again without a second
+  credential request, `discard` deletes the key. This holds only when its
+  unverified `iss` is the DID the metadata names; otherwise `ISSUER_MISMATCH` at
+  once. Calls of `accept` on one offer run one after the other.
   `retryable` says whether the same offer can still complete: the PIN was wrong
   and the offer exists, the PIN was missing, a usable token is held, a no-answer
   token request, or a credential waits to be stored; otherwise a new offer is
@@ -757,14 +808,29 @@ already reduced to `<iss>/status/<n>`).
   offer). The wallet cannot tell these apart before trying.
 - `get` (and the presentation matches) give `issuerName` only from a passing
   `issuer_trust` check of the stored credential (chain, signature, purpose `vc`,
-  the leaf's organisation, the entry's `vct`; no status list is requested), else null.
+  the leaf's organisation, the entry's `vct`; no status list is requested), else null;
+  always null on the DID path, which has no names (no gateway request is made for it).
+- Stored record: the row's `issuer` is the credential issuer URL on both paths
+  (what the backup catalogue keeps and a new phone asks again); the column
+  `issuer_did` (nullable) holds the DID of a DID-path credential and is bound to the
+  ciphertext when set (a repository must store it; editing or dropping it makes the
+  row `UNDECRYPTABLE`). A row without it, or with NULL (every row written before),
+  reads as X.509 and opens as before: the associated data of such a row is
+  unchanged. Views (`CredentialSummary`, `CredentialDetails`, `PresentationMatch`)
+  carry `trustPath` (`'did'` iff the row has an issuer DID) and `issuerDid`, so the
+  UI can say "checked through CertNet" or "checked through a certificate" and show
+  the shortened DID instead of a name; it must never fall back to the issuer's web
+  origin as a name. An existing table needs `ALTER TABLE credentials ADD COLUMN
+  issuer_did TEXT` (`CREDENTIALS_TABLE_DDL` has it).
 - `remove` deletes the key first, then the row (`vault.removeWithKey`): a row
   without its key is detectable, a key without its row is not; calling it again
   completes an interrupted removal.
 - `refreshStatus` re-runs `verifyStoredCredential` and returns `{ status,
   checks, checkedAt, lastValidAt }`: `valid`, `revoked`, `suspended`, `unknown`
   ONLY when the sole failures are `STATUS_UNAVAILABLE` / `TRUST_LIST_UNAVAILABLE`
-  and the status reference is well-formed (try again when online; ADR-0013
+  (on the DID path the CertNet trust registry counts as the trust list) and the
+  status reference is well-formed, or when `did_resolution` is
+  `DID_RESOLUTION_UNAVAILABLE` (try again when online; ADR-0013
   section 4), else `invalid` (issuer no longer
   trusted, certificate expired, …). Cached in the vault row; the column says
   `unavailable` for `unknown` and needs the `invalid` value in its CHECK
@@ -818,7 +884,8 @@ Adapters: `sdk-server/src/presentation/library.ts` (`@openid4vc/openid4vp`,
 createPresentationVerifier({
   apiOrigin,                    // https://api-identra.awncorp.vn
   signer,                       // the `request` signer, x5c [leaf, issuing CA]
-  verification: { verifier, hasher, chainValidator, trustRegistry, statusChecker, supportedVcts },
+  verification: { verifier, hasher, chainValidator, trustRegistry, statusChecker, supportedVcts,
+                  dpki? /* { resolver, trustRegistry }; statusChecker then with didResolver */ },
   random, clock, store,
   scenarios: { 'ung-tuyen': { vct, claimSets: [[...], [...]], purpose: { vi, en } } },
 }): Promise<PresentationVerifier>
@@ -882,9 +949,15 @@ createPresentationVerifier({
   back, so the session can still complete — then the session key and the request
   record are deleted (a failure of this cleanup is ignored: the result stands, the
   records expire by their TTL). The stored result is `{ ok, checks: [{ id, ok, code }],
-  claims?, issuer?, verifiedAt }`: claims and issuer only when ok, claims = the
-  string claims of the satisfied claim set only; any other disclosed claim is
-  dropped, not stored and not a failure. Answer `200 {}`.
+  claims?, trustPath?, issuer?, issuerDid?, verifiedAt }`: claims, `trustPath` and the
+  issuer only when ok — `trustPath: 'x509'` with `issuer: { maToChuc, ten }` from the
+  trust list, or `trustPath: 'did'` with `issuerDid` and no name (section 11) —;
+  claims = the string claims of the satisfied claim set only; any other disclosed
+  claim is dropped, not stored and not a failure. Answer `200 {}`. The verifier itself
+  stays identified by X.509 (`x509_hash:`). Without `dpki` a credential with a DID
+  `kid` fails `did_resolution` (`DID_RESOLUTION_FAILED`), a gating step, so the
+  response is refused and the session stays open; a gateway with no usable answer
+  (`DID_RESOLUTION_UNAVAILABLE`) is refused the same way, never accepted.
 - `session(id)`: `status` = `verified` / `failed` from the result, else `expired`
   after 5 minutes, else `request_retrieved` / `pending`; `result` absent until
   final; `verifier.name`; `expiresAt` with `serverTime`. Deleted 30 minutes after
@@ -901,7 +974,7 @@ first two deleted when the session is final), `attempts:<requestId>` (300 s),
 wallet.presentations.resolve(qrText) → { ok: true, request: ResolvedPresentation } | WalletFailure
 // ResolvedPresentation = { clientId, verifier: { trusted: true, ten, maToChuc } | { trusted: false },
 //   warning?: 'VERIFIER_NOT_TRUSTED', purpose?, expiresAt,
-//   matches: [{ credentialId, vct, issuerName, claimSets: [{ index, claims: string[] }] }] }
+//   matches: [{ credentialId, vct, issuerName, trustPath, issuerDid, claimSets: [{ index, claims: string[] }] }] }
 wallet.presentations.submit(request, { credentialId, claimSetIndex, allowUntrusted? }) → { ok: true } | WalletFailure
 wallet.presentations.decline(request) → { ok: true } | WalletFailure   // local only, no network call
 ```
@@ -1239,6 +1312,22 @@ Issuance: a signer carries either `x5c` (unchanged) or a `kid` that is a
 `kid`, the header has `kid` and no `x5c`, and the status `uri` must have the
 form above. `issueDiploma` takes either signer; `issueProductEvent` refuses a
 DID signer. A DID issuer signs its status lists with the same DID key.
+
+Above core (details in sections 7, 8 and 9):
+
+- `sdk-server`: `IssuerKeyStore.didSigner(org)` loads `orgs/<org>/did.json` +
+  `did.key.pem`; `createCredentialIssuer` with a DID signer issues `iss` = DID with
+  `kid`, keeps its https identifier and `<issuerUri>/status/<n>`, and publishes
+  `identra_issuer_did` in its metadata; the status list service signs a DID issuer's
+  lists with its DID key; the verifier takes `verification.dpki` and its session
+  result says `trustPath` with `issuer` (x509) or `issuerDid` (did).
+- `sdk-app`: `createWallet({ dpki })`; receipt binds a DID credential to the
+  metadata's `identra_issuer_did` and its status list to `<credential_issuer>/status/<n>`;
+  an unresolvable DID is never stored (retryable `NETWORK_ERROR`); records and views
+  carry `trustPath` and `issuerDid`.
+- `sdk-client`: parses both result shapes, knows `did_resolution` and
+  `DID_RESOLUTION_UNAVAILABLE` (`DID_PRESENTATION_CHECK_IDS`) and rejects a DID result
+  with a name, without a `did:certnet` `issuerDid`, or with the other path's step 3.
 
 Known limitations:
 

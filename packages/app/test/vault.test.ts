@@ -342,7 +342,8 @@ describe('createCredentialVault', () => {
 
   test('the DDL defines exactly the row columns', () => {
     const columns = [...CREDENTIALS_TABLE_DDL.matchAll(/^\s+([a-z_]+) [A-Z]+/gm)].map((m) => m[1]);
-    assert.deepEqual(columns, ['id', 'vct', 'issuer', 'key_id', 'ciphertext', 'status_cache', 'status_checked_at', 'created_at']);
+    // issuer_did: the DID trust path (ADR-0020), nullable so older rows read as X.509.
+    assert.deepEqual(columns, ['id', 'vct', 'issuer', 'issuer_did', 'key_id', 'ciphertext', 'status_cache', 'status_checked_at', 'created_at']);
   });
 });
 
