@@ -34,9 +34,17 @@ wallet used in Node end-to-end tests. Pure JavaScript on `@noble/curves`, `@nobl
   the verifier RECEIVED the presentation: record it in the sharing history. The request stays usable,
   pinned to that choice: offer "try again in a moment" and call `submit` again with the SAME
   `credentialId` and `claimSetIndex` (a fresh presentation of the same claims is signed and sent);
-  any other choice is `REQUEST_INVALID` and forgets the request without sending anything. After
-  `MAX_PRESENTATION_SENDS` (3) sends the verifier's 503 is `VERIFIER_ERROR` and the request is gone.
-  The same 503 for an X.509 credential, or in a wallet without `dpki`, is `VERIFIER_ERROR`.
+  any other choice is `REQUEST_INVALID` and forgets that object without sending anything. The pin
+  belongs to the request (the QR's `client_id` and `request_uri`), not to the object: for 600 s
+  from the delivery, every `resolve` of the same QR by this wallet instance (a remounted screen, the
+  "open request" button again, a `decline` then a re-scan) returns
+  `pinned: { credentialId, claimSetIndex, sends }` (else `pinned: null`): show the locked retry
+  screen with only that choice. At most `MAX_PRESENTATION_SENDS` (3) sends per request in all; after
+  that the verifier's 503 is `VERIFIER_ERROR` and `resolve` of that QR is `REQUEST_INVALID`. At most
+  `MAX_PRESENTATION_PINS` (32) pins are held at once. The memory is in the wallet instance only:
+  after a restart the same QR resolves unpinned; to keep the lock across restarts, use the sharing
+  history record (QR `request_uri`, verifier, credential, claim set, time). The same 503 for an
+  X.509 credential, or in a wallet without `dpki`, is `VERIFIER_ERROR`.
 
 ## What the app provides
 

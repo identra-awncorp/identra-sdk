@@ -285,7 +285,21 @@ test('isDidStatusListUri: no IPv4 address in any notation, no single-label host 
     assert.equal(isDidStatusListUri(`https://${host}/issuers/x/status/1`), false, host);
     assert.equal(isDidStatusListUri(`https://${host}:8443/issuers/x/status/1`), false, `${host}:8443`);
   }
-  for (const host of ['a.vn', 'status.truong-did.example.vn', '1.example', 'xn--bcher-kva.example', 'a-b.c1', '10.0.0.1.nip.io']) {
+  for (const host of ['a.vn', 'status.truong-did.example.vn', '1.example.com', 'xn--bcher-kva.com', 'a-b.c1', '10.0.0.1.nip.io']) {
+    assert.equal(isDidStatusListUri(`https://${host}/issuers/x/status/1`), true, host);
+  }
+});
+
+test('isDidStatusListUri: no host under a special-use or internal last label (RFC 6761, 6762, internal suffixes); any port', () => {
+  const refused = ['localhost', 'local', 'localdomain', 'internal', 'intranet', 'lan', 'home', 'corp', 'svc', 'arpa', 'test', 'example', 'invalid', 'onion'];
+  for (const tld of refused) {
+    for (const host of [`a.${tld}`, `a.b.${tld}`, `a.${tld}:8443`]) assert.equal(isDidStatusListUri(`https://${host}/issuers/x/status/1`), false, host);
+  }
+  for (const host of ['a.localhost', 'localhost.localdomain', 'metadata.google.internal', 'kubernetes.default.svc', 'host.docker.internal', 'home.arpa', 'gateway.certnet.test']) {
+    assert.equal(isDidStatusListUri(`https://${host}/issuers/x/status/1`), false, host);
+  }
+  // Only the LAST label counts, and ports are not restricted.
+  for (const host of ['api-identra.awncorp.vn', 'api-identra.awncorp.vn:8443', 'a.b:6379', 'localhost.example.com', 'internal.corp.awncorp.vn', 'status.truong.edu.vn', 'svc.io', 'a.testing', 'a.locals']) {
     assert.equal(isDidStatusListUri(`https://${host}/issuers/x/status/1`), true, host);
   }
 });

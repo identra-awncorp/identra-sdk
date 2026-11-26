@@ -1009,7 +1009,8 @@ first two deleted when the session is final), `attempts:<requestId>` (300 s),
 wallet.presentations.resolve(qrText) → { ok: true, request: ResolvedPresentation } | WalletFailure
 // ResolvedPresentation = { clientId, verifier: { trusted: true, ten, maToChuc } | { trusted: false },
 //   warning?: 'VERIFIER_NOT_TRUSTED', purpose?, expiresAt,
-//   matches: [{ credentialId, vct, issuerName, trustPath, issuerDid, claimSets: [{ index, claims: string[] }] }] }
+//   matches: [{ credentialId, vct, issuerName, trustPath, issuerDid, claimSets: [{ index, claims: string[] }] }],
+//   pinned: { credentialId, claimSetIndex, sends } | null }
 wallet.presentations.submit(request, { credentialId, claimSetIndex, allowUntrusted? })
   → { ok: true } | WalletFailure | { ok: false, code: 'DID_RESOLUTION_UNAVAILABLE', delivered: true }
 wallet.presentations.decline(request) → { ok: true } | WalletFailure   // local only, no network call
@@ -1067,13 +1068,36 @@ wallet.presentations.decline(request) → { ok: true } | WalletFailure   // loca
   `DID_RESOLUTION_UNAVAILABLE` (below): the verifier checked nothing and kept
   its session open, so the same request may be submitted again until it expires,
   pinned to what was sent: the retry signs a FRESH presentation (new KB-JWT `iat`,
-  same `nonce` and `aud`) of the SAME credential and the SAME claim set, nothing
-  more; a `submit` of that request with another credential or claim set is
-  `REQUEST_INVALID`, sends nothing and forgets the request. At most
-  `MAX_PRESENTATION_SENDS` (3) sends per request: the 503 answering the last one
-  is `VERIFIER_ERROR` and the request is forgotten. A `decline` (or another
-  `submit`) while the POST is in flight is `REQUEST_INVALID` and makes the
-  request not come back, whatever the verifier answers.
+  same `nonce` and `aud`) of the SAME credential and the SAME claims, nothing
+  more and nothing less; a `submit` with another credential or claim set is
+  `REQUEST_INVALID`, sends nothing (before any key prompt) and forgets that
+  resolved object. At most `MAX_PRESENTATION_SENDS` (3) sends per request: the
+  503 answering the last one is `VERIFIER_ERROR`. A `decline` (or another
+  `submit`) while the POST is in flight is `REQUEST_INVALID` and makes that
+  object not come back, whatever the verifier answers.
+- The pin belongs to the REQUEST, not to the resolved object. "The request" is
+  the QR as the user met it: its `client_id` (the verifier; the request
+  object's certificate must match it) and its `request_uri`, compared as the
+  strings the QR carries. The `nonce`, `state`, `response_uri` and claim sets
+  inside the request object are the verifier's to change on every fetch of that
+  URI and are not part of it. Once the verifier gave that 503 for a request, the
+  wallet instance remembers it in memory for 600 s from that first delivery
+  (`MAX_REQUEST_SECONDS`: no request object resolved before it can live longer,
+  since `exp` is at most 600 s after its fetch; not extended by later sends or
+  resolves). Meanwhile every `resolve` of the same QR comes back with
+  `pinned: { credentialId, claimSetIndex, sends }` (show the locked "try again"
+  screen; `sends` so far) and an `expiresAt` no later than the pin's end; it is
+  `REQUEST_INVALID` when the re-fetched request no longer offers that credential
+  with the same claims under that index, and, once the sends are used up,
+  `REQUEST_INVALID` without even fetching. Objects resolved before the delivery
+  (their `pinned` is `null`, a snapshot) obey the pin too: `submit` checks it
+  when called and again right before sending. The count is shared: at most 3
+  POSTs per request in all, however often it is resolved, and one at a time (a
+  second object's `submit` while one is in flight is `REQUEST_INVALID`).
+  `decline` forgets the object, not the pin. Another `request_uri` (a new QR,
+  even of the same verifier) is another request. At most
+  `MAX_PRESENTATION_PINS` (32) live pins per wallet; when that many are held,
+  such a 503 is `VERIFIER_ERROR` and the request is not kept.
 - `submit`: `allowUntrusted: true` required for an untrusted verifier
   (`VERIFIER_NOT_TRUSTED`); request not expired on the wallet clock
   (`REQUEST_EXPIRED`); `createPresentation` with exactly the chosen claim set's
@@ -1110,8 +1134,21 @@ Known limitations:
   the wallet (`REQUEST_INVALID`); the Identra scenarios use none.
 - `purpose` is the verifier's own text (sanitised, trusted verifiers only).
 - A verifier that answers `issuer_registry_unavailable` falsely for a DID-path
-  credential gets up to `MAX_PRESENTATION_SENDS` freshly signed presentations of
-  the claims the user chose once; it cannot get more claims or another credential.
+  credential gets, per QR, up to `MAX_PRESENTATION_SENDS` freshly signed
+  presentations of the claims the user chose once, however often the app
+  resolves that QR again within 600 s; within that window it cannot get more
+  claims, fewer claims or another credential through that QR. What remains:
+  (1) after the 600 s, or (2) after the wallet process restarts (the memory is
+  per wallet instance, in memory only; the mobile app's process is killed in
+  the background, the website's trial wallet lives in one page), the same QR
+  resolves afresh and the user may choose again and send up to 3 more;
+  (3) a new QR (another `request_uri`) is a new request; (4) with 32 other live
+  pins, the next such 503 is not kept (the user sees a verifier error and may
+  scan again). Each of these needs the user to open the request and confirm a
+  choice again. A host application that wants the pin to survive a restart can
+  record the delivery itself (it records it in the sharing history anyway:
+  verifier, `request_uri`, credential, claim set, time) and, for 600 s, show a
+  QR found there only with that same choice.
 - Presenting the same credential to two verifiers is linkable: both see the same
   issuer signature, status index and `cnf` key (ADR-0001 says so). Batch issuance
   (several credentials with distinct keys and indexes) is planned for later.
@@ -1350,11 +1387,16 @@ Status (step 8 of the DID path): still a Token Status List served by the issuer.
   `^https://([a-z0-9-]+\.)+[a-z][a-z0-9-]*(:[1-9][0-9]{0,4})?(/[A-Za-z0-9_~-]+(\.[A-Za-z0-9_~-]+)*)+/status/[1-9][0-9]{0,8}$`
   (`isDidStatusListUri`): lower-case host of at least two labels whose last
   label starts with a letter (so no IPv4 literal in any notation, such as
-  `2130706433`, `0x7f000001` or `169.254.169.254`, no `localhost`, no
-  single-label intranet name), optional port, at least one path
-  segment before `/status/<n>`, no query, fragment, userinfo, `%`, `\`,
-  whitespace, empty, `.` or `..` segment. Anything else is `STATUS_UNAVAILABLE`
-  without a request. The issuer enforces the same form.
+  `2130706433`, `0x7f000001` or `169.254.169.254`, and no single-label name
+  such as `localhost` or an intranet host) and is not a special-use or internal
+  name: `localhost`, `local`, `localdomain`, `internal`, `intranet`, `lan`,
+  `home`, `corp`, `svc`, `arpa`, `test`, `example`, `invalid`, `onion` (RFC 6761,
+  RFC 6762, RFC 7686, RFC 8375 and common internal suffixes; so no
+  `a.localhost`, `metadata.google.internal`, `kubernetes.default.svc`,
+  `host.docker.internal`); any port (development deployments use them), at
+  least one path segment before `/status/<n>`, no query, fragment, userinfo,
+  `%`, `\`, whitespace, empty, `.` or `..` segment. Anything else is
+  `STATUS_UNAVAILABLE` without a request. The issuer enforces the same form.
 - The checker is asked with `{ did: iss }`. The token's header has `kid`
   `<did>#<fragment>` and no `x5c` (a token with both `x5c` and a DID `kid` is
   `malformed`, on both paths); the DID of `kid` must be the credential issuer's

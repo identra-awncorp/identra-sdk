@@ -29,6 +29,15 @@ const SIOP_AUDIENCE = 'https://self-issued.me/v2';
  * answering 503 must not be able to collect fresh signatures at will.
  */
 export const MAX_PRESENTATION_SENDS = 3;
+/**
+ * How long a wallet remembers a request it delivered (the 503 above): MAX_REQUEST_SECONDS from the
+ * first delivery, the longest any request object resolved before that delivery can still be used
+ * (exp is at most 600 s after its fetch), so none of them outlives the pin; a request resolved while
+ * pinned expires with the pin at the latest.
+ */
+const PIN_MS = MAX_REQUEST_SECONDS * 1000;
+/** Requests a wallet remembers at once; when that many are live, a new 503 of that kind is not kept (VERIFIER_ERROR). */
+export const MAX_PRESENTATION_PINS = 32;
 
 export type VerifierIdentity = { trusted: true; ten: string; maToChuc: string } | { trusted: false };
 
@@ -53,9 +62,22 @@ export interface ResolvedPresentation {
   purpose?: string | { vi?: string; en?: string };
   matches: PresentationMatch[];
   expiresAt: string;
+  /**
+   * Non-null when this wallet already delivered a presentation for this request (same verifier
+   * `clientId`, same QR `request_uri`) and the verifier answered that it could not check it
+   * (DID_RESOLUTION_UNAVAILABLE): only `credentialId` with `claimSetIndex` (the same claims) can
+   * be sent; `sends` is how many times it was sent. Show the locked "try again" screen. As of the
+   * resolve: `submit` enforces the pin as it is at the time it is called.
+   */
+  pinned: { credentialId: string; claimSetIndex: number; sends: number } | null;
 }
 
+/** What the verifier received for a request: the only thing the wallet will send it again, at most MAX_PRESENTATION_SENDS times in all. */
+interface Pin { credentialId: string; claimSetIndex: number; claims: string[]; sends: number; until: number }
+
 interface RequestState {
+  /** The request as the user met it: the verifier (client_id, which the request object's certificate must match) and the QR's request_uri. */
+  key: string;
   origin: string;
   clientId: string;
   trusted: boolean;
@@ -68,8 +90,6 @@ interface RequestState {
   claimSets: string[][];
   expiresAt: number;
   offered: Map<string, number[]>;
-  /** Set once the verifier answered the 503 above: what was sent, the only choice a retry may send again. */
-  sent?: { credentialId: string; claimSetIndex: number; count: number };
 }
 const requests = new WeakMap<ResolvedPresentation, RequestState>();
 /** Requests whose response is being POSTed; submit or decline meanwhile removes the entry, so the request is not kept for a retry. */
@@ -128,7 +148,34 @@ function plainCredentialSets(q: Record<string, unknown>, id: string): boolean {
     Array.isArray(options[0]) && options[0].length === 1 && options[0][0] === id;
 }
 
+const sameClaims = (a: string[], b: string[]) => a.length === b.length && a.every((n) => b.includes(n));
+
 export function createPresentations(ctx: WalletContext) {
+  // Per wallet instance, in memory: nonce, state and response_uri are the verifier's to change on
+  // every fetch of the request URI, so they are not part of the key.
+  const pins = new Map<string, Pin>();
+  /** Keys whose response is being POSTed, from any resolved object: one send at a time per request. */
+  const inFlight = new Set<string>();
+  const livePin = (key: string): Pin | undefined => {
+    const pin = pins.get(key);
+    if (pin && ctx.clock.now().getTime() >= pin.until) pins.delete(key);
+    return pins.get(key);
+  };
+  /** The pin of the request refuses this choice: used up, another credential, or other claims (more or fewer) than were sent. */
+  const pinRefuses = (s: RequestState, choice: { credentialId: string; claimSetIndex: number }): boolean => {
+    const pin = livePin(s.key);
+    return pin !== undefined && (pin.sends >= MAX_PRESENTATION_SENDS || pin.credentialId !== choice.credentialId || !sameClaims(s.claimSets[choice.claimSetIndex]!, pin.claims));
+  };
+  /** A new pin for what was just delivered; null when MAX_PRESENTATION_PINS live pins are held. */
+  const newPin = (s: RequestState, choice: { credentialId: string; claimSetIndex: number }): Pin | null => {
+    const now = ctx.clock.now().getTime();
+    for (const [k, p] of pins) if (now >= p.until) pins.delete(k);
+    if (pins.size >= MAX_PRESENTATION_PINS) return null;
+    const pin = { credentialId: choice.credentialId, claimSetIndex: choice.claimSetIndex, claims: [...s.claimSets[choice.claimSetIndex]!], sends: 1, until: now + PIN_MS };
+    pins.set(s.key, pin);
+    return pin;
+  };
+
   const depsFor = (origin: string) => ({
     fetch: guardFetch(ctx.fetch, { allow: (_u: string, o: string) => o === origin, maxBytes: PROTOCOL_MAX_BYTES, timeoutMs: PROTOCOL_TIMEOUT_MS }),
     hasher: ctx.hasher,
@@ -246,6 +293,9 @@ export function createPresentations(ctx: WalletContext) {
     try {
       const qr = parseQr(qrText);
       if (ctx.allowedOrigins && !ctx.allowedOrigins.includes(qr.origin)) throw new Fail(C.URL_NOT_ALLOWED);
+      const key = `${qr.clientId} ${qr.requestUri}`;
+      // Sent as often as allowed: not even fetched again.
+      if ((livePin(key)?.sends ?? 0) >= MAX_PRESENTATION_SENDS) throw new Fail(C.REQUEST_INVALID);
       const deps = depsFor(qr.origin);
       let checked: Awaited<ReturnType<typeof checkJar>> | undefined;
       let refused: unknown;
@@ -281,6 +331,17 @@ export function createPresentations(ctx: WalletContext) {
       const trusted = entry !== null && entry.mucDich === 'request' && entry.maToChuc === checked.organisation;
       const s = checked.state;
       const matches = await match(s.query, s.queryId, s.claimSets);
+      const state: RequestState = {
+        key, origin: qr.origin, clientId: qr.clientId, trusted, nonce: s.nonce, state: s.state, responseUri: s.responseUri,
+        encryptionJwk: s.encryptionJwk, enc: s.enc, queryId: s.queryId, claimSets: s.claimSets, expiresAt: s.expiresAt,
+        offered: new Map(matches.map((m) => [m.credentialId, m.claimSets.map((c) => c.index)])),
+      };
+      // Delivered before: answerable only with what was sent, and not after the pin is forgotten.
+      const pin = livePin(key);
+      if (pin) {
+        if (!state.offered.get(pin.credentialId)?.includes(pin.claimSetIndex) || pinRefuses(state, pin)) throw new Fail(C.REQUEST_INVALID);
+        state.expiresAt = Math.min(state.expiresAt, pin.until);
+      }
       const resolved: ResolvedPresentation = {
         clientId: qr.clientId,
         verifier: trusted ? { trusted: true, ten: entry!.ten, maToChuc: entry!.maToChuc } : { trusted: false },
@@ -288,13 +349,10 @@ export function createPresentations(ctx: WalletContext) {
         // Free text from an unverified party under a warning would be an impersonation tool.
         ...(trusted && s.purpose !== undefined ? { purpose: s.purpose } : {}),
         matches,
-        expiresAt: new Date(s.expiresAt).toISOString(),
+        expiresAt: new Date(state.expiresAt).toISOString(),
+        pinned: pin ? { credentialId: pin.credentialId, claimSetIndex: pin.claimSetIndex, sends: pin.sends } : null,
       };
-      requests.set(resolved, {
-        origin: qr.origin, clientId: qr.clientId, trusted, nonce: s.nonce, state: s.state, responseUri: s.responseUri,
-        encryptionJwk: s.encryptionJwk, enc: s.enc, queryId: s.queryId, claimSets: s.claimSets, expiresAt: s.expiresAt,
-        offered: new Map(matches.map((m) => [m.credentialId, m.claimSets.map((c) => c.index)])),
-      });
+      requests.set(resolved, state);
       return { ok: true, request: resolved };
     } catch (e) {
       return e instanceof Fail ? fail(e.code) : fail(failureOf(e).code);
@@ -307,9 +365,10 @@ export function createPresentations(ctx: WalletContext) {
    * (biometric prompt cancelled, untrusted verifier refused, storage) leaves it usable, and so does
    * DID_RESOLUTION_UNAVAILABLE with `delivered: true`: the verifier received the presentation but
    * could not check a DID-path credential now and kept the session open. The request is then pinned
-   * to what was sent: a retry re-signs a fresh presentation of the same credential and claim set;
-   * any other choice is REQUEST_INVALID, forgets the request and sends nothing. At most
-   * MAX_PRESENTATION_SENDS sends per request.
+   * to what was sent, in this wallet instance, for every object `resolve` returns for it (same
+   * client_id and request_uri) for PIN_MS: a retry re-signs a fresh presentation of the same
+   * credential and claims; any other choice is REQUEST_INVALID, forgets that object and sends
+   * nothing. At most MAX_PRESENTATION_SENDS sends per request in all, one at a time.
    */
   async function submit(
     resolved: ResolvedPresentation,
@@ -321,7 +380,7 @@ export function createPresentations(ctx: WalletContext) {
       return fail(C.REQUEST_INVALID);
     }
     if (!s.offered.get(choice.credentialId)?.includes(choice.claimSetIndex)) throw new TypeError('credentialId and claimSetIndex must be one of the offered matches');
-    if (s.sent && (s.sent.credentialId !== choice.credentialId || s.sent.claimSetIndex !== choice.claimSetIndex)) {
+    if (pinRefuses(s, choice)) {
       requests.delete(resolved);
       return fail(C.REQUEST_INVALID);
     }
@@ -353,8 +412,12 @@ export function createPresentations(ctx: WalletContext) {
     const header = s.encryptionJwk.kid !== undefined ? { kid: s.encryptionJwk.kid } : {};
     const jwe = encryptJwe({ recipientPublicJwk: s.encryptionJwk, enc: s.enc, plaintext: utf8Encode(JSON.stringify(payload)), random: ctx.random, header });
     if (!requests.delete(resolved)) return fail(C.REQUEST_INVALID); // a concurrent submit got here first
+    // Another object of the same request is being sent, or was delivered while this one was signed.
+    if (inFlight.has(s.key) || pinRefuses(s, choice)) return fail(C.REQUEST_INVALID);
+    const pin = livePin(s.key);
+    if (pin) pin.sends++; // counted whatever the answer: the verifier may have it
+    inFlight.add(s.key);
     sending.set(resolved, s);
-    const sends = (s.sent?.count ?? 0) + 1;
     try {
       const r = await depsFor(s.origin).fetch(s.responseUri, {
         method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `response=${encodeURIComponent(jwe)}`, maxBytes: 16_384,
@@ -363,12 +426,14 @@ export function createPresentations(ctx: WalletContext) {
       // The verifier could not look the issuer up now (sdk-server ISSUER_REGISTRY_UNAVAILABLE): it
       // checked nothing and kept the session open. Only a DID-path credential in a wallet with the
       // DID path can be "not checked because of CertNet"; for anything else this answer is the
-      // verifier's error like any other 503. Kept only when nothing touched the request meanwhile.
-      if (r.status === 503 && oauthErrorOf(await r.text()) === 'issuer_registry_unavailable' && ctx.dpki && trustPathOf(row).trustPath === 'did' &&
-        sends < MAX_PRESENTATION_SENDS && sending.get(resolved) === s) {
-        s.sent = { credentialId: choice.credentialId, claimSetIndex: choice.claimSetIndex, count: sends };
-        requests.set(resolved, s);
-        return { ok: false, code: C.DID_RESOLUTION_UNAVAILABLE, delivered: true };
+      // verifier's error like any other 503. The request is pinned to what it received (even when
+      // the object is not kept), and kept only when nothing touched it meanwhile.
+      if (r.status === 503 && oauthErrorOf(await r.text()) === 'issuer_registry_unavailable' && ctx.dpki && trustPathOf(row).trustPath === 'did') {
+        const held = pin ?? newPin(s, choice);
+        if (held && held.sends < MAX_PRESENTATION_SENDS && sending.get(resolved) === s) {
+          requests.set(resolved, s);
+          return { ok: false, code: C.DID_RESOLUTION_UNAVAILABLE, delivered: true };
+        }
       }
       return fail(C.VERIFIER_ERROR);
     } catch (e) {
@@ -376,6 +441,7 @@ export function createPresentations(ctx: WalletContext) {
       return fail(code as WalletErrorCode);
     } finally {
       sending.delete(resolved);
+      inFlight.delete(s.key);
     }
   }
 

@@ -5,10 +5,13 @@
 // is a FAKE (helpers/world.ts fakeGateway); keys are generated at run time.
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
-import { decodeCredentialUnverified, VCT } from '@identra/sdk-core';
-import { buildCatalogue, MAX_DID_LENGTH, MAX_PRESENTATION_SENDS } from '@identra/sdk-app';
+import { base64Decode, base64UrlDecode, base64UrlEncode, decodeCredentialUnverified, signJws, utf8Decode, utf8Encode, VCT, type Signer } from '@identra/sdk-core';
+import { webCryptoHasher, webCryptoRandom } from '@identra/sdk-core/webcrypto';
+import {
+  buildCatalogue, createInMemorySecretStorage, createSoftwareKeyStore, MAX_DID_LENGTH, MAX_PRESENTATION_PINS, MAX_PRESENTATION_SENDS, type ResolvedPresentation, type WalletKeyStore,
+} from '@identra/sdk-app';
 import { matchesDeclaredIssuer, onlyListsUnavailable } from '../dist/wallet/issuance.js';
-import { createWorld, DID, DID_ISS, fakeGateway, ISS, newSession, startListener, type Handler, type Listener, type World } from './helpers/world.js';
+import { createWorld, DID, DID_ISS, fakeGateway, ISS, leafSigner, newSession, ORIGIN, startListener, type Handler, type Listener, type World } from './helpers/world.js';
 
 let listener: Listener;
 before(async () => (listener = await startListener(47646)));
@@ -496,5 +499,300 @@ describe('stored records', () => {
     w.rows.set(id, row);
     assert.equal(typeof (await w.vault.open(id)), 'string');
     await assert.rejects(w.vault.save({ compact: 'a.b.c~', vct: VCT.diploma, issuer: DID_ISS, issuerDid: 'did:web:x', keyId: 'k' }), TypeError);
+  });
+});
+
+type Verifier = Awaited<ReturnType<World['newVerifier']>>;
+const INVALID = { ok: false, code: 'REQUEST_INVALID' };
+const VERIFIER_ERROR = { ok: false, code: 'VERIFIER_ERROR' };
+
+/**
+ * A verifier's fixed QR whose request URI serves, on every fetch, the request object of a NEW session
+ * (new nonce, state and response_uri) signed with the real request certificate; `edit` rewrites the
+ * credential query, `signer` signs it as another verifier (client_id of its certificate). What a
+ * hostile verifier controls behind a QR it cannot change.
+ */
+const clientIdOf = async (signer: Signer) => `x509_hash:${base64UrlEncode(await webCryptoHasher.sha256(base64Decode(signer.x5c![0]!)))}`;
+async function fixedQr(verifier: Verifier) {
+  const clientId = new URLSearchParams((await newSession(verifier)).qr.split('?')[1]).get('client_id')!;
+  const served = { fetches: 0, seen: new Set<string>(), edit: null as ((cq: Record<string, unknown[]>) => void) | null, signer: null as Signer | null };
+  listener.routes.set('GET /oid4vp/request/fixed', async () => {
+    served.fetches++;
+    const r = (await verifier.requestObject((await newSession(verifier)).requestId))!;
+    const p = JSON.parse(utf8Decode(base64UrlDecode(r.body.split('.')[1]!))) as Record<string, unknown> & { dcql_query: { credentials: Record<string, unknown[]>[] } };
+    served.seen.add(JSON.stringify([p['nonce'], p['state'], p['response_uri']]));
+    if (!served.edit && !served.signer) return r;
+    served.edit?.(p.dcql_query.credentials[0]!);
+    if (served.signer) p['client_id'] = await clientIdOf(served.signer);
+    return { ...r, body: await signJws({ typ: 'oauth-authz-req+jwt' }, utf8Encode(JSON.stringify(p)), served.signer ?? (await leafSigner('request'))) };
+  });
+  const qr = `openid4vp://?client_id=${encodeURIComponent(clientId)}&request_uri=${encodeURIComponent(`${ORIGIN}/oid4vp/request/fixed`)}`;
+  return { qr, served, clientId };
+}
+
+/** A software key store whose signer() reads (where the platform prompts) are counted and can be held. */
+function promptingKeyStore() {
+  const inner = createSoftwareKeyStore({ secrets: createInMemorySecretStorage(), random: webCryptoRandom });
+  const prompts = { count: 0, hold: null as Promise<void> | null };
+  const keyStore: WalletKeyStore = {
+    create: () => inner.create(),
+    delete: (id) => inner.delete(id),
+    async signer(id) {
+      prompts.count++;
+      await prompts.hold;
+      return inner.signer(id);
+    },
+  };
+  return { keyStore, prompts };
+}
+
+async function resolveQr(w: TestWallet, qr: string): Promise<ResolvedPresentation> {
+  const r = await w.wallet.presentations.resolve(qr);
+  assert.ok(r.ok, JSON.stringify(r));
+  return r.request;
+}
+
+describe('a delivered request stays pinned in the wallet, whatever object resolve returns for it (same client_id, same request_uri)', () => {
+  test('the re-review scenario: 5 resolves x 3 sends of one QR, every POST answered with the 503: MAX_PRESENTATION_SENDS POSTs, all of the first selection', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const credentialId = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const posts = answerRegistryDown();
+    const { qr } = await fixedQr(verifier);
+    const results: string[] = [];
+    for (let round = 0; round < 5; round++) {
+      const r = await w.wallet.presentations.resolve(qr);
+      for (let i = 0; i < 3; i++) {
+        results.push(r.ok ? (await w.wallet.presentations.submit(r.request, { credentialId, claimSetIndex: round % 2 }) as { code?: string }).code ?? 'ok' : `resolve ${r.code}`);
+      }
+    }
+    assert.deepEqual(results.slice(0, 4), ['DID_RESOLUTION_UNAVAILABLE', 'DID_RESOLUTION_UNAVAILABLE', 'VERIFIER_ERROR', 'resolve REQUEST_INVALID']);
+    assert.ok(results.slice(3).every((r) => r === 'resolve REQUEST_INVALID'), results.join());
+    assert.equal(posts.length, MAX_PRESENTATION_SENDS);
+    assert.equal(new Set(posts.map((b) => b.length)).size, 1, 'the same claims each time');
+  });
+
+  test('one send per resolve, alternating claim sets: only the first selection is sent, more or fewer claims are refused', async () => {
+    const lengths: number[] = [];
+    for (const first of [1, 0]) {
+      const world = await createWorld(listener, { did: {} });
+      const w = world.newDidWallet();
+      const credentialId = await world.issueTo(w);
+      const verifier = await world.newVerifier({ dpki: true });
+      const posts = answerRegistryDown();
+      const { qr } = await fixedQr(verifier);
+      const results: unknown[] = [];
+      for (let round = 0; round < 6; round++) {
+        const r = await w.wallet.presentations.resolve(qr);
+        results.push(r.ok ? await w.wallet.presentations.submit(r.request, { credentialId, claimSetIndex: (first + round) % 2 }) : r);
+      }
+      assert.deepEqual(results, [UNAVAILABLE, INVALID, UNAVAILABLE, INVALID, VERIFIER_ERROR, INVALID], `first ${first}`);
+      assert.equal(posts.length, MAX_PRESENTATION_SENDS);
+      assert.equal(new Set(posts.map((b) => b.length)).size, 1);
+      lengths.push(posts[0]!.length);
+    }
+    assert.notEqual(lengths[0], lengths[1], 'the two claim sets are told apart by the POST size');
+  });
+
+  test('re-resolved: pinned, with the count carried over; another claim set or credential is refused before any prompt and sends nothing; used up: REQUEST_INVALID without a fetch', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const { keyStore, prompts } = promptingKeyStore();
+    const w = world.newDidWallet({ keyStore });
+    const first = await world.issueTo(w);
+    const second = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const posts = answerRegistryDown();
+    const { qr, served } = await fixedQr(verifier);
+    const sent = { credentialId: first, claimSetIndex: 1 };
+    const submit = (r: ResolvedPresentation, c: typeof sent) => w.wallet.presentations.submit(r, c);
+
+    const r1 = await resolveQr(w, qr);
+    assert.equal(r1.pinned, null);
+    assert.deepEqual(await submit(r1, sent), UNAVAILABLE);
+    const r2 = await resolveQr(w, qr);
+    assert.deepEqual(r2.pinned, { ...sent, sends: 1 });
+    assert.ok(Date.parse(r2.expiresAt) > world.clock.now().getTime());
+    for (const other of [{ credentialId: first, claimSetIndex: 0 }, { credentialId: second, claimSetIndex: 1 }]) {
+      const r = await resolveQr(w, qr);
+      assert.deepEqual(r.pinned, { ...sent, sends: 1 });
+      const before = prompts.count;
+      assert.deepEqual(await submit(r, other), INVALID, JSON.stringify(other));
+      assert.equal(prompts.count, before, 'refused before the prompt');
+      assert.deepEqual(await submit(r, sent), INVALID, 'that object is forgotten');
+    }
+    assert.equal(posts.length, 1);
+    assert.deepEqual(await submit(r2, sent), UNAVAILABLE, 'the second send, from an object resolved while pinned');
+    const r3 = await resolveQr(w, qr);
+    const stale = await resolveQr(w, qr);
+    assert.deepEqual([r3.pinned, stale.pinned], [{ ...sent, sends: 2 }, { ...sent, sends: 2 }]);
+    assert.deepEqual(await submit(r3, sent), VERIFIER_ERROR, 'the third send: the last 503 is the verifier error');
+    assert.deepEqual(await submit(stale, sent), INVALID, 'resolved before the bound was reached: nothing more');
+    assert.deepEqual(await submit(r1, sent), INVALID, 'the first object too');
+    assert.equal(posts.length, MAX_PRESENTATION_SENDS);
+    const fetches = served.fetches;
+    assert.deepEqual(await w.wallet.presentations.resolve(qr), INVALID);
+    assert.equal(served.fetches, fetches, 'used up: not fetched again');
+    assert.equal(served.seen.size, served.fetches, 'nonce, state and response_uri changed on every fetch');
+  });
+
+  test('objects resolved before the delivery obey it, also one being signed when it happens; decline lifts nothing; two objects never send at once', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const { keyStore, prompts } = promptingKeyStore();
+    const w = world.newDidWallet({ keyStore });
+    const credentialId = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const posts = answerRegistryDown();
+    const { qr } = await fixedQr(verifier);
+    const narrow = { credentialId, claimSetIndex: 1 };
+    const broad = { credentialId, claimSetIndex: 0 };
+    const [a, b, c] = [await resolveQr(w, qr), await resolveQr(w, qr), await resolveQr(w, qr)];
+
+    // c is at its prompt while a is delivered.
+    let release!: () => void;
+    prompts.hold = new Promise((r) => (release = r));
+    const before = prompts.count;
+    const signing = w.wallet.presentations.submit(c, broad);
+    while (prompts.count === before) await new Promise((r) => setImmediate(r));
+    prompts.hold = null;
+    assert.deepEqual(await w.wallet.presentations.submit(a, narrow), UNAVAILABLE);
+    release();
+    assert.deepEqual(await signing, INVALID);
+    assert.deepEqual(await w.wallet.presentations.submit(b, broad), INVALID, 'resolved before the delivery');
+    assert.equal(posts.length, 1);
+
+    assert.deepEqual(w.wallet.presentations.decline(a), { ok: true });
+    const d = await resolveQr(w, qr);
+    assert.deepEqual(d.pinned, { ...narrow, sends: 1 }, 'declining and scanning again unlocks nothing');
+    assert.deepEqual(await w.wallet.presentations.submit(d, broad), INVALID);
+
+    // Two objects submitted at once: one POST; the other is refused.
+    const [e, f] = [await resolveQr(w, qr), await resolveQr(w, qr)];
+    listener.routes.set('POST /oid4vp/response/*', async (req) => {
+      posts.push(req.body);
+      await new Promise((r) => setTimeout(r, 100));
+      return REGISTRY_DOWN;
+    });
+    const both = await Promise.all([w.wallet.presentations.submit(e, narrow), w.wallet.presentations.submit(f, narrow)]);
+    assert.deepEqual(both.map((r) => (r as { code: string }).code).sort(), ['DID_RESOLUTION_UNAVAILABLE', 'REQUEST_INVALID']);
+    assert.equal(posts.length, 2);
+    assert.deepEqual((await resolveQr(w, qr)).pinned, { ...narrow, sends: 2 });
+  });
+
+  test('the verifier changes what the pinned claim set asks for, or the credential is gone: REQUEST_INVALID, nothing sent', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const credentialId = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const posts = answerRegistryDown();
+    const { qr, served } = await fixedQr(verifier);
+    const sent = { credentialId, claimSetIndex: 1 };
+    // Index 1 asks for three claims instead of two.
+    const widen = (cq: Record<string, unknown[]>) => (cq['claim_sets'] = [cq['claim_sets']![0], (cq['claim_sets']![0] as unknown[]).slice(0, 3)]);
+    served.edit = widen;
+    const early = await resolveQr(w, qr);
+    assert.deepEqual(early.matches[0]!.claimSets[1]!.claims.length, 3);
+    served.edit = null;
+    assert.deepEqual(await w.wallet.presentations.submit(await resolveQr(w, qr), sent), UNAVAILABLE);
+    assert.deepEqual(await w.wallet.presentations.submit(early, sent), INVALID, 'resolved before the delivery, other claims under the same index');
+    served.edit = widen;
+    assert.deepEqual(await w.wallet.presentations.resolve(qr), INVALID);
+    // Index 1 asks for two claims again, but the two that were not sent.
+    served.edit = (cq) => {
+      const [all, sentIds] = cq['claim_sets'] as unknown[][];
+      cq['claim_sets'] = [all, all!.filter((id) => !sentIds!.includes(id))];
+    };
+    assert.equal((await w.wallet.presentations.resolve(qr) as { code?: string }).code, 'REQUEST_INVALID');
+    served.edit = null;
+    assert.deepEqual((await resolveQr(w, qr)).pinned, { ...sent, sends: 1 });
+    assert.deepEqual(await w.wallet.credentials.remove(credentialId), { ok: true });
+    assert.deepEqual(await w.wallet.presentations.resolve(qr), INVALID, 'the pinned credential is no longer offered');
+    assert.equal(posts.length, 1);
+  });
+
+  test('scope: another request URI of the same verifier, another wallet instance and another client_id are not pinned by it', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const credentialId = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const posts = answerRegistryDown();
+    const { qr, clientId, served } = await fixedQr(verifier);
+    assert.deepEqual(await w.wallet.presentations.submit(await resolveQr(w, qr), { credentialId, claimSetIndex: 1 }), UNAVAILABLE);
+    const fresh = await resolvedRequest(w, verifier);
+    assert.equal(fresh.pinned, null, 'a new QR of the same verifier');
+    assert.deepEqual(await w.wallet.presentations.submit(fresh, { credentialId, claimSetIndex: 0 }), UNAVAILABLE);
+    // The memory is per wallet instance (documented): a wallet restarted on the same storage starts afresh.
+    const restarted = world.newDidWallet({ keyStore: w.keyStore, vault: w.vault });
+    assert.equal((await resolveQr(restarted, qr)).pinned, null);
+    // The same request URI under another client_id: refuted by the request object's certificate...
+    const other = (id: string) => qr.replace(encodeURIComponent(clientId), encodeURIComponent(id));
+    assert.deepEqual(await w.wallet.presentations.resolve(other(`x509_hash:${'A'.repeat(43)}`)), { ok: false, code: 'CLIENT_ID_MISMATCH' });
+    // ...or another verifier identity (here an untrusted one) serving that URI: another request, shown under its own name.
+    served.signer = await leafSigner('vc');
+    const elsewhere = await resolveQr(w, other(await clientIdOf(served.signer)));
+    assert.deepEqual([elsewhere.verifier, elsewhere.pinned], [{ trusted: false }, null]);
+    assert.deepEqual(await w.wallet.presentations.submit(elsewhere, { credentialId, claimSetIndex: 0, allowUntrusted: true }), UNAVAILABLE);
+    assert.equal(posts.length, 3);
+    served.signer = null;
+    assert.deepEqual((await resolveQr(w, qr)).pinned, { credentialId, claimSetIndex: 1, sends: 1 }, 'the first one is still pinned');
+  });
+
+  test('declined while the POST is in flight: that object is gone, the request is still pinned to what the verifier received', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const credentialId = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const { qr } = await fixedQr(verifier);
+    const narrow = { credentialId, claimSetIndex: 1 };
+    const request = await resolveQr(w, qr);
+    let posts = 0;
+    listener.routes.set('POST /oid4vp/response/*', async () => (posts++, w.wallet.presentations.decline(request), REGISTRY_DOWN));
+    assert.deepEqual(await w.wallet.presentations.submit(request, narrow), VERIFIER_ERROR);
+    assert.deepEqual(await w.wallet.presentations.submit(request, narrow), INVALID);
+    const again = await resolveQr(w, qr);
+    assert.deepEqual(again.pinned, { ...narrow, sends: 1 });
+    assert.deepEqual(await w.wallet.presentations.submit(again, { credentialId, claimSetIndex: 0 }), INVALID);
+    assert.equal(posts, 1);
+  });
+
+  test(`a pin lives ${600} s from the delivery (MAX_REQUEST_SECONDS); a request resolved while pinned expires with it; afterwards the QR resolves afresh`, async () => {
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const credentialId = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const posts = answerRegistryDown();
+    const { qr } = await fixedQr(verifier);
+    const narrow = { credentialId, claimSetIndex: 1 };
+    assert.deepEqual(await w.wallet.presentations.submit(await resolveQr(w, qr), narrow), UNAVAILABLE);
+    const delivered = world.clock.now().getTime();
+    world.clock.advance(590);
+    const late = await resolveQr(w, qr);
+    assert.deepEqual(late.pinned, { ...narrow, sends: 1 });
+    assert.equal(late.expiresAt, new Date(delivered + 600_000).toISOString(), 'its own exp would be 300 s later');
+    world.clock.advance(9);
+    assert.deepEqual((await resolveQr(w, qr)).pinned, { ...narrow, sends: 1 });
+    world.clock.advance(1);
+    assert.deepEqual(await w.wallet.presentations.submit(late, narrow), { ok: false, code: 'REQUEST_EXPIRED' });
+    const after = await resolveQr(w, qr);
+    assert.equal(after.pinned, null);
+    assert.deepEqual(await w.wallet.presentations.submit(after, { credentialId, claimSetIndex: 0 }), UNAVAILABLE);
+    assert.equal(posts.length, 2);
+  });
+
+  test(`at most MAX_PRESENTATION_PINS (${MAX_PRESENTATION_PINS}) live pins: the next such 503 is VERIFIER_ERROR and not kept; expired pins make room`, async () => {
+    assert.equal(MAX_PRESENTATION_PINS, 32);
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const credentialId = await world.issueTo(w);
+    const verifier = await world.newVerifier({ dpki: true });
+    const posts = answerRegistryDown();
+    const choice = { credentialId, claimSetIndex: 1 };
+    for (let i = 0; i < MAX_PRESENTATION_PINS; i++) assert.deepEqual(await w.wallet.presentations.submit(await resolvedRequest(w, verifier), choice), UNAVAILABLE, `pin ${i}`);
+    const over = await resolvedRequest(w, verifier);
+    assert.deepEqual(await w.wallet.presentations.submit(over, choice), VERIFIER_ERROR);
+    assert.deepEqual(await w.wallet.presentations.submit(over, choice), INVALID);
+    assert.equal(posts.length, MAX_PRESENTATION_PINS + 1);
+    world.clock.advance(600);
+    assert.deepEqual(await w.wallet.presentations.submit(await resolvedRequest(w, verifier), choice), UNAVAILABLE);
   });
 });

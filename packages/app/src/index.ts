@@ -43,5 +43,5 @@ export { createWallet, type Wallet, type WalletConfig } from './wallet/wallet.js
 export { WalletErrorCodes, type WalletErrorCode, type WalletFailure } from './wallet/errors.js';
 export { MAX_DID_LENGTH, REQUIRED_CLAIMS, type AcceptFailure, type AcceptResult, type DisplayEntry, type ResolvedOffer } from './wallet/issuance.js';
 export type { CredentialDetails, CredentialSummary, WalletCredentialStatus } from './wallet/credentials.js';
-export { MAX_PRESENTATION_SENDS, type PresentationMatch, type ResolvedPresentation, type VerifierIdentity } from './wallet/presentation.js';
+export { MAX_PRESENTATION_PINS, MAX_PRESENTATION_SENDS, type PresentationMatch, type ResolvedPresentation, type VerifierIdentity } from './wallet/presentation.js';
 export { DEFAULT_MAX_BYTES, PROTOCOL_MAX_BYTES, PROTOCOL_TIMEOUT_MS } from './wallet/fetch.js';

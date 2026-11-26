@@ -83,22 +83,30 @@ export function isStatusListUri(uri: unknown, iss: string): boolean {
 }
 
 // Host: at least two lower-case labels of letters, digits and hyphens joined by dots, the last one
-// starting with a letter, so that no URL parser reads it as an IPv4 address in any notation
-// (2130706433, 0x7f000001, 169.254.169.254, 0) and no single-label name (localhost, an intranet
-// host) passes; a port of 1-5 digits without a leading 0; one or more path segments of unreserved
-// characters, a dot only inside a segment (so no empty, "." or ".." segment); then /status/<n>.
-// No ambiguous repetition (no ReDoS).
+// (captured) starting with a letter, so that no URL parser reads it as an IPv4 address in any
+// notation (2130706433, 0x7f000001, 169.254.169.254, 0) and no single-label name (localhost, an
+// intranet host) passes; a port of 1-5 digits without a leading 0 (any port: development
+// deployments use them); one or more path segments of unreserved characters, a dot only inside a
+// segment (so no empty, "." or ".." segment); then /status/<n>. No ambiguous repetition (no ReDoS).
 const DID_STATUS_LIST_URI =
-  /^https:\/\/([a-z0-9-]+\.)+[a-z][a-z0-9-]*(:[1-9][0-9]{0,4})?(\/[A-Za-z0-9_~-]+(\.[A-Za-z0-9_~-]+)*)+\/status\/[1-9][0-9]{0,8}$/;
+  /^https:\/\/(?:[a-z0-9-]+\.)+([a-z][a-z0-9-]*)(?::[1-9][0-9]{0,4})?(?:\/[A-Za-z0-9_~-]+(?:\.[A-Za-z0-9_~-]+)*)+\/status\/[1-9][0-9]{0,8}$/;
+/**
+ * Last labels that name no public host: the special-use names of RFC 6761 (localhost, test,
+ * example, invalid), local of RFC 6762, home.arpa of RFC 8375 (by arpa), onion of RFC 7686, and the
+ * common internal suffixes (localdomain, internal, intranet, lan, home, corp, Kubernetes' svc).
+ */
+const INTERNAL_TLDS = new Set(['localhost', 'local', 'localdomain', 'internal', 'intranet', 'lan', 'home', 'corp', 'svc', 'arpa', 'test', 'example', 'invalid', 'onion']);
 /**
  * The status list URI of a DID issuer, which cannot be `<iss>/status/<n>` (ADR-0020 section 6):
  * `https://<host>[:port]/<path>/status/<n>`, n in 1..999999999, matched as a string against a strict
  * pattern, so query, fragment, userinfo, "..", "%", "\\", whitespace, upper-case hosts, IPv4
- * literals and single-label hosts cannot pass. A name that resolves to a private address can: the
- * HttpFetch given to the status checker must refuse those.
+ * literals, single-label hosts and hosts under a special-use or internal last label (INTERNAL_TLDS:
+ * a.localhost, metadata.google.internal, kubernetes.default.svc) cannot pass. A public name that
+ * resolves to a private address can: the HttpFetch given to the status checker must refuse those.
  */
 export function isDidStatusListUri(uri: unknown): boolean {
-  return typeof uri === 'string' && DID_STATUS_LIST_URI.test(uri);
+  const m = typeof uri === 'string' ? DID_STATUS_LIST_URI.exec(uri) : null;
+  return m !== null && !INTERNAL_TLDS.has(m[1]!);
 }
 
 const ISO_INSTANT = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{1,3})?Z$/;

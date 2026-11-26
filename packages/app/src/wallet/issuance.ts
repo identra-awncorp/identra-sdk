@@ -470,7 +470,15 @@ export function createIssuance(ctx: WalletContext) {
       // A credential that verified except for a list that could not be read is kept as `unknown`.
       const listsDown = !result.ok && onlyListsUnavailable(result);
       if (!credential || (!result.ok && !listsDown)) throw new Fail(C.CREDENTIAL_INVALID, result.checks);
-      // The receipt rule again, on what verification established: this is the check that counts.
+      // The receipt rule again, on what verification established. Defence in depth: with today's core
+      // it cannot fail once the early check passed, so no test can tell it apart from that one. Both
+      // read the same parseSdJwt payload of the same compact (same iss, and status.status_list.uri is
+      // what statusRef returns, or verification failed above without a status). The only new input is
+      // trustPath, taken from the header: an x5c header with iss = the declared DID needs a status
+      // URI <iss>/status/<n> = did:...; the early check demanded <issuer URL>/status/<n>, so its
+      // status check and onlyListsUnavailable both fail above; a DID kid with iss = the issuer URL is
+      // refused in step 3 (iss must be the kid's DID). It stays so that a change in core cannot make
+      // the wallet store a credential of a path the issuer did not declare.
       if (!matchesDeclaredIssuer({ trustPath: credential.trustPath, iss: credential.iss, statusUri: credential.status?.uri }, state)) throw new Fail(C.ISSUER_MISMATCH);
       if (credential.vct !== state.vct) throw new Fail(C.ISSUER_ERROR);
       if (!credential.cnfJwk || (await jwkThumbprint(credential.cnfJwk, ctx.hasher)) !== (await jwkThumbprint(publicJwk, ctx.hasher))) throw new Fail(C.CNF_MISMATCH);
