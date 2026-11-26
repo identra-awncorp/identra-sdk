@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { decodeCredentialUnverified, VCT } from '@identra/sdk-core';
 import { buildCatalogue } from '@identra/sdk-app';
-import { createWorld, DID, DID_ISS, ISS, newSession, startListener, type Handler, type Listener, type World } from './helpers/world.js';
+import { createWorld, DID, DID_ISS, fakeGateway, ISS, newSession, startListener, type Handler, type Listener, type World } from './helpers/world.js';
 
 let listener: Listener;
 before(async () => (listener = await startListener(47646)));
@@ -111,21 +111,34 @@ describe('receiving from a DID issuer', () => {
     }
   });
 
-  test('a malformed identra_issuer_did makes the offer invalid before anything is spent', async () => {
+  test('a malformed identra_issuer_did makes the offer invalid before anything is spent, with or without dpki', async () => {
     for (const bad of ['did:web:truong.example.vn', 'did:certnet:local:', 'did:certnet:other:abc', `${DID}#key-1`, 42, null, '']) {
       const world = await createWorld(listener, { did: {} });
       patchMetadata('truong-did', (m) => (m['identra_issuer_did'] = bad));
-      const w = world.newDidWallet();
-      const created = await world.offer();
-      assert.deepEqual(await w.wallet.offers.resolve(created.offerUri), { ok: false, code: 'OFFER_INVALID' }, String(bad));
+      for (const w of [world.newDidWallet(), world.newWallet()]) {
+        const created = await world.offer();
+        assert.deepEqual(await w.wallet.offers.resolve(created.offerUri), { ok: false, code: 'OFFER_INVALID' }, String(bad));
+      }
       assert.equal(listener.requests.some((r) => r.includes('/token')), false);
     }
   });
 
-  test('without dpki: an offer of a DID issuer is refused at resolve, and a DID credential is never accepted', async () => {
+  test('resolve says which path the issuer declared: its unverified DID without a gateway request, null for an X.509 issuer', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const { offer } = await resolved(world, world.newDidWallet());
+    assert.equal(offer.issuerDid, DID);
+    assert.deepEqual(world.gateway.state.calls, []);
+    const x509 = await createWorld(listener);
+    assert.equal((await resolved(x509, x509.newWallet())).offer.issuerDid, null);
+    assert.equal((await resolved(x509, x509.newDidWallet())).offer.issuerDid, null);
+  });
+
+  test('without dpki: an offer of a DID issuer is TRUST_PATH_UNSUPPORTED at resolve, before any PIN or key; a DID credential is never accepted', async () => {
     const world = await createWorld(listener, { did: {} });
     const plain = world.newWallet();
-    assert.deepEqual(await plain.wallet.offers.resolve((await world.offer()).offerUri), { ok: false, code: 'OFFER_INVALID' });
+    assert.deepEqual(await plain.wallet.offers.resolve((await world.offer()).offerUri), { ok: false, code: 'TRUST_PATH_UNSUPPORTED' });
+    assert.equal(listener.requests.some((r) => r.includes('/token')), false);
+    assert.equal(plain.secrets.size, 0);
     patchMetadata('truong-did', (m) => delete m['identra_issuer_did']);
     const { offer, txCode } = await resolved(world, plain);
     const r = await plain.wallet.offers.accept(offer, { txCode });
@@ -198,6 +211,21 @@ describe('not checked yet versus refused', () => {
     const rejected = await w.wallet.credentials.refreshStatus(accepted.credentialId);
     assert.deepEqual([rejected.ok && rejected.status, rejected.ok && codeAt(rejected.checks, 'issuer_trust')], ['invalid', 'ISSUER_NOT_TRUSTED']);
     assert.equal((await w.wallet.credentials.list())[0]!.status, 'invalid');
+  });
+
+  test('a stored DID credential re-checked in a wallet without dpki is unknown (nothing checked); with dpki a definitive DID failure stays invalid', async () => {
+    const world = await createWorld(listener, { did: {} });
+    const w = world.newDidWallet();
+    const id = await world.issueTo(w);
+    // The same key store and vault, the DID path switched off.
+    const off = world.newWallet('noble', undefined, world.clock, { keyStore: w.keyStore, vault: w.vault });
+    const unchecked = await off.wallet.credentials.refreshStatus(id);
+    assert.deepEqual([unchecked.ok && unchecked.status, unchecked.ok && codeAt(unchecked.checks, 'did_resolution')], ['unknown', 'DID_RESOLUTION_FAILED']);
+    assert.equal(w.rows.get(id)!.status_cache, 'unavailable');
+    // A gateway that does not know the DID (404): definitive, so invalid.
+    const unknownDid = world.newWallet('noble', undefined, world.clock, { keyStore: w.keyStore, vault: w.vault, dpki: fakeGateway().dpki(world.clock) });
+    const failed = await unknownDid.wallet.credentials.refreshStatus(id);
+    assert.deepEqual([failed.ok && failed.status, failed.ok && codeAt(failed.checks, 'did_resolution')], ['invalid', 'DID_RESOLUTION_FAILED']);
   });
 
   test('issuer rejected by the trust registry at receipt: refused as invalid', async () => {

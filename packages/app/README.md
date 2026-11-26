@@ -58,7 +58,10 @@ to `createWallet`, built by the app from the deployment's gateway URL and networ
 `createCertNetDidResolver({ gatewayUrl, network, fetch, clock })` and
 `createCertNetTrustRegistry({ gatewayUrl, network, fetch })` of `@identra/sdk-core` (the same
 `HttpFetch` rules apply; the gateway must allow CORS on its two read routes for the web wallet).
-Without it, offers of DID issuers are refused. A credential of that path is stored with
+Without it, offers of DID issuers are refused at `resolve` with `TRUST_PATH_UNSUPPORTED` (a
+malformed `identra_issuer_did` is `OFFER_INVALID`), and `refreshStatus` of a DID credential stored
+earlier is `unknown`. `ResolvedOffer.issuerDid` is the DID the issuer's metadata declares, not yet
+verified, or null for an X.509 issuer: show it instead of the self-declared display name. A credential of that path is stored with
 `issuer_did`: add the nullable column to an existing table (`ALTER TABLE credentials ADD COLUMN
 issuer_did TEXT`) and store it in `insert`; rows without it read as X.509. Views carry `trustPath`
 and `issuerDid`; on the DID path `issuerName` is always null: show the shortened DID, never the

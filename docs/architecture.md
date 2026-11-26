@@ -192,7 +192,7 @@ presentation request), `SKIPPED`,
 and the wallet operation codes of section 8 (`OFFER_INVALID`, `URL_NOT_ALLOWED`,
 `TX_CODE_WRONG`, `TX_CODE_REQUIRED`, `OFFER_EXPIRED`, `NETWORK_ERROR`, `ISSUER_ERROR`,
 `CREDENTIAL_INVALID`, `CNF_MISMATCH`, `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`,
-`CREDENTIAL_NOT_FOUND`) and of section 9 (`QUERY_NOT_SATISFIED`, `TOO_MANY_ATTEMPTS`,
+`CREDENTIAL_NOT_FOUND`, `TRUST_PATH_UNSUPPORTED`) and of section 9 (`QUERY_NOT_SATISFIED`, `TOO_MANY_ATTEMPTS`,
 `REQUEST_INVALID`, `REQUEST_EXPIRED`, `VERIFIER_ERROR`, `KEY_INVALIDATED`,
 `USER_CANCELLED`, `DEVICE_LOCKED`; the check id `query`).
 
@@ -693,7 +693,7 @@ createWallet({ keyStore, vault, fetch, random, clock, trustedRoots, trustListUrl
                supportedVcts? /* [diploma] */, seen?, verifier? /* noble */, hasher? /* noble */,
                allowedOrigins? /* exact origins of offers and presentation requests */,
                dpki? /* { resolver, trustRegistry }: the DID trust path, section 11 */ })
-wallet.offers.resolve(qrText) → { ok: true, offer: ResolvedOffer /* incl. issuerOrigin, readonly codeRedeemed */ } | WalletFailure
+wallet.offers.resolve(qrText) → { ok: true, offer: ResolvedOffer /* incl. issuerOrigin, issuerDid: string | null, readonly codeRedeemed */ } | WalletFailure
 wallet.offers.accept(offer, { txCode }) → { ok: true, credentialId, vct, issuerName: string | null, issuerDid? /* DID path only */, status: 'valid' | 'unknown' }
                                         | { ok: false, code, checks?, retryable: boolean, codeRedeemed: boolean }
 wallet.offers.discard(offer) → Promise<void>   // forget a held token / pending credential (deletes its key)
@@ -730,9 +730,13 @@ fetches never admit it.
 The DID trust path (section 11) is on only with `dpki: { resolver, trustRegistry }`
 (`createCertNetDidResolver`, `createCertNetTrustRegistry`, built by the app from the
 deployment's gateway URL and network); the status checker then gets the resolver
-too. Without it the wallet behaves as before: an offer whose metadata names
-`identra_issuer_did` is `OFFER_INVALID` at `resolve` (before the PIN is spent), and
-any credential with a DID `kid` fails `did_resolution` (`CREDENTIAL_INVALID`).
+too. Without it: an offer whose metadata names a well-formed `identra_issuer_did`
+is `TRUST_PATH_UNSUPPORTED` at `resolve` (before the PIN is spent and before any
+key is created; a malformed one stays `OFFER_INVALID`), so a UI can tell "this
+wallet cannot receive from this kind of issuer" from a bad QR code; any
+credential with a DID `kid` fails `did_resolution` (`CREDENTIAL_INVALID`); and
+`refreshStatus` of a stored DID credential is `unknown`, not `invalid` (core's
+`DID_RESOLUTION_FAILED` "not configured": nothing was checked).
 
 - `resolve`: the QR text must be exactly `openid-credential-offer://?credential_offer_uri=<https URL>`
   (`OFFER_INVALID`; non-https `URL_NOT_ALLOWED`); offer 404 → `OFFER_EXPIRED`;
@@ -741,7 +745,11 @@ any credential with a DID `kid` fails `did_resolution` (`CREDENTIAL_INVALID`).
   one configuration, pre-authorized grant, request and response encryption with
   ECDH-ES, `dc+sd-jwt`, a supported `vct`, `jwt` proofs with ES256, `jwk`
   binding (`OFFER_INVALID`); `identra_issuer_did`, when present, a `did:certnet` DID
-  (`OFFER_INVALID`). No key is created and nothing is stored.
+  (`OFFER_INVALID`; well-formed but no `dpki`: `TRUST_PATH_UNSUPPORTED`). No key is
+  created and nothing is stored. `offer.issuerDid` is that declared DID, or null
+  for an X.509 issuer: NOT verified at this point (no gateway request; `accept`
+  binds the credential to it). A UI shows it instead of the self-declared
+  `issuerDisplay` name for a DID issuer.
 - `accept`: token with the PIN (`invalid_grant`: the offer is fetched again; still
   there → `TX_CODE_WRONG`, retryable on the same resolved offer; gone →
   `OFFER_EXPIRED`) → `c_nonce` → a NEW key from the key store (one per
@@ -831,7 +839,9 @@ any credential with a DID `kid` fails `did_resolution` (`CREDENTIAL_INVALID`).
   (on the DID path the CertNet trust registry counts as the trust list) and the
   status reference is well-formed, or when `did_resolution` is
   `DID_RESOLUTION_UNAVAILABLE` (try again when online; ADR-0013
-  section 4), else `invalid` (issuer no longer
+  section 4), or when the wallet has no `dpki` and `did_resolution` is
+  `DID_RESOLUTION_FAILED` (a DID credential stored before the path was switched
+  off: nothing was checked; with `dpki` that code stays `invalid`), else `invalid` (issuer no longer
   trusted, certificate expired, …). Cached in the vault row; the column says
   `unavailable` for `unknown` and needs the `invalid` value in its CHECK
   constraint (`CREDENTIALS_TABLE_DDL`; an existing table must be recreated).
@@ -844,8 +854,8 @@ any credential with a DID `kid` fails `did_resolution` (`CREDENTIAL_INVALID`).
 - Codes (`WalletErrorCodes`, entries of `ErrorCodes`): `OFFER_INVALID`,
   `URL_NOT_ALLOWED`, `TX_CODE_WRONG`, `TX_CODE_REQUIRED`, `OFFER_EXPIRED`, `NETWORK_ERROR`,
   `ISSUER_ERROR`, `CREDENTIAL_INVALID`, `ISSUER_MISMATCH`, `CNF_MISMATCH`,
-  `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`, `CREDENTIAL_NOT_FOUND`, plus the key and
-  presentation codes of section 9.
+  `CLAIMS_INCOMPLETE`, `STORAGE_ERROR`, `CREDENTIAL_NOT_FOUND`,
+  `TRUST_PATH_UNSUPPORTED`, plus the key and presentation codes of section 9.
 
 Known limitations:
 

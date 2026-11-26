@@ -59,6 +59,8 @@ export const ErrorCodes = Object.freeze({
   CLAIMS_INCOMPLETE: 'CLAIMS_INCOMPLETE',
   STORAGE_ERROR: 'STORAGE_ERROR',
   CREDENTIAL_NOT_FOUND: 'CREDENTIAL_NOT_FOUND',
+  /** The offer's issuer is on the DID trust path (ADR-0020) and this wallet has no `dpki`. */
+  TRUST_PATH_UNSUPPORTED: 'TRUST_PATH_UNSUPPORTED',
   // presentation (docs/architecture.md section 9); CLIENT_ID_MISMATCH, VERIFIER_NOT_TRUSTED, CERT_*,
   // SIGNATURE_INVALID, ALG_NOT_ALLOWED and TRUST_LIST_UNAVAILABLE above are reused
   QUERY_NOT_SATISFIED: 'QUERY_NOT_SATISFIED',

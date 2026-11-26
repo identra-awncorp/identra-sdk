@@ -30,6 +30,12 @@ export interface ResolvedOffer {
   issuerUri: string;
   /** The origin every request of this offer went to; the only fact about the issuer verified at this point. */
   issuerOrigin: string;
+  /**
+   * The DID the issuer's metadata declares (`identra_issuer_did`, ADR-0020): NOT verified yet (no
+   * gateway request is made at resolve); accept checks that the credential is signed by it. Null:
+   * an X.509 issuer. With a DID, show the DID rather than the self-declared `issuerDisplay` name.
+   */
+  issuerDid: string | null;
   issuerDisplay: DisplayEntry[];
   configuration: { id: string; vct: string; display: DisplayEntry[] };
   txCode: { length: number | null; inputMode: 'numeric' | 'text'; description: string | null } | null;
@@ -303,7 +309,7 @@ export function createIssuance(ctx: WalletContext) {
       const session = await library(() => resolveMetadata(offer, deps));
       const { configurationId, vct, display, issuerDid } = checkMetadata(session, origin, ctx.supportedVcts);
       // A DID issuer's credential could never be accepted without the DID path: refused before the PIN is spent.
-      if (issuerDid !== null && !ctx.dpki) throw new Fail(C.OFFER_INVALID);
+      if (issuerDid !== null && !ctx.dpki) throw new Fail(C.TRUST_PATH_UNSUPPORTED);
       const grant = (offer['grants'] as Record<string, Record<string, unknown>>)[PRE_AUTHORIZED_GRANT]!;
       const tx = grant['tx_code'];
       const state: OfferState = {
@@ -313,6 +319,7 @@ export function createIssuance(ctx: WalletContext) {
       const resolved: ResolvedOffer = {
         issuerUri: offer['credential_issuer'] as string,
         issuerOrigin: origin,
+        issuerDid,
         issuerDisplay: displayOf(session.credentialIssuer['display']),
         configuration: { id: configurationId, vct, display },
         txCode: isObject(tx)

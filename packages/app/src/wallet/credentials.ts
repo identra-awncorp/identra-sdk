@@ -108,10 +108,12 @@ export function createCredentials(ctx: WalletContext) {
       const before = await ctx.vault.getMeta(id).catch(() => null);
       const r = await verifyStoredCredential(opened.compact, verifyOptionsOf(ctx));
       const statusCode = r.checks.find((c) => c.id === 'status')?.code;
-      // The gateway not answering (DID_RESOLUTION_UNAVAILABLE) is "not checked yet", like a list that could not be read.
+      // The gateway not answering (DID_RESOLUTION_UNAVAILABLE) is "not checked yet", like a list that could not be read;
+      // so is a DID credential in a wallet without dpki (core's DID_RESOLUTION_FAILED "not configured"): nothing was checked.
+      const noDidPath = !ctx.dpki && r.checks.some((c) => c.id === 'did_resolution' && c.code === 'DID_RESOLUTION_FAILED');
       const status: StoredCredentialStatus = r.ok
         ? 'valid'
-        : statusCode === 'REVOKED' ? 'revoked' : statusCode === 'SUSPENDED' ? 'suspended' : onlyListsUnavailable(r) || didUnresolved(r) ? 'unavailable' : 'invalid';
+        : statusCode === 'REVOKED' ? 'revoked' : statusCode === 'SUSPENDED' ? 'suspended' : onlyListsUnavailable(r) || didUnresolved(r) || noDidPath ? 'unavailable' : 'invalid';
       const checkedAt = ctx.clock.now();
       try {
         await ctx.vault.setStatus(id, status, checkedAt);

@@ -30,6 +30,8 @@ export const WalletErrorCodes = Object.freeze({
   /** The key store or the vault failed. */
   STORAGE_ERROR: ErrorCodes.STORAGE_ERROR,
   CREDENTIAL_NOT_FOUND: ErrorCodes.CREDENTIAL_NOT_FOUND,
+  /** resolve: the metadata declares `identra_issuer_did` (a well-formed DID) and the wallet was created without `dpki`. */
+  TRUST_PATH_UNSUPPORTED: ErrorCodes.TRUST_PATH_UNSUPPORTED,
   // presentation (architecture section 9)
   /** The request object or the QR code is not one this wallet accepts. */
   REQUEST_INVALID: ErrorCodes.REQUEST_INVALID,
